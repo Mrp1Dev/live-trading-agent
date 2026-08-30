@@ -2,7 +2,7 @@ import os
 
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
-from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.historical import NewsClient, StockHistoricalDataClient
 from alpaca.data.historical.option import OptionHistoricalDataClient
 
 load_dotenv()
@@ -53,4 +53,10 @@ def get_option_data_client() -> OptionHistoricalDataClient:
         api_key=api_key,
         secret_key=secret_key,
     )
-
+def get_news_client() -> NewsClient:
+    """Return a NewsClient for accessing news data."""
+    api_key, secret_key = _get_credentials()
+    return NewsClient(
+        api_key=api_key,
+        secret_key=secret_key
+    )
