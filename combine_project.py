@@ -6,6 +6,7 @@ into a single annotated text/markdown file.
 Usage:
     python combine_project.py
     python combine_project.py --output combined_codebase.txt
+    python combine_project.py --no-empty-lines
 """
 
 import argparse
@@ -71,7 +72,7 @@ def collect_python_files(root_dir: Path) -> list[Path]:
     return sorted(py_files, key=sort_key)
 
 
-def combine_files(root_dir: Path, output_file: Path) -> None:
+def combine_files(root_dir: Path, output_file: Path, no_empty_lines: bool = False) -> None:
     """Combine the selected python files into a single annotated output file."""
     files = collect_python_files(root_dir)
 
@@ -79,20 +80,32 @@ def combine_files(root_dir: Path, output_file: Path) -> None:
         print("No Python files found to combine.")
         return
 
-    separator = "=" * 80
+    separator = "=" * 5
     total_lines = 0
 
     with open(output_file, "w", encoding="utf-8") as out:
         for file_path in files:
             rel_path = file_path.relative_to(root_dir).as_posix()
             content = file_path.read_text(encoding="utf-8")
-            line_count = len(content.splitlines())
-            total_lines += line_count
 
-            header = f"{separator}\n# FILE: {rel_path}\n{separator}\n\n"
-            out.write(header)
-            out.write(content)
-            out.write("\n\n")
+            if no_empty_lines:
+                lines = [line for line in content.splitlines() if line.strip()]
+                content = "\n".join(lines)
+                line_count = len(lines)
+                total_lines += line_count
+
+                header = f"{separator}\n# FILE: {rel_path}\n{separator}\n"
+                out.write(header)
+                if content:
+                    out.write(content + "\n")
+            else:
+                line_count = len(content.splitlines())
+                total_lines += line_count
+
+                header = f"{separator}\n# FILE: {rel_path}\n{separator}\n\n"
+                out.write(header)
+                out.write(content)
+                out.write("\n\n")
 
             print(f"  + Added {rel_path} ({line_count} lines)")
 
@@ -109,13 +122,22 @@ def main():
         default="combined_codebase.txt",
         help="Target output file path (default: combined_codebase.txt)",
     )
+    parser.add_argument(
+        "-e",
+        "--no-empty-lines",
+        "--eliminate-empty-lines",
+        dest="no_empty_lines",
+        action="store_true",
+        help="Eliminate empty/blank lines from the output files.",
+    )
     args = parser.parse_args()
 
     root_dir = Path(__file__).resolve().parent
     output_path = root_dir / args.output
 
-    combine_files(root_dir, output_path)
+    combine_files(root_dir, output_path, no_empty_lines=args.no_empty_lines)
 
 
 if __name__ == "__main__":
     main()
+

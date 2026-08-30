@@ -1,37 +1,65 @@
-
-================================================================================
+=====
+# FILE: alpaca_client/__init__.py
+=====
+from .client import (
+    get_option_data_client,
+    get_stock_data_client,
+    get_trading_client,
+)
+from .options import (
+    get_option_chain,
+    inspect_options,
+    print_best_candidates,
+    print_chain,
+)
+from .stocks import (
+    get_historical_daily_bars,
+    get_latest_stock_bars,
+    get_latest_underlying_prices,
+    get_stock_bars,
+    get_stock_snapshots,
+    print_top_scanned_stocks,
+    scan_stocks,
+)
+__all__ = [
+    "get_trading_client",
+    "get_stock_data_client",
+    "get_option_data_client",
+    "get_option_chain",
+    "inspect_options",
+    "print_chain",
+    "print_best_candidates",
+    "get_stock_bars",
+    "get_historical_daily_bars",
+    "get_stock_snapshots",
+    "get_latest_stock_bars",
+    "get_latest_underlying_prices",
+    "scan_stocks",
+    "print_top_scanned_stocks",
+]
+=====
 # FILE: alpaca_client/client.py
-================================================================================
-
+=====
 import os
-
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.historical.option import OptionHistoricalDataClient
-
 load_dotenv()
-
-
 def _get_credentials() -> tuple[str, str]:
     """Retrieve API key and secret from environment variables.
-    
     Supports both ALPACA_API_KEY / ALPACA_SECRET_KEY and
     standard APCA_API_KEY_ID / APCA_API_SECRET_KEY.
     """
     api_key = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
     secret_key = os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
-
     if not api_key or not secret_key:
         raise RuntimeError(
             "Missing Alpaca API credentials. Please set ALPACA_API_KEY and ALPACA_SECRET_KEY (or APCA_API_KEY_ID and APCA_API_SECRET_KEY) in .env"
         )
     return api_key, secret_key
-
-
 def get_trading_client(paper: bool = True) -> TradingClient:
     """Return a TradingClient instance for the Trading API.
-    
     Defaults to paper=True for development safety.
     """
     api_key, secret_key = _get_credentials()
@@ -40,8 +68,6 @@ def get_trading_client(paper: bool = True) -> TradingClient:
         secret_key=secret_key,
         paper=paper,
     )
-
-
 def get_stock_data_client() -> StockHistoricalDataClient:
     """Return a StockHistoricalDataClient for historical equity data."""
     api_key, secret_key = _get_credentials()
@@ -49,8 +75,6 @@ def get_stock_data_client() -> StockHistoricalDataClient:
         api_key=api_key,
         secret_key=secret_key,
     )
-
-
 def get_option_data_client() -> OptionHistoricalDataClient:
     """Return an OptionHistoricalDataClient for historical options data."""
     api_key, secret_key = _get_credentials()
@@ -58,63 +82,43 @@ def get_option_data_client() -> OptionHistoricalDataClient:
         api_key=api_key,
         secret_key=secret_key,
     )
-
-
-
-
-================================================================================
+=====
 # FILE: alpaca_client/options.py
-================================================================================
-
+=====
 from typing import Dict
-
 from alpaca.data.historical.option import OptionsSnapshot
 from alpaca.data.requests import OptionChainRequest
-
 from .client import get_option_data_client
 from strategy.option_selector import (
     select_directional_options,
     print_option_candidates,
 )
-
-
 def get_option_chain(symbol: str) -> Dict[str, OptionsSnapshot]:
     client = get_option_data_client()
-
     request = OptionChainRequest(
         underlying_symbol=symbol,
     )
-
     return client.get_option_chain(request)
-
-
 def print_chain(symbol: str, limit: int = 10) -> None:
     """Print a snapshot summary of option contracts for a symbol."""
     chain = get_option_chain(symbol)
-
     print(f"\nOption chain for {symbol}")
     print(f"Contracts returned: {len(chain)}")
-
     if not chain:
         print("No contracts found.")
         return
-
     for contract_symbol, snapshot in list(chain.items())[:limit]:
         print(f"\n{contract_symbol}")
-
         if snapshot.latest_quote:
             print(f"  bid: {snapshot.latest_quote.bid_price}")
             print(f"  ask: {snapshot.latest_quote.ask_price}")
-
         if snapshot.implied_volatility is not None:
             print(f"  IV:    {snapshot.implied_volatility:.4f}")
-
         if snapshot.greeks:
             print(f"  delta: {snapshot.greeks.delta}")
             print(f"  gamma: {snapshot.greeks.gamma}")
             print(f"  theta: {snapshot.greeks.theta}")
             print(f"  vega:  {snapshot.greeks.vega}")
-
 def print_best_candidates(
     symbol: str,
     underlying_price: float = 100.0,
@@ -122,17 +126,14 @@ def print_best_candidates(
     limit: int = 20,
 ) -> None:
     chain = get_option_chain(symbol)
-
     candidates = select_directional_options(
         chain=chain,
         underlying_price=underlying_price,
         direction=direction,
     )
-
     print(f"\n{symbol}")
     print(f"Contracts returned: {len(chain)}")
     print(f"Liquid candidates:  {len(candidates)}")
-
     for candidate in candidates[:limit]:
         print(
             f"{candidate.symbol} "
@@ -141,46 +142,36 @@ def print_best_candidates(
             f"IV={candidate.iv} "
             f"delta={candidate.delta}"
         )
-
-
 def inspect_options(
     symbol: str,
     underlying_price: float,
     direction: str = "bullish",
 ) -> None:
     chain = get_option_chain(symbol)
-
     candidates = select_directional_options(
         chain=chain,
         underlying_price=underlying_price,
         direction=direction,
     )
-
     print(f"\n{symbol}")
     print(f"Contracts returned: {len(chain)}")
     print(f"Selected candidates: {len(candidates)}")
-
     print_option_candidates(
         symbol=symbol,
         underlying_price=underlying_price,
         candidates=candidates,
         direction=direction,
     )
-
 if __name__ == "__main__":
     import sys
     ticker = sys.argv[1] if len(sys.argv) > 1 else "SPY"
     print_chain(ticker)
-
-
-================================================================================
+=====
 # FILE: alpaca_client/stocks.py
-================================================================================
-
+=====
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Union
 import pandas as pd
-
 from alpaca.data.enums import DataFeed
 from alpaca.data.models import Bar, Snapshot
 from alpaca.data.requests import (
@@ -189,12 +180,9 @@ from alpaca.data.requests import (
     StockSnapshotRequest,
 )
 from alpaca.data.timeframe import TimeFrame
-
 from .client import get_stock_data_client
 from strategy.scanner import ScannedStock, print_scan_results, scan_stock_bars
 from strategy.universe import BENCHMARK_SYMBOL, UNIVERSE
-
-
 def get_stock_bars(
     symbols: Union[str, List[str]],
     start: Union[datetime, str],
@@ -204,13 +192,11 @@ def get_stock_bars(
     limit: Optional[int] = None,
 ) -> pd.DataFrame:
     """Fetch historical OHLCV bars for one or more symbols.
-
     Returns a pandas DataFrame. For multiple symbols, the DataFrame
     has a MultiIndex of (symbol, timestamp).
     """
     client = get_stock_data_client()
     symbol_list = [symbols] if isinstance(symbols, str) else list(symbols)
-
     request = StockBarsRequest(
         symbol_or_symbols=symbol_list,
         timeframe=timeframe,
@@ -219,31 +205,24 @@ def get_stock_bars(
         limit=limit,
         feed=feed,
     )
-
     bar_set = client.get_stock_bars(request)
     return bar_set.df
-
-
 def get_historical_daily_bars(
     symbols: Union[str, List[str]],
     days: int = 90,
     feed: DataFeed = DataFeed.IEX,
 ) -> pd.DataFrame:
     """Fetch daily bars for the past N calendar days (with weekend/holiday buffer).
-
     Returns a MultiIndex DataFrame indexed by (symbol, timestamp).
     """
     calendar_buffer_days = max(int(days * 1.6), days + 20)
     start_time = datetime.now() - timedelta(days=calendar_buffer_days)
-
     return get_stock_bars(
         symbols=symbols,
         start=start_time,
         timeframe=TimeFrame.Day,
         feed=feed,
     )
-
-
 def get_stock_snapshots(
     symbols: Union[str, List[str]],
     feed: DataFeed = DataFeed.IEX,
@@ -251,26 +230,20 @@ def get_stock_snapshots(
     """Fetch latest snapshot (quotes, trades, daily bars) for symbols."""
     client = get_stock_data_client()
     symbol_list = [symbols] if isinstance(symbols, str) else list(symbols)
-
     request = StockSnapshotRequest(
         symbol_or_symbols=symbol_list,
         feed=feed,
     )
-
     return client.get_stock_snapshot(request)
-
-
 def get_latest_underlying_prices(
     symbols: Union[str, List[str]],
     feed: DataFeed = DataFeed.IEX,
 ) -> Dict[str, float]:
     """Return the freshest usable underlying price for each symbol.
-
     Preference order:
         latest trade
         quote midpoint
         latest daily close
-
     Raises if no usable price exists.
     """
     snapshots = get_stock_snapshots(
@@ -279,36 +252,27 @@ def get_latest_underlying_prices(
     )
     symbol_list = [symbols] if isinstance(symbols, str) else list(symbols)
     prices: Dict[str, float] = {}
-
     for symbol in symbol_list:
         snapshot = snapshots.get(symbol)
         if snapshot is None:
             continue
-
         price: Optional[float] = None
-
         if snapshot.latest_trade is not None:
             trade_price = float(snapshot.latest_trade.price or 0)
             if trade_price > 0:
                 price = trade_price
-
         if price is None and snapshot.latest_quote is not None:
             bid = float(snapshot.latest_quote.bid_price or 0)
             ask = float(snapshot.latest_quote.ask_price or 0)
             if bid > 0 and ask > 0 and ask >= bid:
                 price = (bid + ask) / 2.0
-
         if price is None and snapshot.daily_bar is not None:
             daily_close = float(snapshot.daily_bar.close or 0)
             if daily_close > 0:
                 price = daily_close
-
         if price is not None:
             prices[symbol] = price
-
     return prices
-
-
 def get_latest_stock_bars(
     symbols: Union[str, List[str]],
     feed: DataFeed = DataFeed.IEX,
@@ -316,15 +280,11 @@ def get_latest_stock_bars(
     """Fetch the latest bar for one or more symbols."""
     client = get_stock_data_client()
     symbol_list = [symbols] if isinstance(symbols, str) else list(symbols)
-
     request = StockLatestBarRequest(
         symbol_or_symbols=symbol_list,
         feed=feed,
     )
-
     return client.get_stock_latest_bar(request)
-
-
 def scan_stocks(
     universe: Optional[List[str]] = None,
     top_n: int = 15,
@@ -333,7 +293,6 @@ def scan_stocks(
     """Fetch historical daily bars from Alpaca and scan the universe for top candidates."""
     target_universe = list(universe) if universe else list(UNIVERSE)
     all_symbols = list(set(target_universe + [benchmark_symbol]))
-
     df = get_historical_daily_bars(symbols=all_symbols, days=90)
     return scan_stock_bars(
         bars_df=df,
@@ -341,8 +300,6 @@ def scan_stocks(
         benchmark_symbol=benchmark_symbol,
         top_n=top_n,
     )
-
-
 def print_top_scanned_stocks(
     universe: Optional[List[str]] = None,
     top_n: int = 15,
@@ -351,22 +308,46 @@ def print_top_scanned_stocks(
     stocks = scan_stocks(universe=universe, top_n=top_n)
     print_scan_results(stocks, title=f"Top Stock Scanner Picks (Top {len(stocks)})")
     return stocks
-
-
 if __name__ == "__main__":
     print_top_scanned_stocks(top_n=15)
-
-
-
-================================================================================
+=====
+# FILE: config.py
+=====
+from datetime import date
+# ============================================================
+# PORTFOLIO / RISK
+# ============================================================
+MAX_TOTAL_RISK_PCT = 0.12
+MAX_SINGLE_TRADE_RISK_PCT = 0.025
+MAX_UNDERLYING_RISK_PCT = 0.03
+MAX_DIRECTION_RISK_PCT = 0.075
+MAX_POSITIONS = 6
+MIN_TRADE_SCORE = 70.0
+# Greeks are warnings for now, not hard portfolio vetoes.
+MAX_ABS_PORTFOLIO_DELTA = 1500.0
+MAX_ABS_PORTFOLIO_GAMMA = 100.0
+MAX_ABS_PORTFOLIO_VEGA = 3000.0
+EMERGENCY_DRAWDOWN_PCT = 0.15
+# ============================================================
+# OPTIONS
+# ============================================================
+MIN_DTE = 1
+MAX_DTE = 14
+MAX_OPTION_SPREAD_PCT = 0.15
+MIN_OPTION_ABS_DELTA = 0.15
+MAX_OPTION_ABS_DELTA = 0.90
+MIN_OPTION_PREMIUM = 0.25
+# For this hackathon, avoid contracts that expire on or before
+# the last official portfolio valuation date.
+#
+# Official EOD valuation is September 3, 2026.
+LATEST_FORBIDDEN_EXPIRATION = date(2026, 9, 3)
+=====
 # FILE: risk/risk.py
-================================================================================
-
+=====
 from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Dict, List
-
 from config import (
     MAX_TOTAL_RISK_PCT,
     MAX_SINGLE_TRADE_RISK_PCT,
@@ -377,45 +358,30 @@ from config import (
     MAX_ABS_PORTFOLIO_VEGA,
     EMERGENCY_DRAWDOWN_PCT,
 )
-
 from strategy.portfolio import PortfolioPosition
-
-
 @dataclass
 class RiskAssessment:
     approved: bool
     adjusted_contracts: int
     reason: str
-
-
 @dataclass
 class PortfolioRiskReport:
     approved_positions: List[PortfolioPosition]
     rejected_positions: List[PortfolioPosition]
-
     total_max_loss: float
     max_loss_pct: float
-
     bullish_risk_pct: float
     bearish_risk_pct: float
-
     portfolio_delta: float
     portfolio_gamma: float
     portfolio_vega: float
     portfolio_theta: float
-
     emergency_stop: bool
-
     warnings: List[str]
-
-
 def _per_contract_loss(position: PortfolioPosition) -> float:
     if position.contracts <= 0:
         return 0.0
-
     return position.max_loss / position.contracts
-
-
 def assess_position(
     position: PortfolioPosition,
     account_equity: float,
@@ -423,46 +389,38 @@ def assess_position(
     """
     Validate and cap a single proposed position.
     """
-
     if account_equity <= 0:
         return RiskAssessment(
             approved=False,
             adjusted_contracts=0,
             reason="Invalid account equity.",
         )
-
     if position.contracts <= 0:
         return RiskAssessment(
             approved=False,
             adjusted_contracts=0,
             reason="Position has no contracts.",
         )
-
     per_contract_loss = _per_contract_loss(position)
-
     if per_contract_loss <= 0:
         return RiskAssessment(
             approved=False,
             adjusted_contracts=0,
             reason="Invalid per-contract loss.",
         )
-
     max_allowed_loss = (
         account_equity
         * MAX_SINGLE_TRADE_RISK_PCT
     )
-
     allowed_contracts = int(
         max_allowed_loss // per_contract_loss
     )
-
     if allowed_contracts <= 0:
         return RiskAssessment(
             approved=False,
             adjusted_contracts=0,
             reason="Single-trade risk limit exceeded.",
         )
-
     if allowed_contracts < position.contracts:
         return RiskAssessment(
             approved=True,
@@ -472,22 +430,17 @@ def assess_position(
                 f"to {allowed_contracts} contracts."
             ),
         )
-
     return RiskAssessment(
         approved=True,
         adjusted_contracts=position.contracts,
         reason="Passed position-level limits.",
     )
-
-
 def _adjust_position(
     position: PortfolioPosition,
     contracts: int,
 ) -> PortfolioPosition:
     per_contract_loss = _per_contract_loss(position)
-
     new_loss = contracts * per_contract_loss
-
     return PortfolioPosition(
         trade=position.trade,
         contracts=contracts,
@@ -495,8 +448,6 @@ def _adjust_position(
         premium_deployed=new_loss,
         risk_weight=position.risk_weight,
     )
-
-
 def _directional_risk(
     positions: List[PortfolioPosition],
 ) -> tuple[float, float]:
@@ -505,16 +456,12 @@ def _directional_risk(
         for p in positions
         if p.trade.direction == "BULLISH"
     )
-
     bearish = sum(
         p.max_loss
         for p in positions
         if p.trade.direction == "BEARISH"
     )
-
     return bullish, bearish
-
-
 def _calculate_greeks(
     positions: List[PortfolioPosition],
 ) -> tuple[float, float, float, float]:
@@ -522,103 +469,78 @@ def _calculate_greeks(
     gamma = 0.0
     vega = 0.0
     theta = 0.0
-
     for position in positions:
         trade = position.trade
         multiplier = position.contracts * 100
-
         delta += (
             (trade.option_delta or 0.0)
             * multiplier
         )
-
         gamma += (
             (trade.option_gamma or 0.0)
             * multiplier
         )
-
         vega += (
             (trade.option_vega or 0.0)
             * multiplier
         )
-
         theta += (
             (trade.option_theta or 0.0)
             * multiplier
         )
-
     return delta, gamma, vega, theta
-
-
 def _enforce_directional_limits(
     positions: List[PortfolioPosition],
     max_direction_risk: float,
 ) -> tuple[List[PortfolioPosition], List[PortfolioPosition], List[str]]:
     """
     Enforce hard directional risk limits.
-
     Positions are considered independently for bullish and bearish
     exposure. Within each direction, higher trade-score positions
     receive priority.
-
     The returned approved set is guaranteed not to exceed the
     directional risk limit.
     """
-
     approved: List[PortfolioPosition] = []
     rejected: List[PortfolioPosition] = []
     warnings: List[str] = []
-
     for direction in ("BULLISH", "BEARISH"):
-
         direction_positions = [
             position
             for position in positions
             if position.trade.direction == direction
         ]
-
         direction_positions.sort(
             key=lambda position: position.trade.trade_score,
             reverse=True,
         )
-
         running_risk = 0.0
-
         for position in direction_positions:
-
             proposed_risk = (
                 running_risk
                 + position.max_loss
             )
-
             if proposed_risk <= max_direction_risk:
                 approved.append(position)
                 running_risk = proposed_risk
                 continue
-
             rejected.append(position)
-
             warnings.append(
                 f"{position.trade.stock_symbol}: "
                 f"{direction.lower()} concentration limit "
                 "would be exceeded; position rejected."
             )
-
     return approved, rejected, warnings
-
-
 def assess_portfolio(
     positions: List[PortfolioPosition],
     account_equity: float,
     current_equity: float | None = None,
     peak_equity: float | None = None,
 ) -> PortfolioRiskReport:
-
     if account_equity <= 0:
         raise ValueError(
             "account_equity must be positive"
         )
-
     for position in positions:
         if position.contracts <= 0:
             raise ValueError(
@@ -632,29 +554,22 @@ def assess_portfolio(
                 f"{position.trade.stock_symbol}: "
                 "max_loss must be positive."
             )
-
     warnings: List[str] = []
-
     # ========================================================
     # EMERGENCY ACCOUNT PROTECTION
     # ========================================================
-
     if (
         current_equity is not None
         and peak_equity is not None
     ):
-
         if peak_equity <= 0:
             raise ValueError(
                 "peak_equity must be positive."
             )
-
         drawdown_pct = (
             peak_equity - current_equity
         ) / peak_equity
-
         if drawdown_pct >= EMERGENCY_DRAWDOWN_PCT:
-
             return PortfolioRiskReport(
                 approved_positions=[],
                 rejected_positions=positions,
@@ -675,21 +590,16 @@ def assess_portfolio(
                     )
                 ],
             )
-
     # ========================================================
     # STEP 1 — POSITION-LEVEL LIMITS
     # ========================================================
-
     approved: List[PortfolioPosition] = []
     rejected: List[PortfolioPosition] = []
-
     for position in positions:
-
         assessment = assess_position(
             position,
             account_equity,
         )
-
         if not assessment.approved:
             rejected.append(position)
             warnings.append(
@@ -697,46 +607,36 @@ def assess_portfolio(
                 f"{assessment.reason}"
             )
             continue
-
         approved.append(
             _adjust_position(
                 position,
                 assessment.adjusted_contracts,
             )
         )
-
         if assessment.adjusted_contracts < position.contracts:
             warnings.append(
                 f"{position.trade.stock_symbol}: "
                 f"{assessment.reason}"
             )
-
     # ========================================================
     # STEP 2 — UNDERLYING CONCENTRATION
     # ========================================================
-
     max_underlying_risk = (
         account_equity
         * MAX_UNDERLYING_RISK_PCT
     )
-
     final_positions: List[PortfolioPosition] = []
-
     for position in approved:
-
         if position.max_loss <= max_underlying_risk:
             final_positions.append(position)
             continue
-
         per_contract_loss = _per_contract_loss(
             position
         )
-
         contracts = int(
             max_underlying_risk
             // per_contract_loss
         )
-
         if contracts <= 0:
             rejected.append(position)
             warnings.append(
@@ -744,89 +644,68 @@ def assess_portfolio(
                 "rejected by underlying-risk limit."
             )
             continue
-
         adjusted = _adjust_position(
             position,
             contracts,
         )
-
         final_positions.append(adjusted)
-
         warnings.append(
             f"{position.trade.stock_symbol}: "
             f"reduced to {contracts} contracts "
             "by underlying-risk limit."
         )
-
     # ========================================================
     # STEP 3 — TOTAL PORTFOLIO RISK
     # ========================================================
-
     max_total_risk = (
         account_equity
         * MAX_TOTAL_RISK_PCT
     )
-
     final_positions.sort(
         key=lambda p: p.trade.trade_score,
         reverse=True,
     )
-
     risk_limited: List[PortfolioPosition] = []
-
     total_risk = 0.0
-
     for position in final_positions:
-
         remaining = (
             max_total_risk
             - total_risk
         )
-
         if remaining <= 0:
             rejected.append(position)
             continue
-
         if position.max_loss <= remaining:
             risk_limited.append(position)
             total_risk += position.max_loss
             continue
-
         per_contract_loss = _per_contract_loss(
             position
         )
-
         contracts = int(
             remaining
             // per_contract_loss
         )
-
         if contracts <= 0:
             rejected.append(position)
             continue
-
         adjusted = _adjust_position(
             position,
             contracts,
         )
-
         risk_limited.append(adjusted)
         total_risk += adjusted.max_loss
-
         warnings.append(
             f"{position.trade.stock_symbol}: "
             "reduced by total portfolio risk limit."
         )
-
     # ========================================================
     # STEP 4 — DIRECTIONAL CONCENTRATION
     # ========================================================
-
     max_direction_risk = (
         account_equity
         * MAX_DIRECTION_RISK_PCT
     )
-
     (
         risk_limited,
         directional_rejected,
@@ -835,48 +714,38 @@ def assess_portfolio(
         positions=risk_limited,
         max_direction_risk=max_direction_risk,
     )
-
     rejected.extend(directional_rejected)
     warnings.extend(directional_warnings)
-
     # ========================================================
     # STEP 5 — GREEKS
     # ========================================================
-
     delta, gamma, vega, theta = _calculate_greeks(
         risk_limited
     )
-
     # Greeks are currently advisory rather than hard vetoes.
     # The hard safety controls are defined-loss and concentration limits.
     if abs(delta) > MAX_ABS_PORTFOLIO_DELTA:
         warnings.append(
             f"Portfolio delta above advisory threshold: {delta:.1f}"
         )
-
     if abs(gamma) > MAX_ABS_PORTFOLIO_GAMMA:
         warnings.append(
             f"Portfolio gamma above advisory threshold: {gamma:.1f}"
         )
-
     if abs(vega) > MAX_ABS_PORTFOLIO_VEGA:
         warnings.append(
             f"Portfolio vega above advisory threshold: {vega:.1f}"
         )
-
     # ========================================================
     # FINAL METRICS
     # ========================================================
-
     total_risk = sum(
         p.max_loss
         for p in risk_limited
     )
-
     bullish, bearish = _directional_risk(
         risk_limited
     )
-
     return PortfolioRiskReport(
         approved_positions=risk_limited,
         rejected_positions=rejected,
@@ -900,72 +769,55 @@ def assess_portfolio(
         emergency_stop=False,
         warnings=warnings,
     )
-
-
 def print_risk_report(
     report: PortfolioRiskReport,
     account_equity: float,
 ) -> None:
-
     print("\n" + "=" * 130)
     print(" RISK ASSESSMENT")
     print("=" * 130)
-
     if report.emergency_stop:
         print(
             "🚨 EMERGENCY STOP — "
             "NO NEW POSITIONS APPROVED"
         )
-
         for warning in report.warnings:
             print(f"  ⚠ {warning}")
-
         print("=" * 130)
         return
-
     print(
         f"Total max loss:  "
         f"${report.total_max_loss:,.2f} "
         f"({report.max_loss_pct:.2%})"
     )
-
     print(
         f"Bullish risk:    "
         f"{report.bullish_risk_pct:.2%}"
     )
-
     print(
         f"Bearish risk:    "
         f"{report.bearish_risk_pct:.2%}"
     )
-
     print(
         f"Portfolio Delta: "
         f"{report.portfolio_delta:,.2f}"
     )
-
     print(
         f"Portfolio Gamma: "
         f"{report.portfolio_gamma:,.2f}"
     )
-
     print(
         f"Portfolio Vega:  "
         f"{report.portfolio_vega:,.2f}"
     )
-
     print(
         f"Portfolio Theta: "
         f"{report.portfolio_theta:,.2f}"
     )
-
     print("\nAPPROVED POSITIONS")
     print("-" * 130)
-
     for position in report.approved_positions:
-
         trade = position.trade
-
         print(
             f"{trade.stock_symbol:<7} "
             f"{trade.direction:<9} "
@@ -974,14 +826,10 @@ def print_risk_report(
             f"score={trade.trade_score:>5.1f}  "
             f"{trade.option_symbol}"
         )
-
     print("\nREJECTED POSITIONS")
     print("-" * 130)
-
     for position in report.rejected_positions:
-
         trade = position.trade
-
         print(
             f"{trade.stock_symbol:<7} "
             f"{trade.direction:<9} "
@@ -990,45 +838,60 @@ def print_risk_report(
             f"score={trade.trade_score:>5.1f}  "
             f"{trade.option_symbol}"
         )
-
     if report.warnings:
         print("\nWARNINGS")
         print("-" * 130)
-
         for warning in report.warnings:
             print(f"⚠ {warning}")
-
     print("=" * 130)
-
-
-================================================================================
+=====
+# FILE: strategy/direction.py
+=====
+from enum import Enum
+class TradeDirection(str, Enum):
+    BULLISH = "BULLISH"
+    BEARISH = "BEARISH"
+    NEUTRAL = "NEUTRAL"
+def determine_direction(stock) -> TradeDirection:
+    """
+    Determine directional bias from the stock-level signals.
+    Requires a majority of the three directional signals to agree.
+    Mixed signals are explicitly NEUTRAL rather than forced bearish.
+    """
+    bullish_signals = sum([
+        stock.return_5d > 0,
+        stock.return_20d > 0,
+        stock.relative_strength_spy > 0,
+    ])
+    bearish_signals = sum([
+        stock.return_5d < 0,
+        stock.return_20d < 0,
+        stock.relative_strength_spy < 0,
+    ])
+    if bullish_signals >= 2:
+        return TradeDirection.BULLISH
+    if bearish_signals >= 2:
+        return TradeDirection.BEARISH
+    return TradeDirection.NEUTRAL
+=====
 # FILE: strategy/llm.py
-================================================================================
-
+=====
 from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Optional
-
 from strategy.option_selector import OptionCandidate
 from strategy.scanner import ScannedStock
 from strategy.direction import TradeDirection, determine_direction
-
 @dataclass
 class LLMDecision:
     """Represents a trading decision and confidence evaluation for an option contract."""
-
     decision: str  # "BULLISH", "BEARISH" etc.
     confidence: float  # 0.0 to 1.0
     thesis: str
     invalidation: str
-
-
 def analyze_trade(candidate, stock):
     # TEMPORARY PLACEHOLDER FOR FUTURE FEATHERLESS MODEL
-
     expected_direction = determine_direction(stock)
-
     if expected_direction == TradeDirection.NEUTRAL:
         return LLMDecision(
             decision="WATCH",
@@ -1039,29 +902,22 @@ def analyze_trade(candidate, stock):
             ),
             invalidation="No directional edge is currently established.",
         )
-
     if (
         expected_direction == TradeDirection.BULLISH
         and candidate.option_type != "call"
     ):
         decision = "WATCH"
-
     elif (
         expected_direction == TradeDirection.BEARISH
         and candidate.option_type != "put"
     ):
         decision = "WATCH"
-
     else:
         decision = expected_direction.value
     confidence = min(
         0.95,
-        max(
-            0.50,
-            0.50 + abs(stock.score - 50.0) / 100.0,
-        ),
+        0.50 + max(stock.score - 50.0, 0.0) / 100.0,
     )
-
     if decision == "BULLISH":
         thesis = (
             f"{stock.symbol} shows positive medium-term momentum, "
@@ -1071,7 +927,6 @@ def analyze_trade(candidate, stock):
             "Momentum turns negative and relative strength "
             "versus SPY deteriorates."
         )
-
     elif decision == "BEARISH":
         thesis = (
             f"{stock.symbol} shows weak momentum or relative strength, "
@@ -1081,37 +936,28 @@ def analyze_trade(candidate, stock):
             "Momentum reverses higher and relative strength "
             "versus SPY improves."
         )
-
     else:
         thesis = (
             f"The stock thesis is {expected_direction.lower()}, "
             f"but the option direction does not match."
         )
         invalidation = "No trade until stock and option direction agree."
-
         # Don't allow WATCH to compete with real trades.
         confidence = 0.0
-
     return LLMDecision(
         decision=decision,
         confidence=confidence,
         thesis=thesis,
         invalidation=invalidation,
     )
-
-
-================================================================================
+=====
 # FILE: strategy/option_selector.py
-================================================================================
-
+=====
 from __future__ import annotations
-
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional
-
 from alpaca.data.historical.option import OptionsSnapshot
-
 from config import (
     MIN_DTE,
     MAX_DTE,
@@ -1121,66 +967,48 @@ from config import (
     MIN_OPTION_PREMIUM,
     LATEST_FORBIDDEN_EXPIRATION,
 )
-
-
 @dataclass
 class OptionCandidate:
     symbol: str
     expiration: date
     option_type: str          # "call" or "put"
     strike: float
-
     bid: float
     ask: float
     mid: float
     spread_pct: float
-
     iv: Optional[float]
     delta: Optional[float]
     gamma: Optional[float]
     theta: Optional[float]
     vega: Optional[float]
-
     dte: int
     moneyness_pct: float
-
     score: float = 0.0
-
-
 def parse_occ_symbol(symbol: str) -> tuple[date, str, float]:
     """
     Parse a standard OCC option symbol.
-
     Example:
         NVDA260904C00217500
-
     Returns:
         (expiration_date, option_type, strike)
     """
     if len(symbol) < 15:
         raise ValueError(f"Invalid option symbol: {symbol}")
-
     # Standard OCC format:
     # ROOT + YYMMDD + C/P + 8-digit strike * 1000
-
     expiration_raw = symbol[-15:-9]
     option_type_raw = symbol[-9]
     strike_raw = symbol[-8:]
-
     expiration = datetime.strptime(expiration_raw, "%y%m%d").date()
-
     if option_type_raw == "C":
         option_type = "call"
     elif option_type_raw == "P":
         option_type = "put"
     else:
         raise ValueError(f"Unknown option type in symbol: {symbol}")
-
     strike = int(strike_raw) / 1000.0
-
     return expiration, option_type, strike
-
-
 def build_candidate(
     symbol: str,
     snapshot: OptionsSnapshot,
@@ -1189,43 +1017,30 @@ def build_candidate(
     """
     Convert an Alpaca option snapshot into a normalized candidate.
     """
-
     if underlying_price <= 0:
         return None
-
     quote = snapshot.latest_quote
     if quote is None:
         return None
-
     bid = float(quote.bid_price or 0)
     ask = float(quote.ask_price or 0)
-
     # Ignore broken/unusable quotes.
     if bid <= 0 or ask <= 0 or ask < bid:
         return None
-
     mid = (bid + ask) / 2.0
-
     if mid <= 0:
         return None
-
     spread_pct = (ask - bid) / mid
-
     try:
         expiration, option_type, strike = parse_occ_symbol(symbol)
     except ValueError:
         return None
-
     today = date.today()
     dte = (expiration - today).days
-
     if dte < 0:
         return None
-
     moneyness_pct = (strike - underlying_price) / underlying_price
-
     greeks = snapshot.greeks
-
     return OptionCandidate(
         symbol=symbol,
         expiration=expiration,
@@ -1263,32 +1078,23 @@ def build_candidate(
         dte=dte,
         moneyness_pct=moneyness_pct,
     )
-
-
 OPTION_SCORE_MAX = 80.0
-
-
 def _score_candidate(
     candidate: OptionCandidate,
     direction: str,
 ) -> float:
     """
     Score an option for a directional trade.
-
     This is deliberately a simple first version.
     We will later replace this with a much better quantitative model.
     """
-
     direction = direction.lower()
-
     score = 0.0
-
     # ---------------------------------------------------------
     # 1. Delta suitability
     # ---------------------------------------------------------
     if candidate.delta is not None:
         abs_delta = abs(candidate.delta)
-
         # Prefer reasonably responsive options.
         if 0.35 <= abs_delta <= 0.65:
             score += 35.0
@@ -1296,7 +1102,6 @@ def _score_candidate(
             score += 25.0
         elif 0.15 <= abs_delta <= 0.85:
             score += 10.0
-
     # ---------------------------------------------------------
     # 2. Time to expiry
     # ---------------------------------------------------------
@@ -1307,19 +1112,16 @@ def _score_candidate(
         score += 12.0
     elif candidate.dte <= 21:
         score += 5.0
-
     # ---------------------------------------------------------
     # 4. Moneyness
     # ---------------------------------------------------------
     abs_moneyness = abs(candidate.moneyness_pct)
-
     if abs_moneyness <= 0.03:
         score += 15.0
     elif abs_moneyness <= 0.07:
         score += 10.0
     elif abs_moneyness <= 0.12:
         score += 4.0
-
     # ---------------------------------------------------------
     # 5. Price sanity
     # ---------------------------------------------------------
@@ -1328,23 +1130,17 @@ def _score_candidate(
         score += 5.0
     elif candidate.mid >= 0.50:
         score += 2.0
-
     # ---------------------------------------------------------
     # Direction sanity
     # ---------------------------------------------------------
     if candidate.delta is not None:
         if direction == "bullish" and candidate.delta > 0:
             score += 5.0
-
         elif direction == "bearish" and candidate.delta < 0:
             score += 5.0
-
         else:
             score -= 20.0
-
     return (score / OPTION_SCORE_MAX) * 100.0
-
-
 def select_directional_options(
     chain: dict[str, OptionsSnapshot],
     underlying_price: float,
@@ -1359,83 +1155,61 @@ def select_directional_options(
 ) -> list[OptionCandidate]:
     """
     Select reasonably tradeable directional option candidates.
-
     Parameters are intentionally conservative/simple for the first version.
     """
-
     direction = direction.lower()
-
     if direction not in {"bullish", "bearish"}:
         raise ValueError("direction must be 'bullish' or 'bearish'")
-
     candidates: list[OptionCandidate] = []
-
     for symbol, snapshot in chain.items():
         candidate = build_candidate(
             symbol=symbol,
             snapshot=snapshot,
             underlying_price=underlying_price,
         )
-
         if candidate is None:
             continue
-
         # -----------------------------------------------------
         # Expiration
         # -----------------------------------------------------
         if candidate.dte < min_dte or candidate.dte > max_dte:
             continue
-
         # Do not initiate positions that can reach expiration
         # during the official measurement endpoint.
         if candidate.expiration <= LATEST_FORBIDDEN_EXPIRATION:
             continue
-
         # -----------------------------------------------------
         # Premium
         # -----------------------------------------------------
         if candidate.mid < min_premium:
             continue
-
         # -----------------------------------------------------
         # Liquidity / spread
         # -----------------------------------------------------
         if candidate.spread_pct > max_spread_pct:
             continue
-
         # -----------------------------------------------------
         # Greeks
         # -----------------------------------------------------
         if candidate.delta is None:
             continue
-
         abs_delta = abs(candidate.delta)
-
         if abs_delta < min_abs_delta:
             continue
-
         if abs_delta > max_abs_delta:
             continue
-
         # For now, calls for bullish and puts for bearish.
         if direction == "bullish" and candidate.option_type != "call":
             continue
-
         if direction == "bearish" and candidate.option_type != "put":
             continue
-
         candidate.score = _score_candidate(
             candidate=candidate,
             direction=direction,
         )
-
         candidates.append(candidate)
-
     candidates.sort(key=lambda x: x.score, reverse=True)
-
     return candidates[:max_candidates]
-
-
 def print_option_candidates(
     symbol: str,
     underlying_price: float,
@@ -1445,12 +1219,10 @@ def print_option_candidates(
     """
     Print selected option candidates in a readable table.
     """
-
     print()
     print("=" * 125)
     print(f" {symbol} OPTION CANDIDATES — {direction.upper()}")
     print("=" * 125)
-
     print(
         f"{'Rank':<5}"
         f"{'Contract':<22}"
@@ -1463,22 +1235,18 @@ def print_option_candidates(
         f"{'Mny':>9}"
         f"{'Score':>9}"
     )
-
     print("-" * 125)
-
     for rank, candidate in enumerate(candidates, start=1):
         iv_str = (
             f"{candidate.iv:.1%}"
             if candidate.iv is not None
             else "N/A"
         )
-
         delta_str = (
             f"{candidate.delta:+.3f}"
             if candidate.delta is not None
             else "N/A"
         )
-
         print(
             f"{rank:<5}"
             f"{candidate.symbol:<22}"
@@ -1491,21 +1259,14 @@ def print_option_candidates(
             f"{candidate.moneyness_pct:>+8.1%}"
             f"{candidate.score:>9.1f}"
         )
-
     print("=" * 125)
     print()
-
-
-================================================================================
+=====
 # FILE: strategy/portfolio.py
-================================================================================
-
+=====
 from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import List
-
-
 @dataclass
 class PortfolioPosition:
     trade: object
@@ -1513,8 +1274,6 @@ class PortfolioPosition:
     max_loss: float
     premium_deployed: float
     risk_weight: float
-
-
 from config import (
     MAX_TOTAL_RISK_PCT,
     MAX_SINGLE_TRADE_RISK_PCT,
@@ -1522,98 +1281,70 @@ from config import (
     MAX_POSITIONS,
     MIN_TRADE_SCORE,
 )
-
-
 def _estimated_entry_price(trade) -> float:
     """
     Estimate the executable entry price for sizing.
-
     Current strategy only supports buying single-leg options,
     so the conservative reference price is the ask.
-
     Midpoint remains a useful informational/reference value,
     but should not be used to size a live position.
     """
     if trade.option_ask > 0:
         return trade.option_ask
-
     return trade.option_mid
-
-
 def _per_contract_risk(trade) -> float:
     """
     Current system assumes long single-leg options.
-
     For a long option:
         max loss = premium paid × 100
-
     Position sizing uses the estimated executable entry price,
     not the midpoint.
     """
-
     entry_price = _estimated_entry_price(trade)
-
     if entry_price <= 0:
         return 0.0
-
     return entry_price * 100.0
-
-
 def _trade_weight(trade) -> float:
     """
     Convert trade quality into an allocation weight.
-
     Higher-scoring trades receive disproportionately more
     risk budget, rather than everything being allocated equally.
     """
-
     # Start with score above our minimum acceptable threshold.
     excess_score = max(
         0.0,
         trade.trade_score - MIN_TRADE_SCORE,
     )
-
     if excess_score <= 0:
         return 0.0
-
     # Square the advantage so materially better trades receive
     # noticeably more capital.
     return excess_score ** 2
-
-
 def select_best_trade_per_stock(
     trades: List[object],
 ) -> List[object]:
     """
     Only keep the best complete trade for each underlying.
-
     This prevents the portfolio from accidentally holding:
         MSTR 130C
         MSTR 128C
         MSTR 129C
         ...
-
     and treating them as independent opportunities.
     """
-
     best_by_symbol = {}
-
     for trade in trades:
         existing = best_by_symbol.get(trade.stock_symbol)
-
         if (
             existing is None
             or trade.trade_score > existing.trade_score
         ):
             best_by_symbol[trade.stock_symbol] = trade
-
     return sorted(
         best_by_symbol.values(),
         key=lambda t: t.trade_score,
         reverse=True,
     )
-
-
 def build_portfolio(
     trades: List[object],
     account_equity: float,
@@ -1625,121 +1356,87 @@ def build_portfolio(
 ) -> List[PortfolioPosition]:
     """
     Convert ranked trades into a proposed portfolio.
-
     Current instrument assumption:
         long calls / long puts.
-
     The portfolio is allocated by MAXIMUM LOSS, not buying power.
-
     Example:
         $100,000 account
         total_risk = 12%
         => max planned loss = $12,000
-
     This is a proposed portfolio. The risk engine gets the
     final veto before anything can be executed.
     """
-
     if account_equity <= 0:
         raise ValueError("account_equity must be positive")
-
     if total_risk_pct <= 0:
         raise ValueError("total_risk_pct must be positive")
-
     if max_trade_risk_pct <= 0:
         raise ValueError("max_trade_risk_pct must be positive")
-
     if max_underlying_risk_pct <= 0:
         raise ValueError(
             "max_underlying_risk_pct must be positive"
         )
-
     max_total_risk = account_equity * total_risk_pct
     max_trade_risk = account_equity * max_trade_risk_pct
-
     # ---------------------------------------------------------
     # 1. Remove weak trades.
     # ---------------------------------------------------------
-
     eligible = [
         trade
         for trade in trades
         if trade.trade_score >= min_trade_score
     ]
-
     # ---------------------------------------------------------
     # 2. One trade per underlying.
     # ---------------------------------------------------------
-
     eligible = select_best_trade_per_stock(eligible)
-
     # ---------------------------------------------------------
     # 3. Keep only best N underlyings.
     # ---------------------------------------------------------
-
     eligible = eligible[:max_positions]
-
     if not eligible:
         return []
-
     # ---------------------------------------------------------
     # 4. Calculate relative weights.
     # ---------------------------------------------------------
-
     weighted_trades = []
-
     for trade in eligible:
         weight = _trade_weight(trade)
-
         if weight <= 0:
             continue
-
         per_contract_risk = _per_contract_risk(trade)
-
         if per_contract_risk <= 0:
             continue
-
         weighted_trades.append(
             (trade, weight, per_contract_risk)
         )
-
     if not weighted_trades:
         return []
-
     weight_sum = sum(
         weight
         for _, weight, _ in weighted_trades
     )
-
     # ---------------------------------------------------------
     # 5. Convert risk budget into contracts.
     # ---------------------------------------------------------
-
     positions: List[PortfolioPosition] = []
-
     for trade, weight, per_contract_risk in weighted_trades:
         normalized_weight = weight / weight_sum
-
         desired_risk = (
             max_total_risk
             * normalized_weight
         )
-
         # Hard single-trade cap.
         allocated_risk = min(
             desired_risk,
             max_trade_risk,
         )
-
         contracts = int(
             allocated_risk // per_contract_risk
         )
-
         if contracts <= 0:
             continue
-
         max_loss = contracts * per_contract_risk
-
         positions.append(
             PortfolioPosition(
                 trade=trade,
@@ -1749,46 +1446,35 @@ def build_portfolio(
                 risk_weight=normalized_weight,
             )
         )
-
     # ---------------------------------------------------------
     # 6. Ensure we never exceed total risk because of rounding.
     # ---------------------------------------------------------
-
     positions.sort(
         key=lambda p: p.trade.trade_score,
         reverse=True,
     )
-
     final_positions: List[PortfolioPosition] = []
     running_risk = 0.0
-
     for position in positions:
         remaining_risk = max_total_risk - running_risk
-
         if remaining_risk <= 0:
             break
-
         if position.max_loss <= remaining_risk:
             final_positions.append(position)
             running_risk += position.max_loss
             continue
-
         per_contract_risk = (
             position.max_loss / position.contracts
         )
-
         allowed_contracts = int(
             remaining_risk // per_contract_risk
         )
-
         if allowed_contracts <= 0:
             continue
-
         adjusted_loss = (
             allowed_contracts
             * per_contract_risk
         )
-
         final_positions.append(
             PortfolioPosition(
                 trade=position.trade,
@@ -1798,12 +1484,8 @@ def build_portfolio(
                 risk_weight=position.risk_weight,
             )
         )
-
         running_risk += adjusted_loss
-
     return final_positions
-
-
 def print_portfolio_plan(
     positions: List[PortfolioPosition],
     account_equity: float,
@@ -1811,12 +1493,10 @@ def print_portfolio_plan(
     print("\n" + "=" * 130)
     print(" PORTFOLIO PLAN")
     print("=" * 130)
-
     if not positions:
         print("No trades passed portfolio construction.")
         print("=" * 130)
         return
-
     print(
         f"{'Rank':<5}"
         f"{'Ticker':<8}"
@@ -1827,15 +1507,11 @@ def print_portfolio_plan(
         f"{'TradeScore':>12}"
         f"  {'Option':<24}"
     )
-
     print("-" * 130)
-
     total_premium = 0.0
     total_risk = 0.0
-
     for rank, position in enumerate(positions, start=1):
         trade = position.trade
-
         print(
             f"{rank:<5}"
             f"{trade.stock_symbol:<8}"
@@ -1846,37 +1522,27 @@ def print_portfolio_plan(
             f"{trade.trade_score:>12.1f}"
             f"  {trade.option_symbol:<24}"
         )
-
         total_premium += position.premium_deployed
         total_risk += position.max_loss
-
     print("-" * 130)
-
     print(
         f"Total premium deployed: ${total_premium:,.2f}"
     )
-
     print(
         f"Total planned max loss: ${total_risk:,.2f} "
         f"({total_risk / account_equity:.2%})"
     )
-
     print(
         f"Account equity:          ${account_equity:,.2f}"
     )
-
     print(
         f"Remaining capital:       "
         f"${account_equity - total_premium:,.2f}"
     )
-
     print("=" * 130)
-
-
-================================================================================
+=====
 # FILE: strategy/scanner.py
-================================================================================
-
+=====
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -1884,16 +1550,12 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 from scipy.stats import rankdata
-
 from strategy.universe import BENCHMARK_SYMBOL, UNIVERSE
-
-
 @dataclass
 class ScannedStock:
     """Represents a scanned stock with raw technical metrics, component sub-scores,
     and its composite score.
     """
-
     symbol: str
     price: float
     return_1d: float
@@ -1915,39 +1577,33 @@ class ScannedStock:
     trend_score: float
     score: float
     rank: Optional[int] = None
-
-
-def extract_stock_metrics(
-    symbol: str,
-    stock_df: pd.DataFrame,
-    spy_return_20d: float,
-) -> Optional[Dict]:
-    """Calculate raw technical metrics for a single stock from its daily bars."""
-    sorted_df = stock_df.sort_index().copy()
-
-    # The scanner is based on completed daily observations.
-    # Never use the current in-progress trading day's bar.
+def _completed_daily_bars(df: pd.DataFrame) -> pd.DataFrame:
+    """Return only completed daily bars."""
     ny_today = datetime.now(ZoneInfo("America/New_York")).date()
+    sorted_df = df.sort_index().copy()
     if hasattr(sorted_df.index, "tz"):
         index_dates = sorted_df.index.tz_convert(
             "America/New_York"
         ).date
     else:
         index_dates = sorted_df.index.date
-
-    sorted_df = sorted_df.loc[index_dates < ny_today]
+    return sorted_df.loc[index_dates < ny_today]
+def extract_stock_metrics(
+    symbol: str,
+    stock_df: pd.DataFrame,
+    spy_return_20d: float,
+) -> Optional[Dict]:
+    """Calculate raw technical metrics for a single stock from its daily bars."""
+    sorted_df = _completed_daily_bars(stock_df)
     if len(sorted_df) < 21:
         return None
-
     closes = sorted_df["close"].values
     volumes = sorted_df["volume"].values
     current_price = float(closes[-1])
-
     # 1. Returns: 1-day, 5-day, 20-day
     ret_1d = float((closes[-1] - closes[-2]) / closes[-2]) if len(closes) >= 2 else 0.0
     ret_5d = float((closes[-1] - closes[-6]) / closes[-6]) if len(closes) >= 6 else 0.0
     ret_20d = float((closes[-1] - closes[-21]) / closes[-21]) if len(closes) >= 21 else 0.0
-
     # 2. Volume / Average Volume (20-day historical average excluding current bar)
     current_volume = float(volumes[-1])
     if len(volumes) >= 21:
@@ -1956,41 +1612,33 @@ def extract_stock_metrics(
         avg_volume_20d = float(np.mean(volumes[:-1]))
     else:
         avg_volume_20d = float(volumes[0])
-
     volume_ratio = current_volume / avg_volume_20d if avg_volume_20d > 0 else 1.0
-
     # 3. Distance from Moving Averages (20d & 50d)
     sma_20 = float(np.mean(closes[-20:])) if len(closes) >= 20 else float(np.mean(closes))
     dist_sma20 = (current_price - sma_20) / sma_20 if sma_20 > 0 else 0.0
-
     if len(closes) >= 50:
         sma_50 = float(np.mean(closes[-50:]))
         dist_sma50 = (current_price - sma_50) / sma_50 if sma_50 > 0 else dist_sma20
     else:
         sma_50 = sma_20
         dist_sma50 = dist_sma20
-
     # 4. Realized Volatility (Annualized 20-day log return standard deviation)
     if len(closes) >= 21:
         log_returns = np.diff(np.log(closes[-21:]))
     else:
         log_returns = np.diff(np.log(closes))
-
     if len(log_returns) > 1:
         realized_vol = float(np.std(log_returns, ddof=1) * np.sqrt(252))
     else:
         realized_vol = 0.0
-
     # 5. Relative Strength vs SPY (20-day excess return over benchmark)
     rs_spy = float(ret_20d - spy_return_20d)
-
     # Raw factor indicators for ranking
     raw_momentum = 0.20 * ret_1d + 0.30 * ret_5d + 0.50 * ret_20d
     raw_volume = volume_ratio
     raw_volatility = realized_vol
     raw_relative_strength = rs_spy
     raw_trend = 0.50 * dist_sma20 + 0.50 * dist_sma50
-
     return {
         "symbol": symbol,
         "price": current_price,
@@ -2012,11 +1660,8 @@ def extract_stock_metrics(
         "raw_relative_strength": raw_relative_strength,
         "raw_trend": raw_trend,
     }
-
-
 def score_and_rank_stocks(metrics_list: List[Dict]) -> List[ScannedStock]:
     """Normalize raw indicators into 0-100 percentile scores and compute
-
     the weighted composite score:
         score = (
             0.30 * momentum_score
@@ -2029,7 +1674,6 @@ def score_and_rank_stocks(metrics_list: List[Dict]) -> List[ScannedStock]:
     n = len(metrics_list)
     if n == 0:
         return []
-
     if n == 1:
         m = metrics_list[0]
         return [
@@ -2057,20 +1701,17 @@ def score_and_rank_stocks(metrics_list: List[Dict]) -> List[ScannedStock]:
                 rank=1,
             )
         ]
-
     # Percentile ranking (0 to 100) across universe
     raw_m = np.array([m["raw_momentum"] for m in metrics_list])
     raw_v = np.array([m["raw_volume"] for m in metrics_list])
     raw_vol = np.array([m["raw_volatility"] for m in metrics_list])
     raw_rs = np.array([m["raw_relative_strength"] for m in metrics_list])
     raw_t = np.array([m["raw_trend"] for m in metrics_list])
-
     momentum_scores = (rankdata(raw_m) - 1.0) / (n - 1.0) * 100.0
     volume_scores = (rankdata(raw_v) - 1.0) / (n - 1.0) * 100.0
     volatility_scores = (rankdata(raw_vol) - 1.0) / (n - 1.0) * 100.0
     rs_scores = (rankdata(raw_rs) - 1.0) / (n - 1.0) * 100.0
     trend_scores = (rankdata(raw_t) - 1.0) / (n - 1.0) * 100.0
-
     scanned_stocks = []
     for i, m in enumerate(metrics_list):
         mom_score = float(momentum_scores[i])
@@ -2078,7 +1719,6 @@ def score_and_rank_stocks(metrics_list: List[Dict]) -> List[ScannedStock]:
         vola_score = float(volatility_scores[i])
         rs_score = float(rs_scores[i])
         tr_score = float(trend_scores[i])
-
         composite_score = (
             0.30 * mom_score
             + 0.25 * vol_score
@@ -2086,7 +1726,6 @@ def score_and_rank_stocks(metrics_list: List[Dict]) -> List[ScannedStock]:
             + 0.15 * rs_score
             + 0.10 * tr_score
         )
-
         scanned_stocks.append(
             ScannedStock(
                 symbol=m["symbol"],
@@ -2111,15 +1750,11 @@ def score_and_rank_stocks(metrics_list: List[Dict]) -> List[ScannedStock]:
                 score=composite_score,
             )
         )
-
     # Sort descending by score and assign ranks
     scanned_stocks.sort(key=lambda s: s.score, reverse=True)
     for rank_idx, stock in enumerate(scanned_stocks, start=1):
         stock.rank = rank_idx
-
     return scanned_stocks
-
-
 def scan_stock_bars(
     bars_df: pd.DataFrame,
     universe: Optional[List[str]] = None,
@@ -2127,25 +1762,31 @@ def scan_stock_bars(
     top_n: int = 15,
 ) -> List[ScannedStock]:
     """Pure strategy scanner logic that processes a DataFrame of daily bars
-
     and returns the top N ranked candidates.
     """
     target_universe = list(universe) if universe else list(UNIVERSE)
-
     # 1. Calculate SPY 20d benchmark return
     spy_return_20d = 0.0
     if benchmark_symbol in bars_df.index.levels[0]:
-        spy_df = bars_df.xs(benchmark_symbol, level=0).sort_index()
+        spy_df = bars_df.xs(
+            benchmark_symbol,
+            level=0,
+        )
+        spy_df = _completed_daily_bars(spy_df)
         spy_closes = spy_df["close"].values
         if len(spy_closes) >= 21:
-            spy_return_20d = float((spy_closes[-1] - spy_closes[-21]) / spy_closes[-21])
+            spy_return_20d = float(
+                (spy_closes[-1] - spy_closes[-21])
+                / spy_closes[-21]
+            )
         elif len(spy_closes) > 1:
-            spy_return_20d = float((spy_closes[-1] - spy_closes[0]) / spy_closes[0])
-
+            spy_return_20d = float(
+                (spy_closes[-1] - spy_closes[0])
+                / spy_closes[0]
+            )
     # 2. Extract metrics for all available stocks in universe
     metrics_list = []
     available_symbols = set(bars_df.index.levels[0])
-
     for symbol in target_universe:
         if symbol not in available_symbols:
             continue
@@ -2153,25 +1794,20 @@ def scan_stock_bars(
         metrics = extract_stock_metrics(symbol, sdf, spy_return_20d)
         if metrics is not None:
             metrics_list.append(metrics)
-
     # 3. Score and rank
     ranked_stocks = score_and_rank_stocks(metrics_list)
     return ranked_stocks[:top_n]
-
-
 def print_scan_results(stocks: List[ScannedStock], title: str = "Top Stock Scanner Picks") -> None:
     """Display scan results in a clear terminal table."""
     print(f"\n{'=' * 118}")
     print(f" {title.upper()} (Top {len(stocks)})")
     print(f"{'=' * 118}")
-
     header = (
         f"{'Rank':<5} {'Symbol':<7} {'Price':>8} {'1D Ret':>8} {'5D Ret':>8} {'20D Ret':>9} "
         f"{'Vol/Avg':>8} {'SMA20%':>8} {'RealVol':>8} {'RS vs SPY':>10} {'Score':>7}"
     )
     print(header)
     print(f"{'-' * 118}")
-
     for stock in stocks:
         rank_str = f"#{stock.rank}" if stock.rank is not None else "-"
         print(
@@ -2187,49 +1823,33 @@ def print_scan_results(stocks: List[ScannedStock], title: str = "Top Stock Scann
             f"{stock.relative_strength_spy:>+9.2%} "
             f"{stock.score:>7.1f}"
         )
-
     print(f"{'=' * 118}\n")
-
-
-
-================================================================================
+=====
 # FILE: strategy/trade_scorer.py
-================================================================================
-
+=====
 from dataclasses import dataclass
-
 from strategy.llm import LLMDecision
-
-
 @dataclass
 class ScoredTrade:
     stock_symbol: str
     option_symbol: str
     direction: str
-
     stock_score: float
     option_score: float
     llm_confidence: float
     trade_score: float
-
     thesis: str
     invalidation: str
-
     dte: int
     spread_pct: float
-
     underlying_price: float
-
     option_bid: float
     option_ask: float
     option_mid: float
-
     option_delta: float | None
     option_gamma: float | None
     option_vega: float | None
     option_theta: float | None
-
-
 def calculate_trade_score(
     stock_score: float,
     option_score: float,
@@ -2241,9 +1861,7 @@ def calculate_trade_score(
     Combine stock quality, option quality, LLM confidence,
     liquidity and time-to-expiry into one trade score.
     """
-
     option_quality = option_score
-
     # Liquidity penalty.
     if spread_pct <= 0.03:
         liquidity_score = 100.0
@@ -2255,7 +1873,6 @@ def calculate_trade_score(
         liquidity_score = 55.0
     else:
         liquidity_score = 25.0
-
     # Prefer short duration for this particular competition,
     # without preferring contracts expiring immediately.
     if 2 <= dte <= 7:
@@ -2266,9 +1883,7 @@ def calculate_trade_score(
         dte_score = 65.0
     else:
         dte_score = 40.0
-
     confidence_score = llm_confidence * 100.0
-
     score = (
         0.30 * stock_score
         + 0.30 * option_quality
@@ -2276,10 +1891,7 @@ def calculate_trade_score(
         + 0.10 * liquidity_score
         + 0.05 * dte_score
     )
-
     return round(score, 2)
-
-
 def score_trade(
     stock,
     option,
@@ -2289,7 +1901,6 @@ def score_trade(
     """
     Convert a stock + option + LLM decision into a single scored trade.
     """
-
     trade_score = calculate_trade_score(
         stock_score=stock.score,
         option_score=option.score,
@@ -2297,7 +1908,6 @@ def score_trade(
         spread_pct=option.spread_pct,
         dte=option.dte,
     )
-
     return ScoredTrade(
         stock_symbol=stock.symbol,
         option_symbol=option.symbol,
@@ -2319,56 +1929,38 @@ def score_trade(
         option_vega=option.vega,
         option_theta=option.theta,
     )
-
-
 def validate_trade(trade: ScoredTrade) -> tuple[bool, str]:
     """
     Validate that a scored trade satisfies the invariants
     required by portfolio construction.
     """
-
     if trade.direction not in {"BULLISH", "BEARISH"}:
         return False, "Invalid trade direction."
-
     if not 0.0 <= trade.trade_score <= 100.0:
         return False, "Trade score outside 0-100 range."
-
     if not 0.0 <= trade.stock_score <= 100.0:
         return False, "Stock score outside 0-100 range."
-
     if not 0.0 <= trade.option_score <= 100.0:
         return False, "Option score outside 0-100 range."
-
     if not 0.0 <= trade.llm_confidence <= 1.0:
         return False, "LLM confidence outside 0-1 range."
-
     if trade.dte < 1:
         return False, "Option expires too soon."
-
     if trade.option_bid <= 0:
         return False, "Invalid option bid."
-
     if trade.option_ask <= 0:
         return False, "Invalid option ask."
-
     if trade.option_ask < trade.option_bid:
         return False, "Ask is below bid."
-
     if trade.option_mid <= 0:
         return False, "Invalid option midpoint."
-
     if trade.spread_pct < 0:
         return False, "Negative spread."
-
     return True, "Valid trade."
-
-
-================================================================================
+=====
 # FILE: strategy/universe.py
-================================================================================
-
+=====
 BENCHMARK_SYMBOL = "SPY"
-
 # 50 liquid US equities with active options markets
 UNIVERSE = [
     "AAPL",
@@ -2422,49 +2014,39 @@ UNIVERSE = [
     "BA",
     "UBER",
 ]
-
-
-================================================================================
+=====
 # FILE: main.py
-================================================================================
-
+=====
 from alpaca_client.client import get_trading_client
 from alpaca_client.options import print_best_candidates, inspect_options, get_option_chain
 from alpaca_client.stocks import (
     print_top_scanned_stocks,
     get_latest_underlying_prices,
 )
-
 from strategy.option_selector import select_directional_options
 from strategy.llm import analyze_trade
 from strategy.trade_scorer import score_trade, ScoredTrade, validate_trade
 from strategy.portfolio import build_portfolio, print_portfolio_plan
 from risk.risk import assess_portfolio, print_risk_report
 from strategy.direction import TradeDirection, determine_direction
-
 def main() -> None:
     trading_client = get_trading_client()
     account = trading_client.get_account()
-
     print("=== Connected to Alpaca (Paper Trading) ===")
     print(f"Account ID:     {account.id}")
     print(f"Equity:         ${float(account.equity):,.2f}")
     print(f"Buying power:   ${float(account.buying_power):,.2f}")
     print(f"Options level:  {account.options_trading_level} (approved: {account.options_approved_level})")
-
     # 1. Scan 50-stock universe and display top 15 ranked candidates
     print("\nScanning 50-stock universe...")
     top_candidates = print_top_scanned_stocks(top_n=15)
-
     # 2. Inspect directional option candidates for the top stocks
     if top_candidates:
         latest_prices = get_latest_underlying_prices(
             [stock.symbol for stock in top_candidates]
         )
         print("\nAnalyzing option opportunities across top 15 stocks...")
-
         all_trade_candidates = []
-
         for stock in top_candidates:
             underlying_price = latest_prices.get(stock.symbol)
             if underlying_price is None:
@@ -2473,22 +2055,17 @@ def main() -> None:
                     "no fresh underlying price available."
                 )
                 continue
-
             if underlying_price <= 0:
                 print(
                     f"Skipping {stock.symbol}: "
                     f"invalid underlying price {underlying_price}."
                 )
                 continue
-
             # Get option chain
             chain = get_option_chain(stock.symbol)
-
             direction = determine_direction(stock)
-
             if direction == TradeDirection.NEUTRAL:
                 continue
-
             options = select_directional_options(
                 chain=chain,
                 underlying_price=underlying_price,
@@ -2496,36 +2073,28 @@ def main() -> None:
             )
             for option in options[:5]:
                 decision = analyze_trade(option, stock)
-
                 if decision.decision == "WATCH":
                     continue
-
                 scored_trade = score_trade(
                     stock=stock,
                     option=option,
                     decision=decision,
                     underlying_price=underlying_price,
                 )
-
                 is_valid, reason = validate_trade(scored_trade)
-
                 if not is_valid:
                     print(
                         f"Skipping {scored_trade.option_symbol}: {reason}"
                     )
                     continue
-
                 all_trade_candidates.append(scored_trade)
-    
         print("\n" + "=" * 120)
         print(" TOP TRADE CANDIDATES")
         print("=" * 120)
-
         all_trade_candidates.sort(
             key=lambda x: x.trade_score,
             reverse=True,
         )
-
         for i, trade in enumerate(all_trade_candidates[:20], start=1):
             print(
                 f"#{i:<3} "
@@ -2537,28 +2106,21 @@ def main() -> None:
                 f"LLM={trade.llm_confidence:.2f} "
                 f"Option={trade.option_symbol}"
             )
-
         portfolio = build_portfolio(
             trades=all_trade_candidates,
             account_equity=float(account.equity),
         )
-
         print_portfolio_plan(
             positions=portfolio,
             account_equity=float(account.equity),
         )
-
         risk_report = assess_portfolio(
             positions=portfolio,
             account_equity=float(account.equity),
         )
-
         print_risk_report(
             report=risk_report,
             account_equity=float(account.equity),
         )
-
 if __name__ == "__main__":
     main()
-
-

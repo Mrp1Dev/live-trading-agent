@@ -49,10 +49,7 @@ def analyze_trade(candidate, stock):
         decision = expected_direction.value
     confidence = min(
         0.95,
-        max(
-            0.50,
-            0.50 + abs(stock.score - 50.0) / 100.0,
-        ),
+        0.50 + max(stock.score - 50.0, 0.0) / 100.0,
     )
 
     if decision == "BULLISH":

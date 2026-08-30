@@ -38,17 +38,12 @@ class ScannedStock:
     rank: Optional[int] = None
 
 
-def extract_stock_metrics(
-    symbol: str,
-    stock_df: pd.DataFrame,
-    spy_return_20d: float,
-) -> Optional[Dict]:
-    """Calculate raw technical metrics for a single stock from its daily bars."""
-    sorted_df = stock_df.sort_index().copy()
-
-    # The scanner is based on completed daily observations.
-    # Never use the current in-progress trading day's bar.
+def _completed_daily_bars(df: pd.DataFrame) -> pd.DataFrame:
+    """Return only completed daily bars."""
     ny_today = datetime.now(ZoneInfo("America/New_York")).date()
+
+    sorted_df = df.sort_index().copy()
+
     if hasattr(sorted_df.index, "tz"):
         index_dates = sorted_df.index.tz_convert(
             "America/New_York"
@@ -56,7 +51,16 @@ def extract_stock_metrics(
     else:
         index_dates = sorted_df.index.date
 
-    sorted_df = sorted_df.loc[index_dates < ny_today]
+    return sorted_df.loc[index_dates < ny_today]
+
+
+def extract_stock_metrics(
+    symbol: str,
+    stock_df: pd.DataFrame,
+    spy_return_20d: float,
+) -> Optional[Dict]:
+    """Calculate raw technical metrics for a single stock from its daily bars."""
+    sorted_df = _completed_daily_bars(stock_df)
     if len(sorted_df) < 21:
         return None
 
@@ -255,13 +259,27 @@ def scan_stock_bars(
 
     # 1. Calculate SPY 20d benchmark return
     spy_return_20d = 0.0
+
     if benchmark_symbol in bars_df.index.levels[0]:
-        spy_df = bars_df.xs(benchmark_symbol, level=0).sort_index()
+        spy_df = bars_df.xs(
+            benchmark_symbol,
+            level=0,
+        )
+
+        spy_df = _completed_daily_bars(spy_df)
+
         spy_closes = spy_df["close"].values
+
         if len(spy_closes) >= 21:
-            spy_return_20d = float((spy_closes[-1] - spy_closes[-21]) / spy_closes[-21])
+            spy_return_20d = float(
+                (spy_closes[-1] - spy_closes[-21])
+                / spy_closes[-21]
+            )
         elif len(spy_closes) > 1:
-            spy_return_20d = float((spy_closes[-1] - spy_closes[0]) / spy_closes[0])
+            spy_return_20d = float(
+                (spy_closes[-1] - spy_closes[0])
+                / spy_closes[0]
+            )
 
     # 2. Extract metrics for all available stocks in universe
     metrics_list = []
