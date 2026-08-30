@@ -11,6 +11,13 @@ from strategy.trade_scorer import score_trade, ScoredTrade, validate_trade
 from strategy.portfolio import build_portfolio, print_portfolio_plan
 from risk.risk import assess_portfolio, print_risk_report
 from strategy.direction import TradeDirection, determine_direction
+from strategy.research_agent import (
+    research_stocks,
+    research_text_by_symbol,
+    print_research_reports,
+)
+from strategy.llm_ranker import rank_stocks
+from config import STOCK_SCANNER_TOP_N, LLM_STOCK_TOP_K
 
 def main() -> None:
     trading_client = get_trading_client()
@@ -24,18 +31,67 @@ def main() -> None:
 
     # 1. Scan 50-stock universe and display top 15 ranked candidates
     print("\nScanning 50-stock universe...")
-    top_candidates = print_top_scanned_stocks(top_n=15)
+    top_candidates = print_top_scanned_stocks(
+        top_n=STOCK_SCANNER_TOP_N
+    )
 
-    # 2. Inspect directional option candidates for the top stocks
     if top_candidates:
-        latest_prices = get_latest_underlying_prices(
-            [stock.symbol for stock in top_candidates]
-        )
-        print("\nAnalyzing option opportunities across top 15 stocks...")
+        # Research all scanner-selected stocks.
+        research_reports = research_stocks(top_candidates)
+        print_research_reports(research_reports)
+        research = research_text_by_symbol(research_reports)
 
+        # LLM ranks stocks comparatively.
+        ranked_symbols = rank_stocks(
+            stocks=top_candidates,
+            research=research,
+            debug=True,
+        )
+
+        # Restore ScannedStock objects in LLM order.
+        stocks_by_symbol = {
+            stock.symbol: stock
+            for stock in top_candidates
+        }
+
+        ranked_candidates = [
+            stocks_by_symbol[symbol]
+            for symbol in ranked_symbols
+        ]
+
+        print("\n" + "=" * 120)
+        print(" LLM STOCK RANKING")
+        print("=" * 120)
+
+        for llm_rank, symbol in enumerate(ranked_symbols, start=1):
+            stock = stocks_by_symbol[symbol]
+            scanner_rank = stock.rank if stock.rank is not None else "-"
+            print(
+                f"#{llm_rank:<2} "
+                f"{symbol:<6} "
+                f"Scanner=#{scanner_rank:<3} "
+                f"ScannerScore={stock.score:>5.1f}"
+            )
+
+        # Only send LLM top-K into option selection.
+        selected_stocks = ranked_candidates[:LLM_STOCK_TOP_K]
+
+        print("\nLLM-RANKED STOCKS")
+        for rank, stock in enumerate(selected_stocks, start=1):
+            print(
+                f"#{rank:<2} {stock.symbol:<6} "
+                f"Scanner=#{stock.rank:<2} "
+                f"ScannerScore={stock.score:.1f}"
+            )
+
+        latest_prices = get_latest_underlying_prices(
+            [stock.symbol for stock in selected_stocks]
+        )
+
+        print("\nAnalyzing option opportunities across LLM top-K...")
         all_trade_candidates = []
 
-        for stock in top_candidates:
+        for stock in selected_stocks:
             underlying_price = latest_prices.get(stock.symbol)
             if underlying_price is None:
                 print(
