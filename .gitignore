@@ -6,3 +6,7 @@ logs/
 
 combined_codebase.txt
 state/
+
+# build scratch
+_header.txt
+_pipeline_body.txt
