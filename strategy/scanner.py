@@ -1,12 +1,58 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional
-from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
-from scipy.stats import rankdata
 
 from strategy.universe import BENCHMARK_SYMBOL, UNIVERSE
+
+# ---------------------------------------------------------------------------
+# Market clock
+# ---------------------------------------------------------------------------
+# ZoneInfo needs the IANA database, which a bare Windows install does not ship.
+# Falling back to a fixed offset keeps the module importable; the exchange date
+# is what matters here and an hour of DST drift cannot change it.
+
+try:  # pragma: no cover - environment dependent
+    from zoneinfo import ZoneInfo
+
+    MARKET_TZ = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover - environment dependent
+    from datetime import timezone
+
+    MARKET_TZ = timezone(timedelta(hours=-4), name="America/New_York")
+
+# ---------------------------------------------------------------------------
+# Scoring configuration
+# ---------------------------------------------------------------------------
+
+# Composite weights. These sum to 1.0 and each component is on a 0-100 scale.
+WEIGHT_MOMENTUM = 0.30
+WEIGHT_VOLUME = 0.25
+WEIGHT_VOLATILITY = 0.20
+WEIGHT_RELATIVE_STRENGTH = 0.15
+WEIGHT_TREND = 0.10
+
+# Realized-volatility regime preference, annualized.
+#
+# The previous implementation scored volatility as an unsigned percentile, so the
+# single highest-volatility name in the universe scored 100. High realized vol
+# means high implied vol means expensive premium, and that premium was then
+# bought outright as a short-dated single leg: the selection criterion and the
+# instrument worked against each other.
+#
+# Volatility now expresses REGIME TRADEABILITY rather than "more is better":
+# a name too quiet to travel far enough to cover a breakeven scores badly, and so
+# does a name whose vol is so extreme that the premium is unaffordable and jump
+# risk dominates. Whether the premium is fairly priced is a different question,
+# and it is answered in one place only - the option selector's IV-vs-realized-vol
+# gate - so the two stages no longer fight over the same signal.
+VOL_BAND_LOW = 0.25       # below this, the name is too quiet to pay for premium
+VOL_BAND_HIGH = 0.55      # above this, premium gets expensive fast
+VOL_FLOOR = 0.10          # scores 0
+VOL_CEILING = 1.20        # scores 0
+
+MIN_BARS_REQUIRED = 21
 
 
 @dataclass
@@ -38,54 +84,123 @@ class ScannedStock:
     rank: Optional[int] = None
 
 
-def _completed_daily_bars(df: pd.DataFrame) -> pd.DataFrame:
-    """Return only completed daily bars."""
-    ny_today = datetime.now(ZoneInfo("America/New_York")).date()
+# ---------------------------------------------------------------------------
+# Bar preparation
+# ---------------------------------------------------------------------------
 
-    sorted_df = df.sort_index().copy()
 
-    if hasattr(sorted_df.index, "tz"):
-        index_dates = sorted_df.index.tz_convert(
-            "America/New_York"
-        ).date
+def _exchange_today(as_of: Optional[datetime] = None) -> date:
+    """Today's date on the exchange clock.
+
+    Never use the local system date. On a machine east of New York, the local
+    date rolls over hours before the exchange date does, which would classify the
+    most recent completed session as "today" and silently drop it.
+    """
+    if as_of is None:
+        return datetime.now(MARKET_TZ).date()
+    if as_of.tzinfo is None:
+        return as_of.date()
+    return as_of.astimezone(MARKET_TZ).date()
+
+
+def _completed_daily_bars(
+    df: pd.DataFrame,
+    as_of: Optional[datetime] = None,
+) -> pd.DataFrame:
+    """Return only completed daily bars, strictly before the exchange date.
+
+    `as_of` lets the scanner be replayed at a historical decision timestamp
+    instead of the wall clock, which is what makes a deterministic backtest
+    possible. Default behaviour is unchanged.
+    """
+    cutoff = _exchange_today(as_of)
+
+    sorted_df = df.sort_index()
+
+    index = sorted_df.index
+    # A tz-naive DatetimeIndex still HAS a `.tz` attribute (it is None), so
+    # testing with hasattr calls tz_convert on naive data and raises. Test the
+    # value, not the attribute's existence.
+    if getattr(index, "tz", None) is not None:
+        index_dates = index.tz_convert(MARKET_TZ).date
+    elif isinstance(index, pd.DatetimeIndex):
+        index_dates = index.date
     else:
-        index_dates = sorted_df.index.date
+        try:
+            index_dates = pd.to_datetime(index).date
+        except (TypeError, ValueError):
+            return sorted_df
 
-    return sorted_df.loc[index_dates < ny_today]
+    return sorted_df.loc[index_dates < cutoff]
+
+
+def _clean_close_volume(sorted_df: pd.DataFrame) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    """Extract close/volume arrays, or None if the data cannot support metrics.
+
+    Missing or non-positive prices are treated as a data gap and reject the
+    symbol. They are deliberately NOT forward-filled or zero-filled: a fabricated
+    price produces a real-looking score, which is worse than no score at all.
+    """
+    if "close" not in sorted_df.columns or "volume" not in sorted_df.columns:
+        return None
+
+    closes = pd.to_numeric(sorted_df["close"], errors="coerce").to_numpy(dtype=float)
+    volumes = pd.to_numeric(sorted_df["volume"], errors="coerce").to_numpy(dtype=float)
+
+    if closes.size < MIN_BARS_REQUIRED:
+        return None
+    if not np.all(np.isfinite(closes)) or np.any(closes <= 0):
+        return None
+    if not np.all(np.isfinite(volumes)) or np.any(volumes < 0):
+        return None
+
+    return closes, volumes
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
 
 
 def extract_stock_metrics(
     symbol: str,
     stock_df: pd.DataFrame,
     spy_return_20d: float,
+    as_of: Optional[datetime] = None,
 ) -> Optional[Dict]:
-    """Calculate raw technical metrics for a single stock from its daily bars."""
-    sorted_df = _completed_daily_bars(stock_df)
-    if len(sorted_df) < 21:
+    """Calculate raw technical metrics for a single stock from its daily bars.
+
+    Returns None when the bars cannot support a trustworthy metric set, so the
+    symbol is dropped rather than scored on defaults.
+    """
+    sorted_df = _completed_daily_bars(stock_df, as_of=as_of)
+    if len(sorted_df) < MIN_BARS_REQUIRED:
         return None
 
-    closes = sorted_df["close"].values
-    volumes = sorted_df["volume"].values
+    cleaned = _clean_close_volume(sorted_df)
+    if cleaned is None:
+        return None
+
+    closes, volumes = cleaned
     current_price = float(closes[-1])
 
     # 1. Returns: 1-day, 5-day, 20-day
-    ret_1d = float((closes[-1] - closes[-2]) / closes[-2]) if len(closes) >= 2 else 0.0
-    ret_5d = float((closes[-1] - closes[-6]) / closes[-6]) if len(closes) >= 6 else 0.0
-    ret_20d = float((closes[-1] - closes[-21]) / closes[-21]) if len(closes) >= 21 else 0.0
+    ret_1d = float((closes[-1] - closes[-2]) / closes[-2])
+    ret_5d = float((closes[-1] - closes[-6]) / closes[-6])
+    ret_20d = float((closes[-1] - closes[-21]) / closes[-21])
 
     # 2. Volume / Average Volume (20-day historical average excluding current bar)
     current_volume = float(volumes[-1])
-    if len(volumes) >= 21:
-        avg_volume_20d = float(np.mean(volumes[-21:-1]))
-    elif len(volumes) >= 2:
-        avg_volume_20d = float(np.mean(volumes[:-1]))
-    else:
-        avg_volume_20d = float(volumes[0])
+    avg_volume_20d = float(np.mean(volumes[-21:-1]))
 
-    volume_ratio = current_volume / avg_volume_20d if avg_volume_20d > 0 else 1.0
+    if avg_volume_20d <= 0:
+        # No traded history to compare against; the ratio would be meaningless.
+        return None
+
+    volume_ratio = current_volume / avg_volume_20d
 
     # 3. Distance from Moving Averages (20d & 50d)
-    sma_20 = float(np.mean(closes[-20:])) if len(closes) >= 20 else float(np.mean(closes))
+    sma_20 = float(np.mean(closes[-20:]))
     dist_sma20 = (current_price - sma_20) / sma_20 if sma_20 > 0 else 0.0
 
     if len(closes) >= 50:
@@ -96,15 +211,8 @@ def extract_stock_metrics(
         dist_sma50 = dist_sma20
 
     # 4. Realized Volatility (Annualized 20-day log return standard deviation)
-    if len(closes) >= 21:
-        log_returns = np.diff(np.log(closes[-21:]))
-    else:
-        log_returns = np.diff(np.log(closes))
-
-    if len(log_returns) > 1:
-        realized_vol = float(np.std(log_returns, ddof=1) * np.sqrt(252))
-    else:
-        realized_vol = 0.0
+    log_returns = np.diff(np.log(closes[-21:]))
+    realized_vol = float(np.std(log_returns, ddof=1) * np.sqrt(252)) if log_returns.size > 1 else 0.0
 
     # 5. Relative Strength vs SPY (20-day excess return over benchmark)
     rs_spy = float(ret_20d - spy_return_20d)
@@ -139,10 +247,63 @@ def extract_stock_metrics(
     }
 
 
-def score_and_rank_stocks(metrics_list: List[Dict]) -> List[ScannedStock]:
-    """Normalize raw indicators into 0-100 percentile scores and compute
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
 
-    the weighted composite score:
+
+def _average_rank(values: np.ndarray) -> np.ndarray:
+    """Average-method ranks, identical to scipy.stats.rankdata(values).
+
+    Implemented locally so the scanner does not pull scipy in for one function.
+    Ties receive the mean of the ranks they span.
+    """
+    n = values.size
+    order = np.argsort(values, kind="mergesort")
+    ordered = values[order]
+    ranks = np.empty(n, dtype=float)
+
+    start = 0
+    while start < n:
+        stop = start
+        while stop + 1 < n and ordered[stop + 1] == ordered[start]:
+            stop += 1
+        ranks[order[start : stop + 1]] = (start + stop) / 2.0 + 1.0
+        start = stop + 1
+
+    return ranks
+
+
+def _percentile_scores(values: np.ndarray) -> np.ndarray:
+    """Map raw indicator values onto a 0-100 percentile scale."""
+    n = values.size
+    if n <= 1:
+        return np.full(n, 100.0)
+    return (_average_rank(values) - 1.0) / (n - 1.0) * 100.0
+
+
+def volatility_regime_score(realized_vol: float) -> float:
+    """Score a realized-volatility regime for tradeability, on 0-100.
+
+    Piecewise linear: full marks inside the band, tapering to zero at the floor
+    and the ceiling. This is an ABSOLUTE score, not a percentile, so it does not
+    depend on which other symbols happened to be scanned in the same batch -
+    the same stock on the same day always scores the same.
+    """
+    if not np.isfinite(realized_vol) or realized_vol <= VOL_FLOOR:
+        return 0.0
+    if realized_vol >= VOL_CEILING:
+        return 0.0
+    if VOL_BAND_LOW <= realized_vol <= VOL_BAND_HIGH:
+        return 100.0
+    if realized_vol < VOL_BAND_LOW:
+        return (realized_vol - VOL_FLOOR) / (VOL_BAND_LOW - VOL_FLOOR) * 100.0
+    return (VOL_CEILING - realized_vol) / (VOL_CEILING - VOL_BAND_HIGH) * 100.0
+
+
+def score_and_rank_stocks(metrics_list: List[Dict]) -> List[ScannedStock]:
+    """Normalize raw indicators into 0-100 scores and compute the weighted composite:
+
         score = (
             0.30 * momentum_score
             + 0.25 * volume_score
@@ -150,66 +311,39 @@ def score_and_rank_stocks(metrics_list: List[Dict]) -> List[ScannedStock]:
             + 0.15 * relative_strength_score
             + 0.10 * trend_score
         )
+
+    Momentum, volume, relative strength and trend are cross-sectional percentiles
+    - they are comparative measures by nature. Volatility is scored absolutely
+    against a regime band (see volatility_regime_score).
     """
     n = len(metrics_list)
     if n == 0:
         return []
 
-    if n == 1:
-        m = metrics_list[0]
-        return [
-            ScannedStock(
-                symbol=m["symbol"],
-                price=m["price"],
-                return_1d=m["return_1d"],
-                return_5d=m["return_5d"],
-                return_20d=m["return_20d"],
-                volume=m["volume"],
-                avg_volume_20d=m["avg_volume_20d"],
-                volume_ratio=m["volume_ratio"],
-                sma_20=m["sma_20"],
-                sma_50=m["sma_50"],
-                distance_sma20=m["distance_sma20"],
-                distance_sma50=m["distance_sma50"],
-                realized_volatility=m["realized_volatility"],
-                relative_strength_spy=m["relative_strength_spy"],
-                momentum_score=100.0,
-                volume_score=100.0,
-                volatility_score=100.0,
-                relative_strength_score=100.0,
-                trend_score=100.0,
-                score=100.0,
-                rank=1,
-            )
-        ]
+    raw_momentum = np.array([m["raw_momentum"] for m in metrics_list], dtype=float)
+    raw_volume = np.array([m["raw_volume"] for m in metrics_list], dtype=float)
+    raw_relative_strength = np.array([m["raw_relative_strength"] for m in metrics_list], dtype=float)
+    raw_trend = np.array([m["raw_trend"] for m in metrics_list], dtype=float)
 
-    # Percentile ranking (0 to 100) across universe
-    raw_m = np.array([m["raw_momentum"] for m in metrics_list])
-    raw_v = np.array([m["raw_volume"] for m in metrics_list])
-    raw_vol = np.array([m["raw_volatility"] for m in metrics_list])
-    raw_rs = np.array([m["raw_relative_strength"] for m in metrics_list])
-    raw_t = np.array([m["raw_trend"] for m in metrics_list])
+    momentum_scores = _percentile_scores(raw_momentum)
+    volume_scores = _percentile_scores(raw_volume)
+    rs_scores = _percentile_scores(raw_relative_strength)
+    trend_scores = _percentile_scores(raw_trend)
 
-    momentum_scores = (rankdata(raw_m) - 1.0) / (n - 1.0) * 100.0
-    volume_scores = (rankdata(raw_v) - 1.0) / (n - 1.0) * 100.0
-    volatility_scores = (rankdata(raw_vol) - 1.0) / (n - 1.0) * 100.0
-    rs_scores = (rankdata(raw_rs) - 1.0) / (n - 1.0) * 100.0
-    trend_scores = (rankdata(raw_t) - 1.0) / (n - 1.0) * 100.0
-
-    scanned_stocks = []
+    scanned_stocks: List[ScannedStock] = []
     for i, m in enumerate(metrics_list):
         mom_score = float(momentum_scores[i])
         vol_score = float(volume_scores[i])
-        vola_score = float(volatility_scores[i])
+        vola_score = float(volatility_regime_score(m["raw_volatility"]))
         rs_score = float(rs_scores[i])
         tr_score = float(trend_scores[i])
 
         composite_score = (
-            0.30 * mom_score
-            + 0.25 * vol_score
-            + 0.20 * vola_score
-            + 0.15 * rs_score
-            + 0.10 * tr_score
+            WEIGHT_MOMENTUM * mom_score
+            + WEIGHT_VOLUME * vol_score
+            + WEIGHT_VOLATILITY * vola_score
+            + WEIGHT_RELATIVE_STRENGTH * rs_score
+            + WEIGHT_TREND * tr_score
         )
 
         scanned_stocks.append(
@@ -237,12 +371,61 @@ def score_and_rank_stocks(metrics_list: List[Dict]) -> List[ScannedStock]:
             )
         )
 
-    # Sort descending by score and assign ranks
-    scanned_stocks.sort(key=lambda s: s.score, reverse=True)
+    # Sort descending by score, breaking ties on symbol so an identical universe
+    # always produces an identical ordering regardless of input order.
+    scanned_stocks.sort(key=lambda s: (-s.score, s.symbol))
     for rank_idx, stock in enumerate(scanned_stocks, start=1):
         stock.rank = rank_idx
 
     return scanned_stocks
+
+
+# ---------------------------------------------------------------------------
+# Universe scan
+# ---------------------------------------------------------------------------
+
+
+def _available_symbols(bars_df: pd.DataFrame) -> set:
+    """Symbols that actually have rows in the frame.
+
+    `index.levels[0]` returns every category the index was BUILT with, including
+    symbols with no surviving rows, so membership tests against it report symbols
+    that are not really present. Use the realized values instead.
+    """
+    index = bars_df.index
+    if isinstance(index, pd.MultiIndex):
+        return set(index.get_level_values(0).unique())
+    return set()
+
+
+def _benchmark_return_20d(
+    bars_df: pd.DataFrame,
+    benchmark_symbol: str,
+    as_of: Optional[datetime] = None,
+) -> float:
+    """20-day benchmark return, or 0.0 when the benchmark is unavailable.
+
+    A missing benchmark makes relative strength collapse to plain return_20d,
+    which is a defensible fallback because the factor is only ever used as a
+    cross-sectional percentile: with no benchmark every symbol is offset by the
+    same constant, so the ranking is unchanged.
+    """
+    if benchmark_symbol not in _available_symbols(bars_df):
+        return 0.0
+
+    spy_df = _completed_daily_bars(bars_df.xs(benchmark_symbol, level=0), as_of=as_of)
+    if "close" not in spy_df.columns:
+        return 0.0
+
+    spy_closes = pd.to_numeric(spy_df["close"], errors="coerce").to_numpy(dtype=float)
+    spy_closes = spy_closes[np.isfinite(spy_closes)]
+    spy_closes = spy_closes[spy_closes > 0]
+
+    if spy_closes.size >= MIN_BARS_REQUIRED:
+        return float((spy_closes[-1] - spy_closes[-21]) / spy_closes[-21])
+    if spy_closes.size > 1:
+        return float((spy_closes[-1] - spy_closes[0]) / spy_closes[0])
+    return 0.0
 
 
 def scan_stock_bars(
@@ -250,46 +433,29 @@ def scan_stock_bars(
     universe: Optional[List[str]] = None,
     benchmark_symbol: str = BENCHMARK_SYMBOL,
     top_n: int = 15,
+    as_of: Optional[datetime] = None,
 ) -> List[ScannedStock]:
     """Pure strategy scanner logic that processes a DataFrame of daily bars
 
-    and returns the top N ranked candidates.
+    and returns the top N ranked candidates. Makes no API calls.
     """
     target_universe = list(universe) if universe else list(UNIVERSE)
 
-    # 1. Calculate SPY 20d benchmark return
-    spy_return_20d = 0.0
+    if bars_df is None or len(bars_df) == 0:
+        return []
 
-    if benchmark_symbol in bars_df.index.levels[0]:
-        spy_df = bars_df.xs(
-            benchmark_symbol,
-            level=0,
-        )
-
-        spy_df = _completed_daily_bars(spy_df)
-
-        spy_closes = spy_df["close"].values
-
-        if len(spy_closes) >= 21:
-            spy_return_20d = float(
-                (spy_closes[-1] - spy_closes[-21])
-                / spy_closes[-21]
-            )
-        elif len(spy_closes) > 1:
-            spy_return_20d = float(
-                (spy_closes[-1] - spy_closes[0])
-                / spy_closes[0]
-            )
+    # 1. Benchmark return for the relative-strength factor
+    spy_return_20d = _benchmark_return_20d(bars_df, benchmark_symbol, as_of=as_of)
 
     # 2. Extract metrics for all available stocks in universe
     metrics_list = []
-    available_symbols = set(bars_df.index.levels[0])
+    available_symbols = _available_symbols(bars_df)
 
     for symbol in target_universe:
         if symbol not in available_symbols:
             continue
         sdf = bars_df.xs(symbol, level=0)
-        metrics = extract_stock_metrics(symbol, sdf, spy_return_20d)
+        metrics = extract_stock_metrics(symbol, sdf, spy_return_20d, as_of=as_of)
         if metrics is not None:
             metrics_list.append(metrics)
 
