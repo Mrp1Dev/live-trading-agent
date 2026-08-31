@@ -1,43 +1,96 @@
 =====
 # FILE: config.py
 =====
+
 from datetime import date
+
 # ============================================================
-# SCANNER / RESEARCH / LLM
+# SCANNER / RESEARCH / LLM FUNNEL
 # ============================================================
-STOCK_SCANNER_TOP_N = 15
-LLM_STOCK_TOP_K = 5
+
+STOCK_SCANNER_TOP_N = 20
+LLM_STOCK_TOP_K = 8
+MAX_OPTIONS_PER_STOCK = 6
+OPTION_LLM_TOP_K = 8
+
 # ============================================================
 # PORTFOLIO / RISK
 # ============================================================
+
 MAX_TOTAL_RISK_PCT = 0.12
 MAX_SINGLE_TRADE_RISK_PCT = 0.025
 MAX_UNDERLYING_RISK_PCT = 0.03
 MAX_DIRECTION_RISK_PCT = 0.075
-MAX_POSITIONS = 6
+
+MAX_POSITIONS = 5
 MIN_TRADE_SCORE = 70.0
+
 # Greeks are warnings for now, not hard portfolio vetoes.
 MAX_ABS_PORTFOLIO_DELTA = 1500.0
 MAX_ABS_PORTFOLIO_GAMMA = 100.0
 MAX_ABS_PORTFOLIO_VEGA = 3000.0
+
 EMERGENCY_DRAWDOWN_PCT = 0.15
+
 # ============================================================
 # OPTIONS
 # ============================================================
+
 MIN_DTE = 1
 MAX_DTE = 14
 MAX_OPTION_SPREAD_PCT = 0.15
 MIN_OPTION_ABS_DELTA = 0.15
 MAX_OPTION_ABS_DELTA = 0.90
 MIN_OPTION_PREMIUM = 0.25
-# For this hackathon, avoid contracts that expire on or before
-# the last official portfolio valuation date.
+
+# Avoid contracts that expire on or before the official valuation.
 #
-# Official EOD valuation is September 3, 2026.
-LATEST_FORBIDDEN_EXPIRATION = date(2026, 9, 3)
+# Submissions close 4 Sep 2026, 8:30 PM IST, which is ~11:00 AM ET on the 4th.
+# A contract expiring ON the 4th is a near-zero-DTE coin flip at the exact moment
+# judges snapshot the account, so the 4th is forbidden too - not just the 3rd.
+LATEST_FORBIDDEN_EXPIRATION = date(2026, 9, 4)
+
+# ============================================================
+# EXITS
+#
+# Breakeven win rate = |stop| / (avg_win + |stop|). A flat +60% target against a
+# -55% stop needs a 47.8% win rate, which short-dated directional options do not
+# achieve. So the fixed target sits far out and rarely fires; the TRAILING stop
+# is the real profit taker.
+# ============================================================
+
+TAKE_PROFIT_PCT = 1.20        # +120%: deliberately far out
+STOP_LOSS_PCT = -0.55         # -55%
+TRAIL_ARM_PCT = 0.30          # trailing engages once the position has run +30%
+TRAIL_GIVEBACK_PCT = 0.35     # then give back at most 35% of the peak
+MAX_HOLD_DAYS = 2.5           # time stop; tracks PLANNED_HOLD_DAYS in the selector
+MIN_EXIT_DTE = 1              # force out at 1 DTE rather than hold into expiry
+
+# Hard flatten before the valuation snapshot.
+FLATTEN_DATE = date(2026, 9, 4)
+FLATTEN_AFTER_HOUR_ET = 9
+FLATTEN_AFTER_MINUTE_ET = 45
+
+STATE_FILE = "state/positions.json"
+
+# ============================================================
+# EXECUTION WINDOWS
+# ============================================================
+
+# Spreads are widest at the open and into the close, which is exactly when a
+# marketable limit costs the most. Do not open new risk in those windows.
+NO_TRADE_MINUTES_AFTER_OPEN = 10
+NO_TRADE_MINUTES_BEFORE_CLOSE = 10
+
+# A resting entry limit that has not filled is stale information; cancel it
+# rather than let it fill against a quote we would no longer accept.
+ENTRY_ORDER_TIMEOUT_SECONDS = 180
+
+
 =====
 # FILE: alpaca_client/__init__.py
 =====
+
 from .client import (
     get_option_data_client,
     get_stock_data_client,
@@ -58,6 +111,7 @@ from .stocks import (
     print_top_scanned_stocks,
     scan_stocks,
 )
+
 __all__ = [
     "get_trading_client",
     "get_stock_data_client",
@@ -74,29 +128,43 @@ __all__ = [
     "scan_stocks",
     "print_top_scanned_stocks",
 ]
+
+
+
+
 =====
 # FILE: alpaca_client/client.py
 =====
+
 import os
+
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 from alpaca.data.historical import NewsClient, StockHistoricalDataClient
 from alpaca.data.historical.option import OptionHistoricalDataClient
+
 load_dotenv()
+
+
 def _get_credentials() -> tuple[str, str]:
     """Retrieve API key and secret from environment variables.
+    
     Supports both ALPACA_API_KEY / ALPACA_SECRET_KEY and
     standard APCA_API_KEY_ID / APCA_API_SECRET_KEY.
     """
     api_key = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
     secret_key = os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
+
     if not api_key or not secret_key:
         raise RuntimeError(
             "Missing Alpaca API credentials. Please set ALPACA_API_KEY and ALPACA_SECRET_KEY (or APCA_API_KEY_ID and APCA_API_SECRET_KEY) in .env"
         )
     return api_key, secret_key
+
+
 def get_trading_client(paper: bool = True) -> TradingClient:
     """Return a TradingClient instance for the Trading API.
+    
     Defaults to paper=True for development safety.
     """
     api_key, secret_key = _get_credentials()
@@ -105,6 +173,8 @@ def get_trading_client(paper: bool = True) -> TradingClient:
         secret_key=secret_key,
         paper=paper,
     )
+
+
 def get_stock_data_client() -> StockHistoricalDataClient:
     """Return a StockHistoricalDataClient for historical equity data."""
     api_key, secret_key = _get_credentials()
@@ -112,6 +182,8 @@ def get_stock_data_client() -> StockHistoricalDataClient:
         api_key=api_key,
         secret_key=secret_key,
     )
+
+
 def get_option_data_client() -> OptionHistoricalDataClient:
     """Return an OptionHistoricalDataClient for historical options data."""
     api_key, secret_key = _get_credentials()
@@ -126,43 +198,60 @@ def get_news_client() -> NewsClient:
         api_key=api_key,
         secret_key=secret_key
     )
+
 =====
 # FILE: alpaca_client/options.py
 =====
+
 from typing import Dict
+
 from alpaca.data.historical.option import OptionsSnapshot
 from alpaca.data.requests import OptionChainRequest
+
 from .client import get_option_data_client
 from strategy.option_selector import (
     select_directional_options,
     print_option_candidates,
 )
+
+
 def get_option_chain(symbol: str) -> Dict[str, OptionsSnapshot]:
     client = get_option_data_client()
+
     request = OptionChainRequest(
         underlying_symbol=symbol,
     )
+
     return client.get_option_chain(request)
+
+
 def print_chain(symbol: str, limit: int = 10) -> None:
     """Print a snapshot summary of option contracts for a symbol."""
     chain = get_option_chain(symbol)
+
     print(f"\nOption chain for {symbol}")
     print(f"Contracts returned: {len(chain)}")
+
     if not chain:
         print("No contracts found.")
         return
+
     for contract_symbol, snapshot in list(chain.items())[:limit]:
         print(f"\n{contract_symbol}")
+
         if snapshot.latest_quote:
             print(f"  bid: {snapshot.latest_quote.bid_price}")
             print(f"  ask: {snapshot.latest_quote.ask_price}")
+
         if snapshot.implied_volatility is not None:
             print(f"  IV:    {snapshot.implied_volatility:.4f}")
+
         if snapshot.greeks:
             print(f"  delta: {snapshot.greeks.delta}")
             print(f"  gamma: {snapshot.greeks.gamma}")
             print(f"  theta: {snapshot.greeks.theta}")
             print(f"  vega:  {snapshot.greeks.vega}")
+
 def print_best_candidates(
     symbol: str,
     underlying_price: float = 100.0,
@@ -170,14 +259,17 @@ def print_best_candidates(
     limit: int = 20,
 ) -> None:
     chain = get_option_chain(symbol)
+
     candidates = select_directional_options(
         chain=chain,
         underlying_price=underlying_price,
         direction=direction,
     )
+
     print(f"\n{symbol}")
     print(f"Contracts returned: {len(chain)}")
     print(f"Liquid candidates:  {len(candidates)}")
+
     for candidate in candidates[:limit]:
         print(
             f"{candidate.symbol} "
@@ -186,36 +278,45 @@ def print_best_candidates(
             f"IV={candidate.iv} "
             f"delta={candidate.delta}"
         )
+
+
 def inspect_options(
     symbol: str,
     underlying_price: float,
     direction: str = "bullish",
 ) -> None:
     chain = get_option_chain(symbol)
+
     candidates = select_directional_options(
         chain=chain,
         underlying_price=underlying_price,
         direction=direction,
     )
+
     print(f"\n{symbol}")
     print(f"Contracts returned: {len(chain)}")
     print(f"Selected candidates: {len(candidates)}")
+
     print_option_candidates(
         symbol=symbol,
         underlying_price=underlying_price,
         candidates=candidates,
         direction=direction,
     )
+
 if __name__ == "__main__":
     import sys
     ticker = sys.argv[1] if len(sys.argv) > 1 else "SPY"
     print_chain(ticker)
+
 =====
 # FILE: alpaca_client/stocks.py
 =====
+
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Union
 import pandas as pd
+
 from alpaca.data.enums import DataFeed
 from alpaca.data.models import Bar, Snapshot
 from alpaca.data.requests import (
@@ -224,9 +325,13 @@ from alpaca.data.requests import (
     StockSnapshotRequest,
 )
 from alpaca.data.timeframe import TimeFrame
+
 from .client import get_stock_data_client
+from config import STOCK_SCANNER_TOP_N
 from strategy.scanner import ScannedStock, print_scan_results, scan_stock_bars
 from strategy.universe import BENCHMARK_SYMBOL, UNIVERSE
+
+
 def get_stock_bars(
     symbols: Union[str, List[str]],
     start: Union[datetime, str],
@@ -236,11 +341,13 @@ def get_stock_bars(
     limit: Optional[int] = None,
 ) -> pd.DataFrame:
     """Fetch historical OHLCV bars for one or more symbols.
+
     Returns a pandas DataFrame. For multiple symbols, the DataFrame
     has a MultiIndex of (symbol, timestamp).
     """
     client = get_stock_data_client()
     symbol_list = [symbols] if isinstance(symbols, str) else list(symbols)
+
     request = StockBarsRequest(
         symbol_or_symbols=symbol_list,
         timeframe=timeframe,
@@ -249,24 +356,31 @@ def get_stock_bars(
         limit=limit,
         feed=feed,
     )
+
     bar_set = client.get_stock_bars(request)
     return bar_set.df
+
+
 def get_historical_daily_bars(
     symbols: Union[str, List[str]],
     days: int = 90,
     feed: DataFeed = DataFeed.IEX,
 ) -> pd.DataFrame:
     """Fetch daily bars for the past N calendar days (with weekend/holiday buffer).
+
     Returns a MultiIndex DataFrame indexed by (symbol, timestamp).
     """
     calendar_buffer_days = max(int(days * 1.6), days + 20)
     start_time = datetime.now() - timedelta(days=calendar_buffer_days)
+
     return get_stock_bars(
         symbols=symbols,
         start=start_time,
         timeframe=TimeFrame.Day,
         feed=feed,
     )
+
+
 def get_stock_snapshots(
     symbols: Union[str, List[str]],
     feed: DataFeed = DataFeed.IEX,
@@ -274,20 +388,26 @@ def get_stock_snapshots(
     """Fetch latest snapshot (quotes, trades, daily bars) for symbols."""
     client = get_stock_data_client()
     symbol_list = [symbols] if isinstance(symbols, str) else list(symbols)
+
     request = StockSnapshotRequest(
         symbol_or_symbols=symbol_list,
         feed=feed,
     )
+
     return client.get_stock_snapshot(request)
+
+
 def get_latest_underlying_prices(
     symbols: Union[str, List[str]],
     feed: DataFeed = DataFeed.IEX,
 ) -> Dict[str, float]:
     """Return the freshest usable underlying price for each symbol.
+
     Preference order:
         latest trade
         quote midpoint
         latest daily close
+
     Raises if no usable price exists.
     """
     snapshots = get_stock_snapshots(
@@ -296,27 +416,36 @@ def get_latest_underlying_prices(
     )
     symbol_list = [symbols] if isinstance(symbols, str) else list(symbols)
     prices: Dict[str, float] = {}
+
     for symbol in symbol_list:
         snapshot = snapshots.get(symbol)
         if snapshot is None:
             continue
+
         price: Optional[float] = None
+
         if snapshot.latest_trade is not None:
             trade_price = float(snapshot.latest_trade.price or 0)
             if trade_price > 0:
                 price = trade_price
+
         if price is None and snapshot.latest_quote is not None:
             bid = float(snapshot.latest_quote.bid_price or 0)
             ask = float(snapshot.latest_quote.ask_price or 0)
             if bid > 0 and ask > 0 and ask >= bid:
                 price = (bid + ask) / 2.0
+
         if price is None and snapshot.daily_bar is not None:
             daily_close = float(snapshot.daily_bar.close or 0)
             if daily_close > 0:
                 price = daily_close
+
         if price is not None:
             prices[symbol] = price
+
     return prices
+
+
 def get_latest_stock_bars(
     symbols: Union[str, List[str]],
     feed: DataFeed = DataFeed.IEX,
@@ -324,19 +453,24 @@ def get_latest_stock_bars(
     """Fetch the latest bar for one or more symbols."""
     client = get_stock_data_client()
     symbol_list = [symbols] if isinstance(symbols, str) else list(symbols)
+
     request = StockLatestBarRequest(
         symbol_or_symbols=symbol_list,
         feed=feed,
     )
+
     return client.get_stock_latest_bar(request)
+
+
 def scan_stocks(
     universe: Optional[List[str]] = None,
-    top_n: int = 15,
+    top_n: int = STOCK_SCANNER_TOP_N,
     benchmark_symbol: str = BENCHMARK_SYMBOL,
 ) -> List[ScannedStock]:
     """Fetch historical daily bars from Alpaca and scan the universe for top candidates."""
     target_universe = list(universe) if universe else list(UNIVERSE)
     all_symbols = list(set(target_universe + [benchmark_symbol]))
+
     df = get_historical_daily_bars(symbols=all_symbols, days=90)
     return scan_stock_bars(
         bars_df=df,
@@ -344,69 +478,600 @@ def scan_stocks(
         benchmark_symbol=benchmark_symbol,
         top_n=top_n,
     )
+
+
 def print_top_scanned_stocks(
     universe: Optional[List[str]] = None,
-    top_n: int = 15,
+    top_n: int = STOCK_SCANNER_TOP_N,
 ) -> List[ScannedStock]:
     """Scan the universe and print the formatted top picks table."""
     stocks = scan_stocks(universe=universe, top_n=top_n)
     print_scan_results(stocks, title=f"Top Stock Scanner Picks (Top {len(stocks)})")
     return stocks
+
+
 if __name__ == "__main__":
-    print_top_scanned_stocks(top_n=15)
+    print_top_scanned_stocks(top_n=STOCK_SCANNER_TOP_N)
+
+
 =====
 # FILE: strategy/direction.py
 =====
+
 from enum import Enum
+
+
 class TradeDirection(str, Enum):
     BULLISH = "BULLISH"
     BEARISH = "BEARISH"
     NEUTRAL = "NEUTRAL"
+
+
 def determine_direction(stock) -> TradeDirection:
     """
     Determine directional bias from the stock-level signals.
+
     Requires a majority of the three directional signals to agree.
     Mixed signals are explicitly NEUTRAL rather than forced bearish.
     """
+
     bullish_signals = sum([
         stock.return_5d > 0,
         stock.return_20d > 0,
         stock.relative_strength_spy > 0,
     ])
+
     bearish_signals = sum([
         stock.return_5d < 0,
         stock.return_20d < 0,
         stock.relative_strength_spy < 0,
     ])
+
     if bullish_signals >= 2:
         return TradeDirection.BULLISH
+
     if bearish_signals >= 2:
         return TradeDirection.BEARISH
+
     return TradeDirection.NEUTRAL
+
+=====
+# FILE: strategy/earnings.py
+=====
+
+"""Deterministic earnings-event veto.
+
+Over a four-day window holding short-dated long premium, one earnings print can
+cost more than every other improvement combined - and it costs you even when the
+direction is right, because implied vol collapses the moment the event passes.
+
+This is deliberately NOT an LLM judgment. In a live run the stock ranker put a
+name at #1 whose own dossier said it reported earnings the next evening: the
+model read "catalyst" where a long-premium strategy should read "binary event".
+A model asked to weigh a catalyst will sometimes weigh it positively. A veto in
+plain Python cannot.
+
+The input is the research dossier text, which is model-written. That makes this a
+CONSERVATIVE filter, not a calendar: ambiguous future-earnings language vetoes.
+Refusing a good trade costs an opportunity; taking an earnings gamble on a 4-DTE
+call costs the demo.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from typing import Optional
+
+# Language that implies an earnings event is STILL AHEAD.
+_FUTURE_PATTERNS = (
+    r"\bwill report\b",
+    r"\bis (?:set|scheduled|expected) to report\b",
+    r"\breports?\s+(?:its\s+)?(?:fiscal\s+)?q[1-4]\b",
+    r"\breports?\s+(?:its\s+)?(?:fiscal\s+)?(?:first|second|third|fourth)[- ]quarter\b",
+    r"\breports?\s+earnings\b",
+    r"\bearnings?\s+(?:are\s+)?(?:due|scheduled|upcoming|expected)\b",
+    r"\bupcoming\s+earnings\b",
+    r"\bahead of\s+(?:its\s+)?(?:q[1-4]\s+)?earnings\b",
+    r"\bahead of\s+(?:the\s+)?earnings call\b",
+    r"\bearnings call\b",
+    r"\bbefore the (?:opening )?bell\b",
+    r"\bafter the (?:closing )?bell\b",
+    r"\bafter the close on\b",
+    r"\bpre[- ]earnings\b",
+    r"\bimplied earnings mover\b",
+    r"\bearnings volatility\b",
+    r"\bexpects? eps of\b",
+    r"\banalysts? expect\s+eps\b",
+)
+
+# Language that implies the event has ALREADY HAPPENED.
+_PAST_PATTERNS = (
+    r"\bbeat\b",
+    r"\bmissed\b",
+    r"\bposted\b",
+    r"\breported\s+(?:q[1-4]|first|second|third|fourth)\b",
+    r"\bfollowing\s+q[1-4]\s+results\b",
+    r"\bpost[- ]earnings\b",
+    r"\bafter\s+(?:its\s+)?q[1-4]\s+(?:results|earnings|report)\b",
+    r"\bq[1-4]\s+(?:results|beat|miss)\b",
+    r"\blast\s+quarter\b",
+)
+
+_MONTHS = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+_MONTH_DAY = re.compile(
+    r"\b(" + "|".join(sorted(_MONTHS, key=len, reverse=True)) + r")\.?\s+(\d{1,2})\b",
+    re.IGNORECASE,
+)
+_NUMERIC_DATE = re.compile(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b")
+
+
+@dataclass(frozen=True)
+class EarningsRisk:
+    has_risk: bool
+    reason: str = ""
+    event_date: Optional[date] = None
+    confidence: str = "none"      # none | inferred | dated
+
+    def __bool__(self) -> bool:
+        return self.has_risk
+
+
+def _matches(patterns: tuple[str, ...], text: str) -> list[str]:
+    return [p for p in patterns if re.search(p, text, re.IGNORECASE)]
+
+
+def extract_candidate_dates(text: str, as_of: date, lookahead_days: int = 400) -> list[date]:
+    """Pull plausible near-future dates out of free text.
+
+    Year is inferred: dossiers say "Tuesday, Sept. 1", not "2026-09-01". A month
+    that has already passed this year is read as next year, so a December run
+    reading "Jan. 5" resolves forward rather than ten months backwards.
+    """
+    found: list[date] = []
+    horizon = as_of + timedelta(days=lookahead_days)
+
+    for match in _MONTH_DAY.finditer(text):
+        month = _MONTHS[match.group(1).lower()]
+        day = int(match.group(2))
+        for year in (as_of.year, as_of.year + 1):
+            try:
+                candidate = date(year, month, day)
+            except ValueError:
+                continue
+            if as_of <= candidate <= horizon:
+                found.append(candidate)
+                break
+
+    for match in _NUMERIC_DATE.finditer(text):
+        month, day = int(match.group(1)), int(match.group(2))
+        raw_year = match.group(3)
+        years = [int(raw_year) + (2000 if int(raw_year) < 100 else 0)] if raw_year else [as_of.year, as_of.year + 1]
+        for year in years:
+            try:
+                candidate = date(year, month, day)
+            except ValueError:
+                continue
+            if as_of <= candidate <= horizon:
+                found.append(candidate)
+                break
+
+    return sorted(set(found))
+
+
+def detect_earnings_risk(
+    symbol: str,
+    research_text: str,
+    *,
+    as_of: Optional[date] = None,
+    horizon_days: int = 14,
+) -> EarningsRisk:
+    """Decide whether `symbol` has an earnings event inside the trading horizon.
+
+    `horizon_days` should cover the longest contract life being considered.
+    """
+    if not research_text or not research_text.strip():
+        return EarningsRisk(has_risk=False)
+
+    reference = as_of or datetime.now().date()
+    text = research_text.strip()
+
+    future_hits = _matches(_FUTURE_PATTERNS, text)
+    if not future_hits:
+        return EarningsRisk(has_risk=False)
+
+    past_hits = _matches(_PAST_PATTERNS, text)
+    # Extraction is deliberately WIDE and the horizon check narrow. If a far-out
+    # earnings date is not even extracted, the code cannot tell "reports in
+    # November" from "reports, date unknown" and falls through to the
+    # conservative undated branch, vetoing a name that is perfectly tradeable.
+    dates = extract_candidate_dates(text, reference)
+    in_window = [d for d in dates if reference <= d <= reference + timedelta(days=horizon_days)]
+
+    if in_window:
+        event = in_window[0]
+        return EarningsRisk(
+            has_risk=True,
+            reason=f"earnings event on {event.isoformat()} falls within the {horizon_days}-day trading horizon",
+            event_date=event,
+            confidence="dated",
+        )
+
+    # Dated, but comfortably beyond anything we would hold.
+    if dates:
+        return EarningsRisk(has_risk=False)
+
+    # Future-earnings language with no parseable date. If the dossier is
+    # dominated by past-tense reporting, treat it as already-happened.
+    if len(past_hits) >= len(future_hits):
+        return EarningsRisk(has_risk=False)
+
+    return EarningsRisk(
+        has_risk=True,
+        reason="undated forward-looking earnings language in the research dossier",
+        confidence="inferred",
+    )
+
+
+def filter_earnings_risk(
+    symbols: list[str],
+    research: dict[str, str],
+    *,
+    as_of: Optional[date] = None,
+    horizon_days: int = 14,
+) -> tuple[list[str], dict[str, EarningsRisk]]:
+    """Split symbols into (safe, vetoed).
+
+    Applied BEFORE the LLM ranker so a binary event never reaches a model that
+    might score it as a catalyst - and so no tokens are spent ranking a name that
+    cannot be traded.
+    """
+    safe: list[str] = []
+    vetoed: dict[str, EarningsRisk] = {}
+
+    for symbol in symbols:
+        risk = detect_earnings_risk(
+            symbol,
+            research.get(symbol, ""),
+            as_of=as_of,
+            horizon_days=horizon_days,
+        )
+        if risk.has_risk:
+            vetoed[symbol] = risk
+        else:
+            safe.append(symbol)
+
+    return safe, vetoed
+
+
+def iv_term_structure_warning(
+    front_iv: Optional[float],
+    back_iv: Optional[float],
+    threshold: float = 1.30,
+) -> Optional[str]:
+    """Flag an inverted IV term structure, which can signal a pending event.
+
+    Reported as a WARNING, never a veto. At 1-14 DTE the front expiry carries a
+    structural vol premium from weekend decay alone: on a live chain every one of
+    four names showed front IV above back IV, including one that had already
+    reported. The signal is too noisy at these tenors to trade off.
+    """
+    if not front_iv or not back_iv or back_iv <= 0:
+        return None
+    ratio = front_iv / back_iv
+    if ratio >= threshold:
+        return f"front/back IV {ratio:.2f} - possible pending event"
+    return None
+
+
+__all__ = [
+    "EarningsRisk",
+    "detect_earnings_risk",
+    "extract_candidate_dates",
+    "filter_earnings_risk",
+    "iv_term_structure_warning",
+]
+
+
+=====
+# FILE: strategy/exits.py
+=====
+
+"""Exit decision rules.
+
+Pure functions: plain numbers in, a decision out. No API calls, no clients, no
+hidden state. That makes every "why did it close?" answer auditable and lets the
+whole rule set be tested without a broker.
+
+Rule ORDER is load-bearing. The first rule that fires is the reported reason, so
+they run most-urgent first:
+
+    1. flatten window   competition valuation approaching        [immediate]
+    2. expiry           DTE <= MIN_EXIT_DTE                      [immediate]
+    3. stop loss        pnl <= STOP_LOSS_PCT                     [immediate]
+    4. trailing stop    faded from peak                          [normal]
+    5. take profit      pnl >= TAKE_PROFIT_PCT                   [normal]
+    6. time stop        held >= MAX_HOLD_DAYS                    [normal]
+
+Trailing is checked BEFORE the fixed target on purpose: a position that ran to
++150% and fell back to +70% should report as a faded winner, not a target hit.
+Those say very different things about whether the strategy is working.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
+from typing import Optional
+
+from config import (
+    FLATTEN_AFTER_HOUR_ET,
+    FLATTEN_AFTER_MINUTE_ET,
+    FLATTEN_DATE,
+    MAX_HOLD_DAYS,
+    MIN_EXIT_DTE,
+    STOP_LOSS_PCT,
+    TAKE_PROFIT_PCT,
+    TRAIL_ARM_PCT,
+    TRAIL_GIVEBACK_PCT,
+)
+
+try:  # pragma: no cover - environment dependent
+    from zoneinfo import ZoneInfo
+
+    MARKET_TZ = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover - environment dependent
+    from datetime import timezone
+
+    MARKET_TZ = timezone(timedelta(hours=-4), name="America/New_York")
+
+
+URGENCY_IMMEDIATE = "IMMEDIATE"
+URGENCY_NORMAL = "NORMAL"
+
+
+@dataclass(frozen=True)
+class ExitDecision:
+    should_close: bool
+    reason: str
+    urgency: str = URGENCY_NORMAL
+    detail: str = ""
+
+    @property
+    def is_immediate(self) -> bool:
+        return self.urgency == URGENCY_IMMEDIATE
+
+
+HOLD = ExitDecision(should_close=False, reason="HOLD", urgency=URGENCY_NORMAL)
+
+
+def market_now(now: Optional[datetime] = None) -> datetime:
+    """Exchange-local time. Never trust the local system clock for this."""
+    if now is None:
+        return datetime.now(MARKET_TZ)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=MARKET_TZ)
+    return now.astimezone(MARKET_TZ)
+
+
+def days_held(opened_at: str | datetime | None, now: Optional[datetime] = None) -> float:
+    """Fractional days a position has been open.
+
+    Returns 0.0 for a missing, unparseable or future timestamp rather than
+    raising. A position with no memory should be governed by the other rules,
+    not force-closed by a bad string.
+    """
+    if opened_at is None:
+        return 0.0
+
+    if isinstance(opened_at, datetime):
+        opened = opened_at
+    else:
+        text = str(opened_at).strip()
+        if not text:
+            return 0.0
+        try:
+            opened = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return 0.0
+
+    reference = market_now(now)
+    if opened.tzinfo is None:
+        opened = opened.replace(tzinfo=reference.tzinfo)
+
+    elapsed = (reference - opened).total_seconds()
+    if elapsed <= 0:
+        return 0.0
+    return elapsed / 86400.0
+
+
+def in_flatten_window(now: Optional[datetime] = None) -> bool:
+    """True once the pre-valuation flatten deadline has passed."""
+    reference = market_now(now)
+    if reference.date() > FLATTEN_DATE:
+        return True
+    if reference.date() < FLATTEN_DATE:
+        return False
+    deadline = time(FLATTEN_AFTER_HOUR_ET, FLATTEN_AFTER_MINUTE_ET)
+    return reference.timetz().replace(tzinfo=None) >= deadline
+
+
+def update_peak(previous_peak_pct: float, current_pnl_pct: float) -> float:
+    """High-water mark. Only ever rises."""
+    return max(float(previous_peak_pct or 0.0), float(current_pnl_pct))
+
+
+def evaluate_exit(
+    *,
+    pnl_pct: float,
+    peak_pnl_pct: float,
+    dte: int,
+    opened_at: str | datetime | None,
+    now: Optional[datetime] = None,
+) -> ExitDecision:
+    """Decide whether an open long option position should be closed.
+
+    `pnl_pct` must be measured against the BID (what you can actually sell at),
+    not a midpoint mark. On a wide market that difference is a winner versus a
+    scratch.
+    """
+
+    # 1. Flatten window - nothing outranks being flat for the valuation.
+    if in_flatten_window(now):
+        return ExitDecision(
+            should_close=True,
+            reason="FLATTEN_WINDOW",
+            urgency=URGENCY_IMMEDIATE,
+            detail="pre-valuation flatten deadline reached",
+        )
+
+    # 2. Expiry. Do not carry a long option into its final session.
+    if dte is not None and dte <= MIN_EXIT_DTE:
+        return ExitDecision(
+            should_close=True,
+            reason="EXPIRY",
+            urgency=URGENCY_IMMEDIATE,
+            detail=f"DTE {dte} <= {MIN_EXIT_DTE}",
+        )
+
+    # 3. Stop loss.
+    if pnl_pct <= STOP_LOSS_PCT:
+        return ExitDecision(
+            should_close=True,
+            reason="STOP_LOSS",
+            urgency=URGENCY_IMMEDIATE,
+            detail=f"P&L {pnl_pct:+.1%} <= {STOP_LOSS_PCT:+.0%}",
+        )
+
+    # 4. Trailing stop, checked BEFORE the fixed target. Arms only once the
+    #    position has actually worked, so a trade that never ran is handled by
+    #    the stop rather than the trail.
+    peak = update_peak(peak_pnl_pct, pnl_pct)
+    if peak >= TRAIL_ARM_PCT:
+        floor = peak * (1.0 - TRAIL_GIVEBACK_PCT)
+        if pnl_pct <= floor:
+            return ExitDecision(
+                should_close=True,
+                reason="TRAILING_STOP",
+                urgency=URGENCY_NORMAL,
+                detail=f"faded to {pnl_pct:+.1%} from peak {peak:+.1%} (floor {floor:+.1%})",
+            )
+
+    # 5. Fixed take profit. Deliberately far out; the trail usually gets there first.
+    if pnl_pct >= TAKE_PROFIT_PCT:
+        return ExitDecision(
+            should_close=True,
+            reason="TAKE_PROFIT",
+            urgency=URGENCY_NORMAL,
+            detail=f"P&L {pnl_pct:+.1%} >= {TAKE_PROFIT_PCT:+.0%}",
+        )
+
+    # 6. Time stop. Theta on short-dated premium is unforgiving; if the thesis
+    #    has not paid within the planned hold, the trade is over.
+    held = days_held(opened_at, now)
+    if held >= MAX_HOLD_DAYS:
+        return ExitDecision(
+            should_close=True,
+            reason="TIME_STOP",
+            urgency=URGENCY_NORMAL,
+            detail=f"held {held:.1f}d >= {MAX_HOLD_DAYS}d",
+        )
+
+    return HOLD
+
+
+def realisable_pnl_pct(
+    entry_price: float,
+    bid: float,
+    fallback_pnl_pct: Optional[float] = None,
+) -> Optional[float]:
+    """P&L measured against the bid.
+
+    Alpaca's `unrealized_plpc` marks to the midpoint, but a long option is exited
+    by hitting the bid. Using the mid systematically overstates every position,
+    and on a wide market it is the difference between a winner and a scratch.
+    Returns None when neither the bid nor a fallback is usable, so the caller can
+    treat it as missing data instead of a zero.
+    """
+    if bid > 0 and entry_price > 0:
+        return (bid - entry_price) / entry_price
+    return fallback_pnl_pct
+
+
+def dte_from_occ_symbol(option_symbol: str, now: Optional[datetime] = None) -> Optional[int]:
+    """Days to expiry parsed from the OCC symbol - no extra API call needed."""
+    from strategy.option_selector import parse_occ_symbol
+
+    try:
+        expiration, _, _ = parse_occ_symbol(option_symbol)
+    except ValueError:
+        return None
+    return (expiration - market_now(now).date()).days
+
+
+def sort_closes_immediate_first(decisions: list[tuple[str, ExitDecision]]) -> list[tuple[str, ExitDecision]]:
+    """Order closes so urgent ones are submitted first if the loop is interrupted."""
+    return sorted(decisions, key=lambda item: (0 if item[1].is_immediate else 1, item[0]))
+
+
+__all__ = [
+    "ExitDecision",
+    "HOLD",
+    "URGENCY_IMMEDIATE",
+    "URGENCY_NORMAL",
+    "days_held",
+    "dte_from_occ_symbol",
+    "evaluate_exit",
+    "in_flatten_window",
+    "market_now",
+    "realisable_pnl_pct",
+    "sort_closes_immediate_first",
+    "update_peak",
+]
+
+
 =====
 # FILE: strategy/llm_ranker.py
 =====
+
 from __future__ import annotations
+
 import json
 import os
 import re
 from random import SystemRandom
 from typing import Mapping, Sequence
+
 from dotenv import load_dotenv
 import requests
+
 from strategy.scanner import ScannedStock
+
 load_dotenv()
+
 FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_MAX_TOKENS = 128
+
+
 SYSTEM_PROMPT = """
 You are the ranking component of an autonomous short-horizon options trading system.
+
 Your job is to RANK candidate UNDERLYINGS relative to one another for the next few
 trading days. You are not choosing an option contract, sizing a position, or deciding
 whether to execute a trade.
+
 Use two evidence sources:
 1. Quantitative scanner data.
 2. A research dossier containing recent market/news/contextual information.
+
 Important principles:
 - Rank candidates comparatively, not independently.
 - Do not simply reproduce the scanner ranking.
@@ -421,13 +1086,18 @@ Important principles:
 - Do not invent facts. If important information is missing, treat that as uncertainty.
 - This is an ORDINAL task. Do not assign scores, probabilities, confidence values, or
   explanations in the final answer.
+
 Return ONLY a JSON array containing every candidate symbol exactly once, ordered from
 MOST attractive to LEAST attractive.
 Example:
 ["CRM", "MSTR", "NVDA", "AMD"]
 """.strip()
+
+
 class LLMRankerError(RuntimeError):
     """Raised when the Featherless ranking request or response is invalid."""
+
+
 def _get_api_key() -> str:
     api_key = os.getenv("FEATHERLESS_API_KEY")
     if not api_key:
@@ -435,6 +1105,8 @@ def _get_api_key() -> str:
             "Missing FEATHERLESS_API_KEY. Add it to .env or the environment."
         )
     return api_key
+
+
 def _get_model(model: str | None) -> str:
     selected_model = model or os.getenv("FEATHERLESS_MODEL")
     if not selected_model:
@@ -443,8 +1115,12 @@ def _get_model(model: str | None) -> str:
             "or set FEATHERLESS_MODEL in .env."
         )
     return selected_model
+
+
 def _pct(value: float) -> str:
     return f"{value:.2%}"
+
+
 def _format_scanner_row(stock: ScannedStock) -> str:
     """Format the complete scanner information compactly for the LLM."""
     rank = stock.rank if stock.rank is not None else "-"
@@ -463,6 +1139,8 @@ def _format_scanner_row(stock: ScannedStock) -> str:
         f"Trend score: {stock.trend_score:.1f} | "
         f"Scanner score: {stock.score:.1f}"
     )
+
+
 def build_ranker_prompt(
     stocks: Sequence[ScannedStock],
     research: Mapping[str, str],
@@ -470,10 +1148,12 @@ def build_ranker_prompt(
     """Build the comparative ranking prompt sent to the model."""
     if not stocks:
         raise ValueError("stocks must contain at least one candidate")
+
     symbols = [stock.symbol.upper() for stock in stocks]
     duplicate_symbols = len(symbols) != len(set(symbols))
     if duplicate_symbols:
         raise ValueError("stocks contains duplicate symbols")
+
     sections: list[str] = [
         "RANK THESE CANDIDATES FOR A SHORT-HORIZON OPTIONS OPPORTUNITY.",
         "",
@@ -481,17 +1161,20 @@ def build_ranker_prompt(
         "The scanner rank is included as data, but you should independently compare the evidence.",
         "",
     ]
+
     for index, stock in enumerate(stocks, start=1):
         symbol = stock.symbol.upper()
         research_text = research.get(symbol, "")
         if not research_text:
             research_text = "NO RESEARCH DOSSIER AVAILABLE. Treat missing research as uncertainty."
+
         sections.append(f"=== CANDIDATE {index}: {symbol} ===")
         sections.append("SCANNER DATA:")
         sections.append(_format_scanner_row(stock))
         sections.append("RESEARCH DOSSIER:")
         sections.append(research_text.strip())
         sections.append("")
+
     sections.extend(
         [
             "FINAL OUTPUT REQUIREMENTS:",
@@ -502,9 +1185,12 @@ def build_ranker_prompt(
         ]
     )
     return "\n".join(sections)
+
+
 def _extract_json_array(content: str) -> list[str]:
     """Parse a model response containing a JSON array of symbols."""
     text = content.strip()
+
     # First, try the entire response as JSON.
     try:
         parsed = json.loads(text)
@@ -517,6 +1203,7 @@ def _extract_json_array(content: str) -> list[str]:
                     return [str(item).strip().upper() for item in value]
     except json.JSONDecodeError:
         pass
+
     # Fallback: extract the first JSON-looking array from surrounding text.
     match = re.search(r"\[[\s\S]*?\]", text)
     if match:
@@ -526,20 +1213,26 @@ def _extract_json_array(content: str) -> list[str]:
                 return [str(item).strip().upper() for item in parsed]
         except json.JSONDecodeError:
             pass
+
     raise LLMRankerError(
         "Featherless returned an invalid ranking response. "
         f"Raw response: {content!r}"
     )
+
+
 def _validate_ranking(ranking: Sequence[str], expected_symbols: Sequence[str]) -> list[str]:
     """Ensure the model returned a complete permutation of the candidates."""
     expected = [symbol.upper() for symbol in expected_symbols]
     normalized = [symbol.strip().upper() for symbol in ranking]
+
     if len(normalized) != len(expected):
         raise LLMRankerError(
             f"Ranking contains {len(normalized)} symbols; expected {len(expected)}."
         )
+
     if len(set(normalized)) != len(normalized):
         raise LLMRankerError("Ranking contains duplicate symbols.")
+
     if set(normalized) != set(expected):
         missing = sorted(set(expected) - set(normalized))
         unexpected = sorted(set(normalized) - set(expected))
@@ -547,7 +1240,10 @@ def _validate_ranking(ranking: Sequence[str], expected_symbols: Sequence[str]) -
             "Ranking does not match candidate universe. "
             f"Missing={missing}, unexpected={unexpected}."
         )
+
     return normalized
+
+
 def rank_stocks(
     stocks: Sequence[ScannedStock],
     research: Mapping[str, str],
@@ -559,6 +1255,7 @@ def rank_stocks(
 ) -> list[str]:
     """
     Rank scanned stocks using a Featherless chat-completion model.
+
     Parameters
     ----------
     stocks:
@@ -573,6 +1270,7 @@ def rank_stocks(
         Small output budget because the desired output is only an ordered symbol list.
     debug:
         If True, print ranker prompt input and raw LLM response.
+
     Returns
     -------
     list[str]
@@ -580,19 +1278,23 @@ def rank_stocks(
     """
     if not stocks:
         return []
+
     selected_model = _get_model(model)
     expected_symbols = [stock.symbol.upper() for stock in stocks]
+
     # Randomize presentation order so the model does not simply inherit the
     # scanner table order. The original scanner rank remains visible as a feature.
     prompt_stocks = list(stocks)
     SystemRandom().shuffle(prompt_stocks)
     prompt = build_ranker_prompt(prompt_stocks, research)
+
     if debug:
         print("\n" + "=" * 120)
         print(" LLM RANKER INPUT")
         print("=" * 120)
         print(prompt)
         print("=" * 120)
+
     try:
         response = requests.post(
             f"{FEATHERLESS_BASE_URL}/chat/completions",
@@ -626,6 +1328,7 @@ def rank_stocks(
         raise LLMRankerError(
             "Featherless returned a non-JSON response."
         ) from exc
+
     try:
         choices = payload["choices"]
         content = choices[0]["message"]["content"]
@@ -639,34 +1342,46 @@ def rank_stocks(
             f"finish_reason={choices[0].get('finish_reason')!r}, "
             f"response={payload!r}"
         )
+
     if debug:
         print("\n" + "=" * 120)
         print(" RAW LLM RANKER RESPONSE")
         print("=" * 120)
         print(content)
         print("=" * 120)
+
     ranking = _extract_json_array(content)
     return _validate_ranking(ranking, expected_symbols)
+
+
 # Clear alias for use from orchestration code.
 rank_candidates = rank_stocks
+
+
 =====
 # FILE: strategy/news.py
 =====
+
 from alpaca_client.client import get_news_client
 from alpaca.data.requests import NewsRequest
+
 from google import genai
 import os
 import json
 from dotenv import load_dotenv
 load_dotenv()
 from pydantic import BaseModel
+
 folder_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'shared_folder'))
+
+
 class ArticleAnalysis(BaseModel):
     headline: str
     relevance: float
     sentiment: str
     importance: str
     reason: str
+
 class NewsAnalysis(BaseModel):
     symbol: str
     signal: str
@@ -676,9 +1391,11 @@ class NewsAnalysis(BaseModel):
     catalysts: list[str]
     risks: list[str]
     research_summary: str
+
 client = genai.Client(
     api_key=os.getenv("GEMINI_API_KEY")
 )
+
 def get_news(symbol, limit=10):
     news_client = get_news_client()
     request_params = NewsRequest(
@@ -688,14 +1405,18 @@ def get_news(symbol, limit=10):
         exclude_contentless=True
     )
     news_set = news_client.get_news(request_params)
+    
     # NewsSet is iterable and yields tuples of ('data', {...})
     # We need to extract the actual news items
     news_items = []
     for key, value in news_set:
         if key == 'data' and isinstance(value, dict) and 'news' in value:
             news_items.extend(value['news'])
+    
     return news_items
+
 def analyze_news(symbol, news) -> NewsAnalysis:
+
     # news is a list (might be dicts or objects) returned from get_news
     # Convert to simple text format for LLM
     articles = []
@@ -714,6 +1435,7 @@ def analyze_news(symbol, news) -> NewsAnalysis:
             published_at = str(getattr(item, 'created_at', 'N/A'))
             url = getattr(item, 'url', 'N/A')
             summary = getattr(item, 'summary', '')
+        
         articles.append({
             "headline": headline,
             "source": source,
@@ -721,6 +1443,7 @@ def analyze_news(symbol, news) -> NewsAnalysis:
             "url": url,
             "summary": summary,
         })
+
     if not articles:
         # Return neutral analysis if no articles
         return NewsAnalysis(
@@ -733,26 +1456,34 @@ def analyze_news(symbol, news) -> NewsAnalysis:
             risks=[],
             research_summary="No news articles to analyze"
         )
+
     prompt = f"""
 You are a financial news research assistant.
+
 Analyze the following recent news about {symbol}.
+
 Your job is NOT to make a final trading decision.
 Instead, produce research that another synthesis agent can use.
+
 For each article determine:
 - relevance to {symbol}: 0 to 1
 - sentiment: bullish, bearish, or neutral
 - importance: low, medium, or high
 - one-sentence explanation
+
 Then provide:
 - overall sentiment
 - key bullish factors
 - key bearish factors
 - whether the news provides a meaningful short-term catalyst
 - a concise research takeaway
+
 Do not invent facts that are not present in the articles.
+
 NEWS:
 {json.dumps(articles, indent=2)}
 """
+
     response = client.models.generate_content(
         model="gemini-2.0-flash-lite",
         contents=prompt,
@@ -761,6 +1492,7 @@ NEWS:
             "response_schema": NewsAnalysis,
         }
     )
+
     # Parse the JSON response and return NewsAnalysis object
     try:
         analysis_json = json.loads(response.text)
@@ -777,6 +1509,7 @@ NEWS:
             risks=["Failed to analyze news"],
             research_summary=f"News analysis failed: {str(e)}"
         )
+
 if __name__ == "__main__":
     symbol = "NVDA"
     news = get_news(symbol, limit=5)
@@ -785,25 +1518,37 @@ if __name__ == "__main__":
     print("\n========== NEWS RESEARCH ==========")
     analysis = analyze_news(symbol, news)
     print(analysis.model_dump_json(indent=2))
+
 =====
 # FILE: strategy/option_ranker.py
 =====
+
 from __future__ import annotations
+
 import json
 import os
 import random
 from typing import Mapping, Sequence
+
 import requests
 from dotenv import load_dotenv
+
+from config import OPTION_LLM_TOP_K
 from strategy.option_selector import OptionCandidate
 from strategy.scanner import ScannedStock
+
 load_dotenv()
+
 FEATHERLESS_URL = "https://api.featherless.ai/v1/chat/completions"
 DEFAULT_MODEL_ENV = "FEATHERLESS_MODEL"
-DEFAULT_MAX_TOKENS = 320
+DEFAULT_MAX_TOKENS = 96
 DEFAULT_TEMPERATURE = 0.0
+
+
 class OptionRankerError(RuntimeError):
     """Raised when the option-ranking request or response is invalid."""
+
+
 def _get_api_key() -> str:
     api_key = os.getenv("FEATHERLESS_API_KEY")
     if not api_key:
@@ -811,6 +1556,8 @@ def _get_api_key() -> str:
             "Missing FEATHERLESS_API_KEY in environment variables."
         )
     return api_key
+
+
 def _get_model(model: str | None) -> str:
     selected = model or os.getenv(DEFAULT_MODEL_ENV)
     if not selected:
@@ -819,24 +1566,45 @@ def _get_model(model: str | None) -> str:
             "or pass model explicitly."
         )
     return selected
+
+
 def _fmt(value: float | None, digits: int = 3) -> str:
     if value is None:
         return "N/A"
     return f"{value:.{digits}f}"
+
+
 def _fmt_pct(value: float | None, digits: int = 1) -> str:
     if value is None:
         return "N/A"
     return f"{value:.{digits}%}"
-def _build_option_block(option: OptionCandidate, stock_symbol: str) -> str:
+
+
+def _build_option_block(
+    option_id: str,
+    option: OptionCandidate,
+    stock_symbol: str,
+) -> str:
     return (
-        f"{option.symbol} | stock={stock_symbol} | "
-        f"{option.option_type} | exp={option.expiration.isoformat()} | DTE={option.dte} | "
-        f"strike=${option.strike:.2f} | mny={_fmt_pct(option.moneyness_pct)} | "
-        f"ask=${option.ask:.2f} | spread={_fmt_pct(option.spread_pct)} | "
-        f"IV={_fmt_pct(option.iv)} | delta={_fmt(option.delta)} | "
-        f"gamma={_fmt(option.gamma)} | theta={_fmt(option.theta)} | "
-        f"vega={_fmt(option.vega)} | selector={option.score:.1f}"
+        f"{option_id} | "
+        f"symbol={option.symbol} | "
+        f"stock={stock_symbol} | "
+        f"{option.option_type} | "
+        f"exp={option.expiration.isoformat()} | "
+        f"DTE={option.dte} | "
+        f"strike=${option.strike:.2f} | "
+        f"mny={_fmt_pct(option.moneyness_pct)} | "
+        f"ask=${option.ask:.2f} | "
+        f"spread={_fmt_pct(option.spread_pct)} | "
+        f"IV={_fmt_pct(option.iv)} | "
+        f"delta={_fmt(option.delta)} | "
+        f"gamma={_fmt(option.gamma)} | "
+        f"theta={_fmt(option.theta)} | "
+        f"vega={_fmt(option.vega)} | "
+        f"selector={option.score:.1f}"
     )
+
+
 def _build_stock_context(
     stock: ScannedStock,
     direction: str,
@@ -852,6 +1620,8 @@ def _build_stock_context(
         f"RS={_fmt_pct(stock.relative_strength_spy)} | "
         f"research={research or 'none'}"
     )
+
+
 def _underlying_for_option(
     option: OptionCandidate,
     stocks: Mapping[str, ScannedStock],
@@ -865,33 +1635,51 @@ def _underlying_for_option(
         raise ValueError(f"Could not determine underlying for {option.symbol}")
     # Longest match handles any potential overlapping roots safely.
     return max(matches, key=len)
+
+
 def build_option_pool_prompt(
     options: Sequence[OptionCandidate],
     stocks: Mapping[str, ScannedStock],
     directions: Mapping[str, str],
     research: Mapping[str, str] | None = None,
+    top_k: int = OPTION_LLM_TOP_K,
 ) -> str:
-    """Build one compact prompt for a cross-underlying option pool."""
+    """Build one compact prompt for a cross-underlying top-K option ranking."""
     if not options:
         raise ValueError("options must not be empty")
+
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+
+    top_k = min(top_k, len(options))
     research = research or {}
-    stock_by_symbol = {symbol.upper(): stock for symbol, stock in stocks.items()}
+
+    stock_by_symbol = {
+        symbol.upper(): stock
+        for symbol, stock in stocks.items()
+    }
+
     option_symbols = [option.symbol for option in options]
+
     if len(option_symbols) != len(set(option_symbols)):
         raise ValueError("options contains duplicate symbols")
+
     underlyings = {
         _underlying_for_option(option, stock_by_symbol)
         for option in options
     }
+
     missing_context = sorted(
         symbol
         for symbol in underlyings
         if symbol not in stock_by_symbol
     )
+
     if missing_context:
         raise ValueError(
             "Missing stock context for: " + ", ".join(missing_context)
         )
+
     stock_blocks = [
         _build_stock_context(
             stock=stock_by_symbol[symbol],
@@ -900,18 +1688,33 @@ def build_option_pool_prompt(
         )
         for symbol in sorted(underlyings)
     ]
+
     option_blocks = [
         _build_option_block(
+            option_id=f"OPT{index:03d}",
             option=option,
-            stock_symbol=_underlying_for_option(option, stock_by_symbol),
+            stock_symbol=_underlying_for_option(
+                option,
+                stock_by_symbol,
+            ),
         )
-        for option in options
+        for index, option in enumerate(options, start=1)
     ]
+
     return f"""Rank the supplied option contracts GLOBALLY by attractiveness for the short-horizon options strategy.
-You are comparing contracts across DIFFERENT underlyings. Do not rank options separately by stock.
+
+You are comparing contracts across DIFFERENT underlyings.
+Do not rank options separately by stock.
+
+Each option has a temporary identifier such as OPT001, OPT002, etc.
+
+Use ONLY those temporary identifiers in your final answer.
+Do NOT return the full option symbols.
+
 The deterministic option selector has already removed invalid/unusable contracts.
-Return ONLY a JSON array containing every supplied option symbol exactly once, strongest to weakest.
-Do not assign scores, probabilities, explanations, or new contracts.
+
+Return ONLY the TOP {top_k} option identifiers, strongest to weakest.
+
 Judge each contract using:
 - fit with its underlying's direction and thesis
 - likely movement relative to strike and DTE
@@ -921,20 +1724,31 @@ Judge each contract using:
 - implied volatility
 - delta, gamma, theta, and vega
 - overall efficiency relative to ALL other contracts in the pool
+
 Do not simply follow scanner rank or selector score.
+
 STOCK CONTEXTS
 {chr(10).join(stock_blocks)}
+
 AVAILABLE OPTION POOL
 {chr(10).join(option_blocks)}
+
 FINAL OUTPUT REQUIREMENTS:
 Return ONLY a JSON array.
-Include every supplied option symbol exactly once.
+Return exactly {top_k} identifiers.
+Use identifiers like OPT001, OPT002, OPT003.
+Do not return option symbols.
+Do not repeat identifiers.
+Every identifier must come from the supplied option pool.
 Order from strongest overall opportunity to weakest overall opportunity.
 """
+
+
 def _extract_json_array(content: str) -> list[str]:
     text = content.strip()
     if not text:
         raise OptionRankerError("Featherless returned an empty option ranking response.")
+
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
@@ -950,35 +1764,61 @@ def _extract_json_array(content: str) -> list[str]:
             raise OptionRankerError(
                 f"Could not parse JSON array from model response: {text!r}"
             ) from exc
+
     if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
         raise OptionRankerError("Model response must be a JSON array of option symbols.")
+
     return [item.strip() for item in parsed]
-def _validate_ranking(
-    ranked_symbols: Sequence[str],
+
+
+def _validate_top_k_ranking(
+    ranked_ids: Sequence[str],
     options: Sequence[OptionCandidate],
+    top_k: int,
 ) -> list[str]:
-    expected = [option.symbol for option in options]
-    expected_set = set(expected)
-    actual = list(ranked_symbols)
-    if len(actual) != len(expected):
+    expected_count = min(top_k, len(options))
+
+    actual = [
+        item.strip().upper()
+        for item in ranked_ids
+    ]
+
+    if len(actual) != expected_count:
         raise OptionRankerError(
-            f"Option ranking length mismatch: expected {len(expected)}, got {len(actual)}."
+            f"Option ranking returned {len(actual)} identifiers; "
+            f"expected {expected_count}."
         )
+
     if len(set(actual)) != len(actual):
-        raise OptionRankerError("Option ranking contains duplicate symbols.")
-    if set(actual) != expected_set:
-        missing = sorted(expected_set - set(actual))
-        unexpected = sorted(set(actual) - expected_set)
         raise OptionRankerError(
-            f"Invalid option ranking. Missing={missing}, unexpected={unexpected}."
+            "Option ranking contains duplicate identifiers."
         )
+
+    expected_ids = {
+        f"OPT{index:03d}"
+        for index in range(1, len(options) + 1)
+    }
+
+    unexpected = sorted(
+        set(actual) - expected_ids
+    )
+
+    if unexpected:
+        raise OptionRankerError(
+            "Option ranking contains unknown identifiers: "
+            + ", ".join(unexpected)
+        )
+
     return actual
+
+
 def rank_option_pool(
     options: Sequence[OptionCandidate],
     stocks: Mapping[str, ScannedStock],
     directions: Mapping[str, str],
     research: Mapping[str, str] | None = None,
     *,
+    top_k: int = OPTION_LLM_TOP_K,
     model: str | None = None,
     temperature: float = DEFAULT_TEMPERATURE,
     max_tokens: int = DEFAULT_MAX_TOKENS,
@@ -987,32 +1827,51 @@ def rank_option_pool(
 ) -> list[str]:
     """
     Rank the entire option pool across all supplied underlyings.
+
     The caller decides how many top-ranked options to keep.
     """
     if not options:
         return []
-    shuffled_options = list(options)
-    random.SystemRandom().shuffle(shuffled_options)
+
+    if top_k <= 0:
+        return []
+
+    top_k = min(top_k, len(options))
+
+    # The pool is shuffled so the model cannot infer importance from presentation
+    # order. CRITICAL: the OPTxxx identifiers are assigned over this shuffled
+    # list, so the response MUST be decoded against the same list. Decoding
+    # against `options` silently maps every identifier to the wrong contract and
+    # turns this whole stage into a random permutation.
+    presented_options = list(options)
+    random.SystemRandom().shuffle(presented_options)
+
     prompt = build_option_pool_prompt(
-        options=shuffled_options,
+        options=presented_options,
         stocks=stocks,
         directions=directions,
         research=research,
+        top_k=top_k,
     )
+
     if debug:
         print("\n" + "=" * 120)
         print(" OPTION LLM GLOBAL RANKER INPUT")
         print("=" * 120)
         print(prompt)
         print("=" * 120)
+
     payload = {
         "model": _get_model(model),
         "messages": [
             {
                 "role": "system",
                 "content": (
-                    "You rank a pool of options globally. "
-                    "Return only the required JSON array."
+                    f"You rank a pool of options globally. "
+                    f"Return ONLY a JSON array containing the top {top_k} "
+                    f"temporary option identifiers such as OPT001 and OPT042. "
+                    f"Never return full option symbols. "
+                    f"Never return more than {top_k} identifiers."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -1021,6 +1880,7 @@ def rank_option_pool(
         "max_tokens": max_tokens,
         "chat_template_kwargs": {"thinking": False},
     }
+
     try:
         response = requests.post(
             FEATHERLESS_URL,
@@ -1035,38 +1895,63 @@ def rank_option_pool(
         raise OptionRankerError(
             f"Featherless option-pool ranking request failed: {exc}"
         ) from exc
+
     if response.status_code >= 400:
         raise OptionRankerError(
             f"Featherless option-pool ranking failed with HTTP "
             f"{response.status_code}: {response.text}"
         )
+
     try:
         response_payload = response.json()
     except ValueError as exc:
         raise OptionRankerError(
             f"Featherless returned non-JSON response: {response.text!r}"
         ) from exc
+
     choices = response_payload.get("choices") or []
     if not choices:
         raise OptionRankerError(
             f"Featherless returned no choices. response={response_payload!r}"
         )
+
     choice = choices[0]
     content = (choice.get("message") or {}).get("content") or ""
+
     if debug:
         print("\n" + "=" * 120)
         print(" RAW OPTION GLOBAL LLM RESPONSE")
         print("=" * 120)
         print(content)
         print("=" * 120)
+
     if not content:
         raise OptionRankerError(
             "Featherless returned empty message.content for option-pool ranking. "
             f"finish_reason={choice.get('finish_reason')!r}; "
             f"response={response_payload!r}"
         )
-    ranked = _extract_json_array(content)
-    return _validate_ranking(ranked, options)
+
+    ranked_ids = _extract_json_array(content)
+
+    validated_ids = _validate_top_k_ranking(
+        ranked_ids=ranked_ids,
+        options=presented_options,
+        top_k=top_k,
+    )
+
+    # Decoded against the SAME list the identifiers were minted from.
+    option_by_id = {
+        f"OPT{index:03d}": option
+        for index, option in enumerate(presented_options, start=1)
+    }
+
+    return [
+        option_by_id[option_id].symbol
+        for option_id in validated_ids
+    ]
+
+
 def top_ranked_options(
     options: Sequence[OptionCandidate],
     stocks: Mapping[str, ScannedStock],
@@ -1079,6 +1964,7 @@ def top_ranked_options(
     """Rank the full pool and return the top K options globally."""
     if top_k <= 0 or not options:
         return []
+
     ranked_symbols = rank_option_pool(
         options=options,
         stocks=stocks,
@@ -1086,20 +1972,29 @@ def top_ranked_options(
         research=research,
         **kwargs,
     )
+
     by_symbol = {option.symbol: option for option in options}
     return [by_symbol[symbol] for symbol in ranked_symbols[:top_k]]
+
+
 # Compatibility aliases.
 rank_options = rank_option_pool
 rank_option_candidates = rank_option_pool
+
+
 =====
 # FILE: strategy/option_selector.py
 =====
+
 from __future__ import annotations
+
 import math
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Optional
+
 from alpaca.data.historical.option import OptionsSnapshot
+
 from config import (
     MIN_DTE,
     MAX_DTE,
@@ -1109,6 +2004,7 @@ from config import (
     MIN_OPTION_PREMIUM,
     LATEST_FORBIDDEN_EXPIRATION,
 )
+
 # ---------------------------------------------------------------------------
 # Market clock
 # ---------------------------------------------------------------------------
@@ -1116,18 +2012,25 @@ from config import (
 # it raises at import time, which would take the whole strategy down. Fall back
 # to a fixed-offset stand-in rather than failing to import: DTE is computed from
 # calendar dates, so an hour of DST drift cannot change a whole-day count.
+
 try:  # pragma: no cover - environment dependent
     from zoneinfo import ZoneInfo
+
     MARKET_TZ = ZoneInfo("America/New_York")
 except Exception:  # pragma: no cover - environment dependent
     from datetime import timezone
+
     MARKET_TZ = timezone(timedelta(hours=-4), name="America/New_York")
+
 MARKET_CLOSE = time(16, 0)
+
 # ---------------------------------------------------------------------------
 # Pricing model constants
 # ---------------------------------------------------------------------------
+
 RISK_FREE_RATE = 0.043
 DIVIDEND_YIELD = 0.0
+
 # Gates. config.MAX_OPTION_SPREAD_PCT (0.15) is deliberately NOT used as the
 # effective ceiling: round-trip friction at a 15% spread is ~14% of capital
 # deployed, which is larger than the gross edge of any realistic directional
@@ -1139,6 +2042,7 @@ MAX_DAILY_THETA_PCT = 0.12       # abs(theta_per_day) / ask
 MAX_BREAKEVEN_RATIO = 1.15       # breakeven move / expected move over the hold
 MAX_IV_RV_RATIO = 1.60           # do not buy richly-priced premium
 MIN_EXPECTED_RETURN = -0.10      # net of the round trip
+
 # Expected-return model.
 PLANNED_HOLD_DAYS = 2.0
 # The single number encoding "our directional signal is worth something",
@@ -1146,6 +2050,7 @@ PLANNED_HOLD_DAYS = 2.0
 # master selectivity dial. At 0.0 a zero-edge trade must price slightly negative.
 EDGE_DRIFT_SIGMAS = 0.35
 SCENARIO_NODES = (-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0)
+
 # Score weights. Spread is deliberately NOT scored: it is a certain, known cost,
 # so it is gated and then subtracted inside expected_return. Scoring it a second
 # time would let an uncertain signal outbid a known cost.
@@ -1153,32 +2058,41 @@ WEIGHT_EXPECTED_RETURN = 0.45
 WEIGHT_PROBABILITY_OF_PROFIT = 0.25
 WEIGHT_VARIANCE_RISK_PREMIUM = 0.20
 WEIGHT_CONTRACT_SHAPE = 0.10
+
 # Retained for backward compatibility with any caller that imports it. The score
 # is now modelled rather than accumulated out of buckets, so it no longer acts as
 # a normalizer.
 OPTION_SCORE_MAX = 80.0
+
 _SQRT_2 = math.sqrt(2.0)
 _SQRT_2PI = math.sqrt(2.0 * math.pi)
 _TRADING_DAYS_PER_YEAR = 252.0
 _CALENDAR_DAYS_PER_YEAR = 365.0
+
+
 @dataclass
 class OptionCandidate:
     symbol: str
     expiration: date
     option_type: str          # "call" or "put"
     strike: float
+
     bid: float
     ask: float
     mid: float
     spread_pct: float
+
     iv: Optional[float]
     delta: Optional[float]
     gamma: Optional[float]
     theta: Optional[float]
     vega: Optional[float]
+
     dte: int
     moneyness_pct: float
+
     score: float = 0.0
+
     # --- Appended diagnostics -------------------------------------------------
     # Every field below has a default, so the original 16-field positional
     # construction is unchanged and every existing consumer keeps working.
@@ -1197,17 +2111,27 @@ class OptionCandidate:
     iv_source: str = "alpaca"                   # alpaca | solved | unavailable
     greeks_source: str = "alpaca"               # alpaca | model | unavailable
     reject_reason: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Black-Scholes-Merton
 # ---------------------------------------------------------------------------
+
+
 def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / _SQRT_2))
+
+
 def _norm_pdf(x: float) -> float:
     return math.exp(-0.5 * x * x) / _SQRT_2PI
+
+
 def _intrinsic(spot: float, strike: float, option_type: str) -> float:
     if option_type == "call":
         return max(0.0, spot - strike)
     return max(0.0, strike - spot)
+
+
 def bsm_price(
     spot: float,
     strike: float,
@@ -1218,6 +2142,7 @@ def bsm_price(
     dividend_yield: float = DIVIDEND_YIELD,
 ) -> float:
     """Black-Scholes-Merton price for a European option.
+
     Degenerate inputs (no time left, or no volatility) collapse to intrinsic
     value, which is the correct limit and keeps the scenario engine finite at
     expiry rather than dividing by zero.
@@ -1226,17 +2151,22 @@ def bsm_price(
         return 0.0
     if year_fraction <= 0.0 or sigma <= 0.0:
         return _intrinsic(spot, strike, option_type)
+
     sqrt_t = math.sqrt(year_fraction)
     d1 = (
         math.log(spot / strike)
         + (rate - dividend_yield + 0.5 * sigma * sigma) * year_fraction
     ) / (sigma * sqrt_t)
     d2 = d1 - sigma * sqrt_t
+
     discount = math.exp(-rate * year_fraction)
     carry = math.exp(-dividend_yield * year_fraction)
+
     if option_type == "call":
         return spot * carry * _norm_cdf(d1) - strike * discount * _norm_cdf(d2)
     return strike * discount * _norm_cdf(-d2) - spot * carry * _norm_cdf(-d1)
+
+
 def bsm_greeks(
     spot: float,
     strike: float,
@@ -1247,6 +2177,7 @@ def bsm_greeks(
     dividend_yield: float = DIVIDEND_YIELD,
 ) -> dict[str, float]:
     """Analytic greeks. Theta is returned ANNUALIZED.
+
     Alpaca reports theta per day, so callers filling missing greeks from this
     model must divide theta by 365 to match that convention.
     """
@@ -1256,18 +2187,22 @@ def bsm_greeks(
         else:
             delta = -1.0 if spot < strike else 0.0
         return {"delta": delta, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+
     sqrt_t = math.sqrt(year_fraction)
     d1 = (
         math.log(spot / strike)
         + (rate - dividend_yield + 0.5 * sigma * sigma) * year_fraction
     ) / (sigma * sqrt_t)
     d2 = d1 - sigma * sqrt_t
+
     discount = math.exp(-rate * year_fraction)
     carry = math.exp(-dividend_yield * year_fraction)
     pdf_d1 = _norm_pdf(d1)
+
     gamma = carry * pdf_d1 / (spot * sigma * sqrt_t)
     # Vega per 1 volatility point (i.e. per 0.01 of sigma).
     vega = spot * carry * pdf_d1 * sqrt_t / 100.0
+
     if option_type == "call":
         delta = carry * _norm_cdf(d1)
         theta = (
@@ -1282,7 +2217,10 @@ def bsm_greeks(
             + rate * strike * discount * _norm_cdf(-d2)
             - dividend_yield * spot * carry * _norm_cdf(-d1)
         )
+
     return {"delta": delta, "gamma": gamma, "theta": theta, "vega": vega}
+
+
 def implied_volatility(
     price: float,
     spot: float,
@@ -1296,18 +2234,23 @@ def implied_volatility(
     iterations: int = 80,
 ) -> Optional[float]:
     """Back out implied volatility by bisection.
+
     Returns None when the price is not attainable by the model - below intrinsic,
     or above the upper vol bound. Never guesses: an unsolvable quote is reported
     as missing rather than filled with a placeholder.
     """
     if price <= 0 or spot <= 0 or strike <= 0 or year_fraction <= 0.0:
         return None
+
     if price < _intrinsic(spot, strike, option_type) - 1e-9:
         return None
+
     low_price = bsm_price(spot, strike, year_fraction, lower, option_type, rate, dividend_yield)
     high_price = bsm_price(spot, strike, year_fraction, upper, option_type, rate, dividend_yield)
+
     if price < low_price or price > high_price:
         return None
+
     low, high = lower, upper
     for _ in range(iterations):
         mid_vol = 0.5 * (low + high)
@@ -1316,43 +2259,61 @@ def implied_volatility(
             low = mid_vol
         else:
             high = mid_vol
+
     return 0.5 * (low + high)
+
+
 # ---------------------------------------------------------------------------
 # Symbol / clock helpers
 # ---------------------------------------------------------------------------
+
+
 def parse_occ_symbol(symbol: str) -> tuple[date, str, float]:
     """
     Parse a standard OCC option symbol.
+
     Example:
         NVDA260904C00217500
+
     Returns:
         (expiration_date, option_type, strike)
     """
     if not isinstance(symbol, str) or len(symbol) < 15:
         raise ValueError(f"Invalid option symbol: {symbol}")
+
     # Standard OCC format:
     # ROOT + YYMMDD + C/P + 8-digit strike * 1000
+
     expiration_raw = symbol[-15:-9]
     option_type_raw = symbol[-9]
     strike_raw = symbol[-8:]
+
     if not expiration_raw.isdigit() or not strike_raw.isdigit():
         raise ValueError(f"Invalid option symbol: {symbol}")
+
     try:
         expiration = datetime.strptime(expiration_raw, "%y%m%d").date()
     except ValueError as exc:
         raise ValueError(f"Invalid expiration in option symbol: {symbol}") from exc
+
     if option_type_raw == "C":
         option_type = "call"
     elif option_type_raw == "P":
         option_type = "put"
     else:
         raise ValueError(f"Unknown option type in symbol: {symbol}")
+
     strike = int(strike_raw) / 1000.0
+
     if strike <= 0:
         raise ValueError(f"Non-positive strike in option symbol: {symbol}")
+
     return expiration, option_type, strike
+
+
 def market_now(as_of: Optional[datetime] = None) -> datetime:
     """Current exchange-local time.
+
     `as_of` exists so the selector can be driven from a historical decision
     timestamp instead of the wall clock. Never use the local system date: on a
     machine east of New York (IST is UTC+5:30 against UTC-4) every run between
@@ -1364,8 +2325,11 @@ def market_now(as_of: Optional[datetime] = None) -> datetime:
     if as_of.tzinfo is None:
         return as_of.replace(tzinfo=MARKET_TZ)
     return as_of.astimezone(MARKET_TZ)
+
+
 def time_to_expiry_years(expiration: date, as_of: Optional[datetime] = None) -> float:
     """Fractional years until the 16:00 ET close on the expiration date.
+
     Whole-day DTE overstates the life of a contract expiring tomorrow when it is
     already 15:30 today. At 1-14 DTE that difference is material to pricing.
     """
@@ -1375,9 +2339,13 @@ def time_to_expiry_years(expiration: date, as_of: Optional[datetime] = None) -> 
     if seconds <= 0:
         return 0.0
     return seconds / (_CALENDAR_DAYS_PER_YEAR * 24.0 * 3600.0)
+
+
 # ---------------------------------------------------------------------------
 # Candidate construction
 # ---------------------------------------------------------------------------
+
+
 def build_candidate(
     symbol: str,
     snapshot: OptionsSnapshot,
@@ -1387,39 +2355,54 @@ def build_candidate(
 ) -> Optional[OptionCandidate]:
     """
     Convert an Alpaca option snapshot into a normalized candidate.
+
     Where Alpaca supplies IV and greeks they are used as-is - they are the
     market's numbers and reproducing them locally would only be worse. Where they
     are missing, IV is solved from the quote midpoint and the greeks are filled
     from the model; the source is recorded on the candidate either way.
     """
+
     if underlying_price <= 0:
         return None
+
     quote = getattr(snapshot, "latest_quote", None)
     if quote is None:
         return None
+
     bid = float(quote.bid_price or 0)
     ask = float(quote.ask_price or 0)
+
     # Ignore broken/unusable quotes.
     if bid <= 0 or ask <= 0 or ask < bid:
         return None
+
     mid = (bid + ask) / 2.0
+
     if mid <= 0:
         return None
+
     spread_pct = (ask - bid) / mid
+
     try:
         expiration, option_type, strike = parse_occ_symbol(symbol)
     except ValueError:
         return None
+
     today = market_now(as_of).date()
     dte = (expiration - today).days
+
     if dte < 0:
         return None
+
     moneyness_pct = (strike - underlying_price) / underlying_price
     year_fraction = time_to_expiry_years(expiration, as_of)
+
     greeks = getattr(snapshot, "greeks", None)
+
     raw_iv = getattr(snapshot, "implied_volatility", None)
     iv: Optional[float] = float(raw_iv) if raw_iv is not None else None
     iv_source = "alpaca"
+
     if iv is None or iv <= 0:
         iv = implied_volatility(
             price=mid,
@@ -1429,15 +2412,18 @@ def build_candidate(
             option_type=option_type,
         )
         iv_source = "solved" if iv is not None else "unavailable"
+
     def _greek(name: str) -> Optional[float]:
         if greeks is None:
             return None
         value = getattr(greeks, name, None)
         return float(value) if value is not None else None
+
     delta = _greek("delta")
     gamma = _greek("gamma")
     theta = _greek("theta")
     vega = _greek("vega")
+
     greeks_source = "alpaca"
     if None in (delta, gamma, theta, vega):
         if iv is not None and iv > 0:
@@ -1460,6 +2446,7 @@ def build_candidate(
             greeks_source = "model"
         else:
             greeks_source = "unavailable"
+
     candidate = OptionCandidate(
         symbol=symbol,
         expiration=expiration,
@@ -1481,13 +2468,17 @@ def build_candidate(
         iv_source=iv_source,
         greeks_source=greeks_source,
     )
+
     _attach_analytics(candidate, realized_vol=realized_vol)
     return candidate
+
+
 def _attach_analytics(
     candidate: OptionCandidate,
     realized_vol: Optional[float] = None,
 ) -> None:
     """Compute the modelled diagnostics used by the gates and the score.
+
     Anything that cannot be computed from available data is left as None. It is
     never filled with a neutral placeholder: a missing number must read as
     missing at the gate, not as an average-quality contract.
@@ -1495,8 +2486,10 @@ def _attach_analytics(
     spot = candidate.underlying_price
     iv = candidate.iv
     t = candidate.year_fraction
+
     if spot is None or spot <= 0:
         return
+
     # Breakeven at expiry, measured against the ask (what you actually pay).
     if candidate.option_type == "call":
         breakeven = candidate.strike + candidate.ask
@@ -1504,11 +2497,14 @@ def _attach_analytics(
         breakeven = candidate.strike - candidate.ask
     candidate.breakeven = breakeven
     candidate.breakeven_pct = abs(breakeven - spot) / spot
+
     # Theta burn as a fraction of premium per day.
     if candidate.theta is not None and candidate.ask > 0:
         candidate.theta_burn_pct = abs(candidate.theta) / candidate.ask
+
     if iv is None or iv <= 0 or t is None or t <= 0:
         return
+
     # Fair value priced at REALIZED vol answers "is the market overcharging me?".
     # Exit repricing below uses IMPLIED vol, because you sell at the market's
     # price, not at your model's. Mixing these two up is the classic error.
@@ -1522,20 +2518,25 @@ def _attach_analytics(
             option_type=candidate.option_type,
         )
         candidate.edge = candidate.fair_value - candidate.ask
+
     forecast_vol = realized_vol if (realized_vol is not None and realized_vol > 0) else iv
+
     hold_years = min(PLANNED_HOLD_DAYS / _CALENDAR_DAYS_PER_YEAR, t)
     if hold_years <= 0:
         return
+
     # Expected move of the underlying over the planned hold.
     expected_move_pct = forecast_vol * math.sqrt(hold_years)
     candidate.expected_move_pct = expected_move_pct
     if expected_move_pct > 0 and candidate.breakeven_pct is not None:
         candidate.breakeven_ratio = candidate.breakeven_pct / expected_move_pct
+
     sign = 1.0 if candidate.option_type == "call" else -1.0
     sqrt_hold = math.sqrt(hold_years)
     drift = sign * EDGE_DRIFT_SIGMAS * forecast_vol * sqrt_hold
     exit_t = max(t - hold_years, 0.0)
     half_spread = 0.5 * (candidate.ask - candidate.bid)
+
     total_weight = 0.0
     weighted_proceeds = 0.0
     for k in SCENARIO_NODES:
@@ -1553,9 +2554,11 @@ def _attach_analytics(
         # Cross the spread again on the way out.
         weighted_proceeds += weight * max(0.0, value - half_spread)
         total_weight += weight
+
     if total_weight > 0 and candidate.ask > 0:
         mean_proceeds = weighted_proceeds / total_weight
         candidate.expected_return = (mean_proceeds - candidate.ask) / candidate.ask
+
     # Probability of finishing beyond the breakeven, under the same drift
     # assumption, evaluated at the breakeven rather than the strike.
     if breakeven > 0:
@@ -1567,18 +2570,26 @@ def _attach_analytics(
             - 0.5 * forecast_vol * forecast_vol * t
         ) / (forecast_vol * sqrt_t)
         candidate.probability_of_profit = _norm_cdf(d2) if candidate.option_type == "call" else _norm_cdf(-d2)
+
+
 # ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
+
+
 def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
     return max(low, min(high, value))
+
+
 def _contract_shape_score(candidate: OptionCandidate) -> float:
     """Preference over contract structure, independent of the pricing model.
+
     Kept small (10% of the score) and deliberately blunt: it expresses that we
     want a responsive, liquid-looking, short-but-not-expiring contract, and
     nothing more. The pricing model carries the real discrimination.
     """
     shape = 0.0
+
     if candidate.delta is not None:
         abs_delta = abs(candidate.delta)
         if 0.35 <= abs_delta <= 0.65:
@@ -1587,12 +2598,14 @@ def _contract_shape_score(candidate: OptionCandidate) -> float:
             shape += 32.0
         elif 0.15 <= abs_delta <= 0.85:
             shape += 14.0
+
     if 2 <= candidate.dte <= 7:
         shape += 30.0
     elif 1 <= candidate.dte <= 10:
         shape += 20.0
     elif candidate.dte <= 21:
         shape += 8.0
+
     abs_moneyness = abs(candidate.moneyness_pct)
     if abs_moneyness <= 0.03:
         shape += 25.0
@@ -1600,26 +2613,35 @@ def _contract_shape_score(candidate: OptionCandidate) -> float:
         shape += 16.0
     elif abs_moneyness <= 0.12:
         shape += 6.0
+
     return _clamp(shape)
+
+
 def _score_candidate(
     candidate: OptionCandidate,
     direction: str,
 ) -> float:
     """
     Score an option for a directional trade, in [0, 100].
+
     The score is a weighted blend of modelled quantities rather than an
     accumulation of magic-number buckets:
+
         expected return          45%
         probability of profit    25%
         variance risk premium    20%   (IV vs realized vol)
         contract shape           10%
+
     Spread is not scored. It is a certain cost, so it is gated up front and then
     subtracted inside expected_return; scoring it again would let an uncertain
     signal buy its way past a known cost.
+
     Components that cannot be computed are dropped and the remaining weights are
     renormalized, so a missing input never enters as a neutral average.
     """
+
     direction = direction.lower()
+
     # Direction sanity. select_directional_options already restricts calls to
     # bullish and puts to bearish, but _score_candidate is public and must not
     # assume it was reached through that path.
@@ -1631,49 +2653,64 @@ def _score_candidate(
             return 0.0
         if direction == "bearish" and candidate.delta >= 0:
             return 0.0
+
     components: list[tuple[float, float]] = []
+
     # 1. Expected return, net of the round trip. Mapped so that -20% -> 0 and
     #    +60% -> 100, which spans the range a short-dated long option can
     #    plausibly show without saturating at either end.
     if candidate.expected_return is not None:
         er_score = _clamp((candidate.expected_return + 0.20) / 0.80 * 100.0)
         components.append((WEIGHT_EXPECTED_RETURN, er_score))
+
     # 2. Probability of profit at the breakeven. Short-dated OTM PoP is small in
     #    absolute terms, so 0-50% is mapped across the full range; the absolute
     #    number is optimistic and is used for ranking only.
     if candidate.probability_of_profit is not None:
         pop_score = _clamp(candidate.probability_of_profit / 0.50 * 100.0)
         components.append((WEIGHT_PROBABILITY_OF_PROFIT, pop_score))
+
     # 3. Variance risk premium. Cheap vol relative to what the stock actually
     #    realizes scores well; rich vol scores badly. Ratio 0.80 -> 100,
     #    ratio 1.60 -> 0.
     if candidate.iv_rv_ratio is not None and candidate.iv_rv_ratio > 0:
         vrp_score = _clamp((MAX_IV_RV_RATIO - candidate.iv_rv_ratio) / (MAX_IV_RV_RATIO - 0.80) * 100.0)
         components.append((WEIGHT_VARIANCE_RISK_PREMIUM, vrp_score))
+
     # 4. Contract shape.
     components.append((WEIGHT_CONTRACT_SHAPE, _contract_shape_score(candidate)))
+
     total_weight = sum(weight for weight, _ in components)
     if total_weight <= 0:
         return 0.0
+
     score = sum(weight * value for weight, value in components) / total_weight
     return _clamp(round(score, 4))
+
+
 # ---------------------------------------------------------------------------
 # Selection
 # ---------------------------------------------------------------------------
+
+
 def _gate(candidate: OptionCandidate, *, max_spread_pct: float) -> Optional[str]:
     """Return a rejection reason, or None if the candidate passes every gate.
+
     Gate ORDER is load-bearing, because the first failure is the reason that gets
     written to the decision log. They are ordered cause before symptom:
+
         spread          a cost that exists before any model runs
         IV/RV           the contract is priced richly
         theta burn      the contract decays too fast
         breakeven       the strike is too far for the expected move
         expected return the aggregate verdict
+
     IV/RV precedes the breakeven check on purpose. Rich implied vol inflates the
     premium, which inflates the breakeven - so a rich contract fails both, and
     "you are paying 3.0x realized vol" is the useful reason to record, while
     "breakeven is 2.6x the expected move" is only its consequence.
     """
+
     # Spread. A one-tick market on a cheap contract is a tick-size floor, not
     # evidence of illiquidity, so an absolute-cents escape hatch applies.
     # The epsilon matters: option quotes are in whole cents, so an exactly
@@ -1682,15 +2719,22 @@ def _gate(candidate: OptionCandidate, *, max_spread_pct: float) -> Optional[str]
     absolute_spread = candidate.ask - candidate.bid
     if candidate.spread_pct > max_spread_pct and absolute_spread > ABS_SPREAD_TOLERANCE + 1e-9:
         return f"spread {candidate.spread_pct:.1%} > {max_spread_pct:.1%}"
+
     if candidate.iv_rv_ratio is not None and candidate.iv_rv_ratio > MAX_IV_RV_RATIO:
         return f"IV/RV {candidate.iv_rv_ratio:.2f} > {MAX_IV_RV_RATIO:.2f}"
+
     if candidate.theta_burn_pct is not None and candidate.theta_burn_pct > MAX_DAILY_THETA_PCT:
         return f"theta burn {candidate.theta_burn_pct:.1%}/day > {MAX_DAILY_THETA_PCT:.0%}"
+
     if candidate.breakeven_ratio is not None and candidate.breakeven_ratio > MAX_BREAKEVEN_RATIO:
         return f"breakeven/expected move {candidate.breakeven_ratio:.2f} > {MAX_BREAKEVEN_RATIO:.2f}"
+
     if candidate.expected_return is not None and candidate.expected_return < MIN_EXPECTED_RETURN:
         return f"expected return {candidate.expected_return:+.1%} < {MIN_EXPECTED_RETURN:+.0%}"
+
     return None
+
+
 def select_directional_options(
     chain: dict[str, OptionsSnapshot],
     underlying_price: float,
@@ -1708,22 +2752,30 @@ def select_directional_options(
 ) -> list[OptionCandidate]:
     """
     Select tradeable directional option candidates, ranked by modelled quality.
+
     `realized_vol` is optional so existing callers keep working, but without it
     the variance-risk-premium gate and score component stay dark and the
     expected-return model falls back to pricing the forecast at implied vol.
     Pass ScannedStock.realized_volatility whenever it is available.
+
     `as_of` drives the market clock, so the same function can be replayed at a
     historical decision timestamp.
+
     Pass a list as `collect_rejections` to receive every candidate that failed a
     gate, each carrying `reject_reason`. Nothing is filtered silently.
     """
+
     direction = direction.lower()
+
     if direction not in {"bullish", "bearish"}:
         raise ValueError("direction must be 'bullish' or 'bearish'")
+
     if max_spread_pct > MAX_SPREAD_PCT:
         # config's ceiling is looser than the friction budget allows.
         max_spread_pct = MAX_SPREAD_PCT
+
     candidates: list[OptionCandidate] = []
+
     for symbol, snapshot in chain.items():
         candidate = build_candidate(
             symbol=symbol,
@@ -1732,12 +2784,15 @@ def select_directional_options(
             as_of=as_of,
             realized_vol=realized_vol,
         )
+
         if candidate is None:
             continue
+
         def _reject(reason: str) -> None:
             if collect_rejections is not None:
                 candidate.reject_reason = reason
                 collect_rejections.append(candidate)
+
         # -----------------------------------------------------
         # Structure: type, expiration window, measurement guard
         # -----------------------------------------------------
@@ -1745,33 +2800,41 @@ def select_directional_options(
             continue
         if direction == "bearish" and candidate.option_type != "put":
             continue
+
         if candidate.dte < min_dte or candidate.dte > max_dte:
             _reject(f"dte {candidate.dte} outside [{min_dte}, {max_dte}]")
             continue
+
         # Do not initiate positions that can reach expiration
         # during the official measurement endpoint.
         if candidate.expiration <= LATEST_FORBIDDEN_EXPIRATION:
             _reject(f"expiration {candidate.expiration} inside the measurement window")
             continue
+
         # -----------------------------------------------------
         # Premium
         # -----------------------------------------------------
         if candidate.mid < min_premium:
             _reject(f"premium {candidate.mid:.2f} < {min_premium:.2f}")
             continue
+
         # -----------------------------------------------------
         # Greeks
         # -----------------------------------------------------
         if candidate.delta is None:
             _reject("no delta available and none recoverable")
             continue
+
         abs_delta = abs(candidate.delta)
+
         if abs_delta < min_abs_delta:
             _reject(f"|delta| {abs_delta:.2f} < {min_abs_delta:.2f}")
             continue
+
         if abs_delta > max_abs_delta:
             _reject(f"|delta| {abs_delta:.2f} > {max_abs_delta:.2f}")
             continue
+
         # -----------------------------------------------------
         # Cost, decay and pricing gates
         # -----------------------------------------------------
@@ -1779,18 +2842,26 @@ def select_directional_options(
         if reason is not None:
             _reject(reason)
             continue
+
         candidate.score = _score_candidate(
             candidate=candidate,
             direction=direction,
         )
+
         candidates.append(candidate)
+
     # Deterministic ordering: score first, then symbol, so an identical chain
     # always produces an identical ranking.
     candidates.sort(key=lambda x: (-x.score, x.symbol))
+
     return candidates[:max_candidates]
+
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
+
+
 def print_option_candidates(
     symbol: str,
     underlying_price: float,
@@ -1800,10 +2871,12 @@ def print_option_candidates(
     """
     Print selected option candidates in a readable table.
     """
+
     print()
     print("=" * 125)
     print(f" {symbol} OPTION CANDIDATES — {direction.upper()}")
     print("=" * 125)
+
     print(
         f"{'Rank':<5}"
         f"{'Contract':<22}"
@@ -1816,18 +2889,22 @@ def print_option_candidates(
         f"{'Mny':>9}"
         f"{'Score':>9}"
     )
+
     print("-" * 125)
+
     for rank, candidate in enumerate(candidates, start=1):
         iv_str = (
             f"{candidate.iv:.1%}"
             if candidate.iv is not None
             else "N/A"
         )
+
         delta_str = (
             f"{candidate.delta:+.3f}"
             if candidate.delta is not None
             else "N/A"
         )
+
         print(
             f"{rank:<5}"
             f"{candidate.symbol:<22}"
@@ -1840,8 +2917,11 @@ def print_option_candidates(
             f"{candidate.moneyness_pct:>+8.1%}"
             f"{candidate.score:>9.1f}"
         )
+
     print("=" * 125)
     print()
+
+
 def print_option_diagnostics(
     symbol: str,
     underlying_price: float,
@@ -1849,10 +2929,12 @@ def print_option_diagnostics(
     direction: str,
 ) -> None:
     """Print the modelled pricing metrics behind each candidate's score."""
+
     print()
     print("=" * 132)
     print(f" {symbol} OPTION DIAGNOSTICS — {direction.upper()}  (underlying ${underlying_price:,.2f})")
     print("=" * 132)
+
     print(
         f"{'Contract':<22}"
         f"{'Ask':>8}"
@@ -1868,8 +2950,10 @@ def print_option_diagnostics(
         f"{'Score':>8}"
     )
     print("-" * 132)
+
     def _fmt(value: Optional[float], spec: str) -> str:
         return format(value, spec) if value is not None else "N/A"
+
     for candidate in candidates:
         print(
             f"{candidate.symbol:<22}"
@@ -1885,5 +2969,923 @@ def print_option_diagnostics(
             f"{_fmt(candidate.expected_return, '>+9.1%'):>9}"
             f"{candidate.score:>8.1f}"
         )
+
     print("=" * 132)
     print()
+
+
+=====
+# FILE: strategy/portfolio.py
+=====
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List
+
+
+@dataclass
+class PortfolioPosition:
+    trade: object
+    contracts: int
+    max_loss: float
+    premium_deployed: float
+    risk_weight: float
+
+
+from config import (
+    MAX_TOTAL_RISK_PCT,
+    MAX_SINGLE_TRADE_RISK_PCT,
+    MAX_UNDERLYING_RISK_PCT,
+    MAX_POSITIONS,
+    MIN_TRADE_SCORE,
+)
+
+
+def _estimated_entry_price(trade) -> float:
+    """
+    Estimate the executable entry price for sizing.
+
+    Current strategy only supports buying single-leg options,
+    so the conservative reference price is the ask.
+
+    Midpoint remains a useful informational/reference value,
+    but should not be used to size a live position.
+    """
+    if trade.option_ask > 0:
+        return trade.option_ask
+
+    return trade.option_mid
+
+
+def _per_contract_risk(trade) -> float:
+    """
+    Current system assumes long single-leg options.
+
+    For a long option:
+        max loss = premium paid × 100
+
+    Position sizing uses the estimated executable entry price,
+    not the midpoint.
+    """
+
+    entry_price = _estimated_entry_price(trade)
+
+    if entry_price <= 0:
+        return 0.0
+
+    return entry_price * 100.0
+
+
+def _trade_weight(
+    trade: object,
+    rank_index: int = 0,
+    total_candidates: int = 1,
+) -> float:
+    """
+    Convert trade priority into an allocation weight.
+
+    Higher-ranked trades receive higher risk allocation weight.
+    """
+    if total_candidates <= 1:
+        return 1.0
+
+    # Rank-based decay weight: rank #1 gets the highest weight
+    return float(max(1, total_candidates - rank_index) ** 1.5)
+
+
+def select_best_trade_per_stock(
+    trades: List[object],
+) -> List[object]:
+    """
+    Only keep the highest-priority trade for each underlying.
+
+    Preserves incoming LLM rank order so that the LLM's top choice
+    for each underlying is retained and evaluated first.
+    """
+    # If trades have explicit option_llm_rank > 0, ensure sorted by rank
+    has_llm_ranks = any(getattr(t, "option_llm_rank", 0) > 0 for t in trades)
+    if has_llm_ranks:
+        sorted_trades = sorted(
+            trades,
+            key=lambda t: getattr(t, "option_llm_rank", 0) if getattr(t, "option_llm_rank", 0) > 0 else float("inf"),
+        )
+    else:
+        sorted_trades = trades
+
+    best_trades: List[object] = []
+    seen_symbols = set()
+
+    for trade in sorted_trades:
+        symbol = trade.stock_symbol
+        if symbol not in seen_symbols:
+            seen_symbols.add(symbol)
+            best_trades.append(trade)
+
+    return best_trades
+
+
+def build_portfolio(
+    trades: List[object],
+    account_equity: float,
+    total_risk_pct: float = MAX_TOTAL_RISK_PCT,
+    max_trade_risk_pct: float = MAX_SINGLE_TRADE_RISK_PCT,
+    max_underlying_risk_pct: float = MAX_UNDERLYING_RISK_PCT,
+    max_positions: int = MAX_POSITIONS,
+    min_trade_score: float = MIN_TRADE_SCORE,
+) -> List[PortfolioPosition]:
+    """
+    Convert ranked trades into a sized portfolio.
+
+    Current instrument assumption:
+        long calls / long puts.
+
+    The portfolio is allocated by MAXIMUM LOSS, not buying power.
+    Priority order is determined upstream by the LLM option ranker;
+    the portfolio layer decides sizing and risk allocation ("how much").
+    """
+
+    if account_equity <= 0:
+        raise ValueError("account_equity must be positive")
+
+    if total_risk_pct <= 0:
+        raise ValueError("total_risk_pct must be positive")
+
+    if max_trade_risk_pct <= 0:
+        raise ValueError("max_trade_risk_pct must be positive")
+
+    if max_underlying_risk_pct <= 0:
+        raise ValueError(
+            "max_underlying_risk_pct must be positive"
+        )
+
+    max_total_risk = account_equity * total_risk_pct
+    max_trade_risk = account_equity * max_trade_risk_pct
+
+    # ---------------------------------------------------------
+    # 1. One trade per underlying, preserving LLM rank priority.
+    # ---------------------------------------------------------
+
+    eligible = select_best_trade_per_stock(trades)
+
+    # ---------------------------------------------------------
+    # 2. Keep only top N underlyings by LLM rank.
+    # ---------------------------------------------------------
+
+    eligible = eligible[:max_positions]
+
+    if not eligible:
+        return []
+
+    # ---------------------------------------------------------
+    # 3. Calculate relative weights based on priority.
+    # ---------------------------------------------------------
+
+    weighted_trades = []
+    total_eligible = len(eligible)
+
+    for rank_idx, trade in enumerate(eligible):
+        weight = _trade_weight(
+            trade,
+            rank_index=rank_idx,
+            total_candidates=total_eligible,
+        )
+
+        if weight <= 0:
+            continue
+
+        per_contract_risk = _per_contract_risk(trade)
+
+        if per_contract_risk <= 0:
+            continue
+
+        weighted_trades.append(
+            (trade, weight, per_contract_risk)
+        )
+
+    if not weighted_trades:
+        return []
+
+    weight_sum = sum(
+        weight
+        for _, weight, _ in weighted_trades
+    )
+
+    # ---------------------------------------------------------
+    # 4. Convert risk budget into contracts.
+    # ---------------------------------------------------------
+
+    positions: List[PortfolioPosition] = []
+
+    for trade, weight, per_contract_risk in weighted_trades:
+        normalized_weight = weight / weight_sum
+
+        desired_risk = (
+            max_total_risk
+            * normalized_weight
+        )
+
+        # Hard single-trade cap.
+        allocated_risk = min(
+            desired_risk,
+            max_trade_risk,
+        )
+
+        contracts = int(
+            allocated_risk // per_contract_risk
+        )
+
+        if contracts <= 0:
+            continue
+
+        max_loss = contracts * per_contract_risk
+
+        positions.append(
+            PortfolioPosition(
+                trade=trade,
+                contracts=contracts,
+                max_loss=max_loss,
+                premium_deployed=max_loss,
+                risk_weight=normalized_weight,
+            )
+        )
+
+    # ---------------------------------------------------------
+    # 5. Ensure total risk never exceeds budget (preserving rank order).
+    # ---------------------------------------------------------
+
+    final_positions: List[PortfolioPosition] = []
+    running_risk = 0.0
+
+    for position in positions:
+        remaining_risk = max_total_risk - running_risk
+
+        if remaining_risk <= 0:
+            break
+
+        if position.max_loss <= remaining_risk:
+            final_positions.append(position)
+            running_risk += position.max_loss
+            continue
+
+        per_contract_risk = (
+            position.max_loss / position.contracts
+        )
+
+        allowed_contracts = int(
+            remaining_risk // per_contract_risk
+        )
+
+        if allowed_contracts <= 0:
+            continue
+
+        adjusted_loss = (
+            allowed_contracts
+            * per_contract_risk
+        )
+
+        final_positions.append(
+            PortfolioPosition(
+                trade=position.trade,
+                contracts=allowed_contracts,
+                max_loss=adjusted_loss,
+                premium_deployed=adjusted_loss,
+                risk_weight=position.risk_weight,
+            )
+        )
+
+        running_risk += adjusted_loss
+
+    return final_positions
+
+
+def print_portfolio_plan(
+    positions: List[PortfolioPosition],
+    account_equity: float,
+) -> None:
+    print("\n" + "=" * 130)
+    print(" PORTFOLIO PLAN")
+    print("=" * 130)
+
+    if not positions:
+        print("No trades passed portfolio construction.")
+        print("=" * 130)
+        return
+
+    print(
+        f"{'Rank':<6}"
+        f"{'Ticker':<8}"
+        f"{'Direction':<10}"
+        f"{'Contracts':>10}"
+        f"{'Premium':>13}"
+        f"{'Max Loss':>13}"
+        f"{'LLM Rank':>10}"
+        f"  {'Option':<24}"
+    )
+
+    print("-" * 130)
+
+    total_premium = 0.0
+    total_risk = 0.0
+
+    for rank, position in enumerate(positions, start=1):
+        trade = position.trade
+        llm_rank = getattr(trade, "option_llm_rank", None)
+        llm_rank_str = f"#{llm_rank}" if llm_rank else f"#{rank}"
+
+        print(
+            f"#{rank:<5}"
+            f"{trade.stock_symbol:<8}"
+            f"{trade.direction:<10}"
+            f"{position.contracts:>10}"
+            f"${position.premium_deployed:>12,.2f}"
+            f"${position.max_loss:>12,.2f}"
+            f"{llm_rank_str:>10}"
+            f"  {trade.option_symbol:<24}"
+        )
+
+        total_premium += position.premium_deployed
+        total_risk += position.max_loss
+
+    print("-" * 130)
+
+    print(
+        f"Total premium deployed: ${total_premium:,.2f}"
+    )
+
+    print(
+        f"Total planned max loss: ${total_risk:,.2f} "
+        f"({total_risk / account_equity:.2%})"
+    )
+
+    print(
+        f"Account equity:          ${account_equity:,.2f}"
+    )
+
+    print(
+        f"Remaining capital:       "
+        f"${account_equity - total_premium:,.2f}"
+    )
+
+    print("=" * 130)
+
+=====
+# FILE: strategy/research_agent.py
+=====
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Mapping, Sequence
+
+import requests
+from dotenv import load_dotenv
+
+from strategy.scanner import ScannedStock
+
+load_dotenv()
+
+ALPACA_NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
+FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
+DEFAULT_LOOKBACK_DAYS = 5
+DEFAULT_MAX_ARTICLES = 3
+DEFAULT_MAX_ARTICLE_SUMMARY_CHARS = 350
+DEFAULT_MAX_WORKERS = 8
+DEFAULT_TEMPERATURE = 0.0
+DEFAULT_MAX_TOKENS = 160
+DEFAULT_TIMEOUT_SECONDS = 30
+
+
+SYSTEM_PROMPT = """
+You are a market-news compression agent for an autonomous short-horizon options system.
+
+Your job is NOT to rank the stock, score it, recommend a trade, or predict a return.
+Compress the recent news into only the information that could matter over the next few
+trading sessions.
+
+The quantitative setup has already been computed deterministically. Translate it into
+short qualitative descriptors when useful, but do not repeat the raw numbers.
+
+Use only the supplied evidence. Do not invent catalysts, risks, dates, or facts.
+If there is no meaningful recent news, say so.
+
+Return ONLY JSON with exactly these keys:
+{
+  "news": "one concise sentence, maximum 40 words",
+  "catalyst": "one concise near-term catalyst, or null",
+  "risk": "one concise news-related risk/contradiction, or null",
+  "timing": "IMMEDIATE | NEAR_TERM | UNKNOWN | NONE"
+}
+
+IMMEDIATE means likely relevant within 1-2 trading days.
+NEAR_TERM means relevant within the short evaluation window but not clearly immediate.
+UNKNOWN means potentially relevant but timing is unclear.
+NONE means there is no meaningful recent catalyst.
+""".strip()
+
+
+@dataclass(frozen=True)
+class NewsArticle:
+    symbol: str
+    headline: str
+    summary: str
+    source: str
+    published_at: str
+    url: str | None = None
+
+
+@dataclass(frozen=True)
+class ResearchReport:
+    symbol: str
+    quantitative_summary: str
+    news: str
+    catalyst: str | None
+    risk: str | None
+    timing: str
+    article_count: int
+    articles: tuple[NewsArticle, ...] = ()
+
+    def to_text(self) -> str:
+        parts = [self.symbol, f"Quant: {self.quantitative_summary}"]
+        parts.append(f"News: {self.news}")
+        if self.catalyst:
+            parts.append(f"Catalyst: {self.catalyst}")
+        if self.risk:
+            parts.append(f"Risk: {self.risk}")
+        parts.append(f"Timing: {self.timing}")
+        return "\n".join(parts)
+
+
+class ResearchAgentError(RuntimeError):
+    """Raised when research retrieval or compression fails."""
+
+
+def _get_alpaca_credentials() -> tuple[str, str]:
+    api_key = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
+    secret_key = os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
+    if not api_key or not secret_key:
+        raise ResearchAgentError(
+            "Missing Alpaca API credentials. Set ALPACA_API_KEY and ALPACA_SECRET_KEY "
+            "(or APCA_API_KEY_ID and APCA_API_SECRET_KEY) in .env."
+        )
+    return api_key, secret_key
+
+
+def _get_research_model(model: str | None) -> str:
+    selected = model or os.getenv("FEATHERLESS_RESEARCH_MODEL")
+    if not selected:
+        raise ResearchAgentError(
+            "No research model selected. Pass model=... to research_stock(s) "
+            "or set FEATHERLESS_RESEARCH_MODEL in .env."
+        )
+    return selected
+
+
+def _clean_text(value: Any, max_chars: int | None = None) -> str:
+    if value is None:
+        return ""
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    if max_chars is not None and len(text) > max_chars:
+        text = text[: max_chars - 1].rstrip() + "…"
+    return text
+
+
+def _qualitative_quant_summary(stock: ScannedStock) -> str:
+    """Turn scanner values into compact semantic labels without an LLM call."""
+    labels: list[str] = []
+
+    # Momentum
+    if stock.return_20d >= 0.20 or stock.momentum_score >= 90:
+        labels.append("exceptionally strong momentum")
+    elif stock.return_20d >= 0.08 or stock.momentum_score >= 70:
+        labels.append("strong momentum")
+    elif stock.return_20d <= -0.20 or stock.momentum_score <= 10:
+        labels.append("exceptionally weak momentum")
+    elif stock.return_20d <= -0.08 or stock.momentum_score <= 30:
+        labels.append("weak momentum")
+
+    # Volume
+    if stock.volume_ratio >= 2.0 or stock.volume_score >= 90:
+        labels.append("unusually high volume")
+    elif stock.volume_ratio >= 1.25 or stock.volume_score >= 70:
+        labels.append("elevated volume")
+
+    # Volatility
+    if stock.realized_volatility >= 0.70 or stock.volatility_score >= 90:
+        labels.append("very high volatility")
+    elif stock.realized_volatility >= 0.45 or stock.volatility_score >= 70:
+        labels.append("elevated volatility")
+
+    # Relative strength
+    if stock.relative_strength_spy >= 0.15 or stock.relative_strength_score >= 90:
+        labels.append("exceptional relative strength")
+    elif stock.relative_strength_spy >= 0.05 or stock.relative_strength_score >= 70:
+        labels.append("strong relative strength")
+    elif stock.relative_strength_spy <= -0.15 or stock.relative_strength_score <= 10:
+        labels.append("exceptionally weak relative strength")
+    elif stock.relative_strength_spy <= -0.05 or stock.relative_strength_score <= 30:
+        labels.append("weak relative strength")
+
+    # Trend / extension
+    max_distance = max(abs(stock.distance_sma20), abs(stock.distance_sma50))
+    if max_distance >= 0.15:
+        labels.append("materially extended from trend")
+    elif max_distance >= 0.08:
+        labels.append("noticeably extended from trend")
+
+    if not labels:
+        return "mixed or moderate quantitative setup"
+    return ", ".join(labels)
+
+
+def _parse_article(raw: Mapping[str, Any], symbol: str) -> NewsArticle:
+    return NewsArticle(
+        symbol=symbol,
+        headline=_clean_text(raw.get("headline") or raw.get("title")),
+        summary=_clean_text(
+            raw.get("summary") or raw.get("content"),
+            DEFAULT_MAX_ARTICLE_SUMMARY_CHARS,
+        ),
+        source=_clean_text(raw.get("source") or raw.get("author") or "Unknown source", 80),
+        published_at=_clean_text(raw.get("created_at") or raw.get("updated_at") or "Unknown time", 40),
+        url=raw.get("url"),
+    )
+
+
+def _article_dedupe_key(article: NewsArticle) -> str:
+    title = re.sub(r"[^a-z0-9 ]+", "", article.headline.lower())
+    title = re.sub(r"\s+", " ", title).strip()
+    return title
+
+
+def _dedupe_articles(articles: Sequence[NewsArticle]) -> list[NewsArticle]:
+    seen: set[str] = set()
+    result: list[NewsArticle] = []
+    for article in articles:
+        key = _article_dedupe_key(article)
+        if not key:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(article)
+    return result
+
+
+def fetch_stock_news(
+    symbol: str,
+    *,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    max_articles: int = DEFAULT_MAX_ARTICLES,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+) -> list[NewsArticle]:
+    """Fetch recent Alpaca news for one stock, newest first."""
+    if lookback_days <= 0:
+        raise ValueError("lookback_days must be positive")
+    if max_articles <= 0:
+        return []
+
+    api_key, secret_key = _get_alpaca_credentials()
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=lookback_days)
+
+    params = {
+        "symbols": symbol.upper(),
+        "start": start.isoformat().replace("+00:00", "Z"),
+        "end": end.isoformat().replace("+00:00", "Z"),
+        "sort": "desc",
+        # Small on purpose: research is a compression step.
+        "limit": max_articles,
+        "include_content": "false",
+        "exclude_contentless": "true",
+    }
+    response = requests.get(
+        ALPACA_NEWS_URL,
+        headers={
+            "APCA-API-KEY-ID": api_key,
+            "APCA-API-SECRET-KEY": secret_key,
+        },
+        params=params,
+        timeout=timeout,
+    )
+    try:
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        raise ResearchAgentError(
+            f"Alpaca news request failed for {symbol}: {exc}"
+        ) from exc
+    except ValueError as exc:
+        raise ResearchAgentError(
+            f"Alpaca returned invalid news JSON for {symbol}."
+        ) from exc
+
+    raw_articles = payload.get("news", [])
+    if not isinstance(raw_articles, list):
+        raise ResearchAgentError(
+            f"Unexpected Alpaca news response for {symbol}."
+        )
+
+    parsed = [_parse_article(item, symbol.upper()) for item in raw_articles]
+    return _dedupe_articles(parsed)[:max_articles]
+
+
+def _format_news_for_llm(articles: Sequence[NewsArticle]) -> str:
+    if not articles:
+        return "NO MATERIAL RECENT NEWS FOUND."
+
+    lines: list[str] = []
+    for index, article in enumerate(articles, start=1):
+        headline = article.headline or "(no headline)"
+        summary = article.summary or "(no provider summary available)"
+        lines.extend(
+            [
+                f"ARTICLE {index}: {article.source} | {article.published_at}",
+                f"Headline: {headline}",
+                f"Summary: {summary}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def build_research_prompt(
+    stock: ScannedStock,
+    articles: Sequence[NewsArticle],
+) -> str:
+    """Build a compact stock-specific prompt for the cheap research model."""
+    return "\n".join(
+        [
+            "STOCK:",
+            stock.symbol.upper(),
+            "",
+            "QUANTITATIVE SETUP (already computed; do not repeat raw numbers):",
+            _qualitative_quant_summary(stock),
+            "",
+            "RECENT ALPACA NEWS:",
+            _format_news_for_llm(articles),
+            "",
+            "TASK:",
+            "Compress only the news/context that could matter over the next few trading sessions.",
+            "Do not score, rank, recommend a trade, or invent information.",
+        ]
+    )
+
+
+def _extract_json_object(content: str) -> dict[str, Any]:
+    text = content.strip()
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    raise ResearchAgentError(
+        f"Featherless returned invalid research JSON: {content!r}"
+    )
+
+
+def _normalize_field(value: Any, max_words: int | None = None) -> str | None:
+    if value is None:
+        return None
+    text = _clean_text(value)
+    if not text or text.lower() in {"null", "none", "n/a"}:
+        return None
+    if max_words is not None:
+        words = text.split()
+        text = " ".join(words[:max_words])
+    return text or None
+
+
+def compress_news(
+    stock: ScannedStock,
+    articles: Sequence[NewsArticle],
+    *,
+    model: str | None = None,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+) -> ResearchReport:
+    """Compress one stock's recent news into a small structured report."""
+    selected_model = _get_research_model(model)
+
+    # If there is no news, avoid spending an LLM call just to say so.
+    if not articles:
+        return ResearchReport(
+            symbol=stock.symbol.upper(),
+            quantitative_summary=_qualitative_quant_summary(stock),
+            news="No material recent news found.",
+            catalyst=None,
+            risk=None,
+            timing="NONE",
+            article_count=0,
+            articles=tuple(articles),
+        )
+
+    prompt = build_research_prompt(stock, articles)
+    api_key = os.getenv("FEATHERLESS_API_KEY")
+    if not api_key:
+        raise ResearchAgentError(
+            "Missing FEATHERLESS_API_KEY. Add it to .env or the environment."
+        )
+
+    try:
+        response = requests.post(
+            f"{FEATHERLESS_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "alpaca-agent",
+                "X-Title": "Alpaca Options Trading Agent - Research",
+            },
+            json={
+                "model": selected_model,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "chat_template_kwargs": {"thinking": False},
+            },
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        raise ResearchAgentError(
+            f"Featherless research request failed for {stock.symbol}: {exc}"
+        ) from exc
+    except ValueError as exc:
+        raise ResearchAgentError(
+            f"Featherless returned non-JSON response for {stock.symbol}."
+        ) from exc
+
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ResearchAgentError(
+            f"Unexpected Featherless response format for {stock.symbol}: {payload!r}"
+        ) from exc
+    if not content:
+        raise ResearchAgentError(
+            f"Featherless returned an empty research response for {stock.symbol}."
+        )
+
+    result = _extract_json_object(content)
+    timing = _normalize_field(result.get("timing")) or "UNKNOWN"
+    timing = timing.upper()
+    if timing not in {"IMMEDIATE", "NEAR_TERM", "UNKNOWN", "NONE"}:
+        timing = "UNKNOWN"
+
+    return ResearchReport(
+        symbol=stock.symbol.upper(),
+        quantitative_summary=_qualitative_quant_summary(stock),
+        news=_normalize_field(result.get("news"), max_words=40)
+        or "No material recent news summary was produced.",
+        catalyst=_normalize_field(result.get("catalyst"), max_words=22),
+        risk=_normalize_field(result.get("risk"), max_words=22),
+        timing=timing,
+        article_count=len(articles),
+        articles=tuple(articles),
+    )
+
+
+def research_stock(
+    stock: ScannedStock,
+    *,
+    model: str | None = None,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    max_articles: int = DEFAULT_MAX_ARTICLES,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> ResearchReport:
+    """Fetch Alpaca news and produce a compact research report for one stock."""
+    articles = fetch_stock_news(
+        stock.symbol,
+        lookback_days=lookback_days,
+        max_articles=max_articles,
+    )
+    return compress_news(
+        stock,
+        articles,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+
+def research_stocks(
+    stocks: Sequence[ScannedStock],
+    *,
+    model: str | None = None,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    max_articles: int = DEFAULT_MAX_ARTICLES,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> dict[str, ResearchReport]:
+    """
+    Research multiple scanner candidates concurrently.
+
+    Failures for individual symbols are converted to compact fallback reports so one
+    bad news/model response does not kill the whole scanner -> research -> ranker path.
+    """
+    if not stocks:
+        return {}
+    if max_workers <= 0:
+        raise ValueError("max_workers must be positive")
+
+    reports: dict[str, ResearchReport] = {}
+
+    def _run(stock: ScannedStock) -> ResearchReport:
+        try:
+            return research_stock(
+                stock,
+                model=model,
+                lookback_days=lookback_days,
+                max_articles=max_articles,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except ResearchAgentError as exc:
+            return ResearchReport(
+                symbol=stock.symbol.upper(),
+                quantitative_summary=_qualitative_quant_summary(stock),
+                news=f"Research unavailable: {str(exc)[:120]}",
+                catalyst=None,
+                risk="Recent news could not be evaluated.",
+                timing="UNKNOWN",
+                article_count=0,
+                articles=(),
+            )
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(stocks))) as executor:
+        futures = {executor.submit(_run, stock): stock.symbol.upper() for stock in stocks}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            report = future.result()
+            reports[symbol] = report
+
+    # Preserve scanner order for deterministic downstream prompt construction.
+    return {stock.symbol.upper(): reports[stock.symbol.upper()] for stock in stocks}
+
+
+def print_research_reports(
+    reports: Sequence[ResearchReport] | Mapping[str, ResearchReport],
+) -> None:
+    report_items = reports.values() if isinstance(reports, Mapping) else reports
+
+    print("\n" + "=" * 120)
+    print(" RESEARCH REPORTS")
+    print("=" * 120)
+
+    for report in report_items:
+        print(f"\n[{report.symbol}]")
+        print(f"Articles:  {report.article_count}")
+        print(f"Quant:     {report.quantitative_summary}")
+        print(f"News:      {report.news}")
+        print(f"Catalyst:  {report.catalyst or 'None'}")
+        print(f"Risk:      {report.risk or 'None'}")
+        print(f"Timing:    {report.timing}")
+
+        if report.articles:
+            print("Source articles:")
+            for article in report.articles:
+                print(
+                    f"  - {article.source} | "
+                    f"{article.published_at} | "
+                    f"{article.headline}"
+                )
+
+
+def research_text_by_symbol(
+    reports: Mapping[str, ResearchReport],
+) -> dict[str, str]:
+    """Convert reports into the mapping expected by strategy.llm_ranker.rank_stocks()."""
+    return {
+        symbol.upper(): report.to_text()
+        for symbol, report in reports.items()
+    }
+
+
+if __name__ == "__main__":
+    raise SystemExit(
+        "research_agent.py is a library module; call research_stock(s) from the orchestration layer."
+    )
+
+

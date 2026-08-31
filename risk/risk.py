@@ -52,6 +52,13 @@ def _per_contract_loss(position: PortfolioPosition) -> float:
     return position.max_loss / position.contracts
 
 
+def _trade_priority_key(position: PortfolioPosition):
+    rank = getattr(position.trade, "option_llm_rank", 0)
+    if rank > 0:
+        return (rank, -getattr(position.trade, "trade_score", 0.0))
+    return (float("inf"), -getattr(position.trade, "trade_score", 0.0))
+
+
 def assess_position(
     position: PortfolioPosition,
     account_equity: float,
@@ -214,8 +221,7 @@ def _enforce_directional_limits(
         ]
 
         direction_positions.sort(
-            key=lambda position: position.trade.trade_score,
-            reverse=True,
+            key=_trade_priority_key,
         )
 
         running_risk = 0.0
@@ -240,6 +246,7 @@ def _enforce_directional_limits(
                 "would be exceeded; position rejected."
             )
 
+    approved.sort(key=_trade_priority_key)
     return approved, rejected, warnings
 
 
@@ -404,8 +411,7 @@ def assess_portfolio(
     )
 
     final_positions.sort(
-        key=lambda p: p.trade.trade_score,
-        reverse=True,
+        key=_trade_priority_key,
     )
 
     risk_limited: List[PortfolioPosition] = []
@@ -549,12 +555,12 @@ def print_risk_report(
 
     if report.emergency_stop:
         print(
-            "🚨 EMERGENCY STOP — "
+            "[!] EMERGENCY STOP — "
             "NO NEW POSITIONS APPROVED"
         )
 
         for warning in report.warnings:
-            print(f"  ⚠ {warning}")
+            print(f"  ! {warning}")
 
         print("=" * 130)
         return
@@ -601,13 +607,15 @@ def print_risk_report(
     for position in report.approved_positions:
 
         trade = position.trade
+        llm_rank = getattr(trade, "option_llm_rank", None)
+        rank_str = f"rank=#{llm_rank:<2}" if llm_rank else f"score={trade.trade_score:>5.1f}"
 
         print(
             f"{trade.stock_symbol:<7} "
             f"{trade.direction:<9} "
             f"{position.contracts:>3} contracts  "
             f"risk=${position.max_loss:>8,.2f}  "
-            f"score={trade.trade_score:>5.1f}  "
+            f"{rank_str}  "
             f"{trade.option_symbol}"
         )
 
@@ -617,13 +625,15 @@ def print_risk_report(
     for position in report.rejected_positions:
 
         trade = position.trade
+        llm_rank = getattr(trade, "option_llm_rank", None)
+        rank_str = f"rank=#{llm_rank:<2}" if llm_rank else f"score={trade.trade_score:>5.1f}"
 
         print(
             f"{trade.stock_symbol:<7} "
             f"{trade.direction:<9} "
             f"{position.contracts:>3} contracts  "
             f"risk=${position.max_loss:>8,.2f}  "
-            f"score={trade.trade_score:>5.1f}  "
+            f"{rank_str}  "
             f"{trade.option_symbol}"
         )
 
@@ -632,6 +642,6 @@ def print_risk_report(
         print("-" * 130)
 
         for warning in report.warnings:
-            print(f"⚠ {warning}")
+            print(f"! {warning}")
 
     print("=" * 130)

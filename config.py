@@ -4,21 +4,21 @@ from datetime import date
 # SCANNER / RESEARCH / LLM FUNNEL
 # ============================================================
 
-STOCK_SCANNER_TOP_N = 20
-LLM_STOCK_TOP_K = 8
-MAX_OPTIONS_PER_STOCK = 6
-OPTION_LLM_TOP_K = 8
+STOCK_SCANNER_TOP_N = 25
+LLM_STOCK_TOP_K = 10
+MAX_OPTIONS_PER_STOCK = 4
+OPTION_LLM_TOP_K = 12
 
 # ============================================================
 # PORTFOLIO / RISK
 # ============================================================
 
-MAX_TOTAL_RISK_PCT = 0.12
+MAX_TOTAL_RISK_PCT = 0.20
 MAX_SINGLE_TRADE_RISK_PCT = 0.025
 MAX_UNDERLYING_RISK_PCT = 0.03
-MAX_DIRECTION_RISK_PCT = 0.075
+MAX_DIRECTION_RISK_PCT = 0.15
 
-MAX_POSITIONS = 5
+MAX_POSITIONS = 8
 MIN_TRADE_SCORE = 70.0
 
 # Greeks are warnings for now, not hard portfolio vetoes.
@@ -70,7 +70,7 @@ FLATTEN_AFTER_MINUTE_ET = 45
 STATE_FILE = "state/positions.json"
 
 # ============================================================
-# EXECUTION WINDOWS
+# EXECUTION WINDOWS & CADENCE
 # ============================================================
 
 # Spreads are widest at the open and into the close, which is exactly when a
@@ -81,3 +81,7 @@ NO_TRADE_MINUTES_BEFORE_CLOSE = 10
 # A resting entry limit that has not filled is stale information; cancel it
 # rather than let it fill against a quote we would no longer accept.
 ENTRY_ORDER_TIMEOUT_SECONDS = 180
+
+# Loop Cadence
+EXIT_INTERVAL_SECONDS = 300           # 5 minutes (marks and manages open positions)
+ENTRY_INTERVAL_MINUTES = 30           # 30 minutes (was 120 min)

@@ -1,787 +1,42 @@
 =====
-# FILE: strategy/portfolio.py
-=====
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import List
-@dataclass
-class PortfolioPosition:
-    trade: object
-    contracts: int
-    max_loss: float
-    premium_deployed: float
-    risk_weight: float
-from config import (
-    MAX_TOTAL_RISK_PCT,
-    MAX_SINGLE_TRADE_RISK_PCT,
-    MAX_UNDERLYING_RISK_PCT,
-    MAX_POSITIONS,
-    MIN_TRADE_SCORE,
-)
-def _estimated_entry_price(trade) -> float:
-    """
-    Estimate the executable entry price for sizing.
-    Current strategy only supports buying single-leg options,
-    so the conservative reference price is the ask.
-    Midpoint remains a useful informational/reference value,
-    but should not be used to size a live position.
-    """
-    if trade.option_ask > 0:
-        return trade.option_ask
-    return trade.option_mid
-def _per_contract_risk(trade) -> float:
-    """
-    Current system assumes long single-leg options.
-    For a long option:
-        max loss = premium paid × 100
-    Position sizing uses the estimated executable entry price,
-    not the midpoint.
-    """
-    entry_price = _estimated_entry_price(trade)
-    if entry_price <= 0:
-        return 0.0
-    return entry_price * 100.0
-def _trade_weight(trade) -> float:
-    """
-    Convert trade quality into an allocation weight.
-    Higher-scoring trades receive disproportionately more
-    risk budget, rather than everything being allocated equally.
-    """
-    # Start with score above our minimum acceptable threshold.
-    excess_score = max(
-        0.0,
-        trade.trade_score - MIN_TRADE_SCORE,
-    )
-    if excess_score <= 0:
-        return 0.0
-    # Square the advantage so materially better trades receive
-    # noticeably more capital.
-    return excess_score ** 2
-def select_best_trade_per_stock(
-    trades: List[object],
-) -> List[object]:
-    """
-    Only keep the best complete trade for each underlying.
-    This prevents the portfolio from accidentally holding:
-        MSTR 130C
-        MSTR 128C
-        MSTR 129C
-        ...
-    and treating them as independent opportunities.
-    """
-    best_by_symbol = {}
-    for trade in trades:
-        existing = best_by_symbol.get(trade.stock_symbol)
-        if (
-            existing is None
-            or trade.trade_score > existing.trade_score
-        ):
-            best_by_symbol[trade.stock_symbol] = trade
-    return sorted(
-        best_by_symbol.values(),
-        key=lambda t: t.trade_score,
-        reverse=True,
-    )
-def build_portfolio(
-    trades: List[object],
-    account_equity: float,
-    total_risk_pct: float = MAX_TOTAL_RISK_PCT,
-    max_trade_risk_pct: float = MAX_SINGLE_TRADE_RISK_PCT,
-    max_underlying_risk_pct: float = MAX_UNDERLYING_RISK_PCT,
-    max_positions: int = MAX_POSITIONS,
-    min_trade_score: float = MIN_TRADE_SCORE,
-) -> List[PortfolioPosition]:
-    """
-    Convert ranked trades into a proposed portfolio.
-    Current instrument assumption:
-        long calls / long puts.
-    The portfolio is allocated by MAXIMUM LOSS, not buying power.
-    Example:
-        $100,000 account
-        total_risk = 12%
-        => max planned loss = $12,000
-    This is a proposed portfolio. The risk engine gets the
-    final veto before anything can be executed.
-    """
-    if account_equity <= 0:
-        raise ValueError("account_equity must be positive")
-    if total_risk_pct <= 0:
-        raise ValueError("total_risk_pct must be positive")
-    if max_trade_risk_pct <= 0:
-        raise ValueError("max_trade_risk_pct must be positive")
-    if max_underlying_risk_pct <= 0:
-        raise ValueError(
-            "max_underlying_risk_pct must be positive"
-        )
-    max_total_risk = account_equity * total_risk_pct
-    max_trade_risk = account_equity * max_trade_risk_pct
-    # ---------------------------------------------------------
-    # 1. Remove weak trades.
-    # ---------------------------------------------------------
-    eligible = [
-        trade
-        for trade in trades
-        if trade.trade_score >= min_trade_score
-    ]
-    # ---------------------------------------------------------
-    # 2. One trade per underlying.
-    # ---------------------------------------------------------
-    eligible = select_best_trade_per_stock(eligible)
-    # ---------------------------------------------------------
-    # 3. Keep only best N underlyings.
-    # ---------------------------------------------------------
-    eligible = eligible[:max_positions]
-    if not eligible:
-        return []
-    # ---------------------------------------------------------
-    # 4. Calculate relative weights.
-    # ---------------------------------------------------------
-    weighted_trades = []
-    for trade in eligible:
-        weight = _trade_weight(trade)
-        if weight <= 0:
-            continue
-        per_contract_risk = _per_contract_risk(trade)
-        if per_contract_risk <= 0:
-            continue
-        weighted_trades.append(
-            (trade, weight, per_contract_risk)
-        )
-    if not weighted_trades:
-        return []
-    weight_sum = sum(
-        weight
-        for _, weight, _ in weighted_trades
-    )
-    # ---------------------------------------------------------
-    # 5. Convert risk budget into contracts.
-    # ---------------------------------------------------------
-    positions: List[PortfolioPosition] = []
-    for trade, weight, per_contract_risk in weighted_trades:
-        normalized_weight = weight / weight_sum
-        desired_risk = (
-            max_total_risk
-            * normalized_weight
-        )
-        # Hard single-trade cap.
-        allocated_risk = min(
-            desired_risk,
-            max_trade_risk,
-        )
-        contracts = int(
-            allocated_risk // per_contract_risk
-        )
-        if contracts <= 0:
-            continue
-        max_loss = contracts * per_contract_risk
-        positions.append(
-            PortfolioPosition(
-                trade=trade,
-                contracts=contracts,
-                max_loss=max_loss,
-                premium_deployed=max_loss,
-                risk_weight=normalized_weight,
-            )
-        )
-    # ---------------------------------------------------------
-    # 6. Ensure we never exceed total risk because of rounding.
-    # ---------------------------------------------------------
-    positions.sort(
-        key=lambda p: p.trade.trade_score,
-        reverse=True,
-    )
-    final_positions: List[PortfolioPosition] = []
-    running_risk = 0.0
-    for position in positions:
-        remaining_risk = max_total_risk - running_risk
-        if remaining_risk <= 0:
-            break
-        if position.max_loss <= remaining_risk:
-            final_positions.append(position)
-            running_risk += position.max_loss
-            continue
-        per_contract_risk = (
-            position.max_loss / position.contracts
-        )
-        allowed_contracts = int(
-            remaining_risk // per_contract_risk
-        )
-        if allowed_contracts <= 0:
-            continue
-        adjusted_loss = (
-            allowed_contracts
-            * per_contract_risk
-        )
-        final_positions.append(
-            PortfolioPosition(
-                trade=position.trade,
-                contracts=allowed_contracts,
-                max_loss=adjusted_loss,
-                premium_deployed=adjusted_loss,
-                risk_weight=position.risk_weight,
-            )
-        )
-        running_risk += adjusted_loss
-    return final_positions
-def print_portfolio_plan(
-    positions: List[PortfolioPosition],
-    account_equity: float,
-) -> None:
-    print("\n" + "=" * 130)
-    print(" PORTFOLIO PLAN")
-    print("=" * 130)
-    if not positions:
-        print("No trades passed portfolio construction.")
-        print("=" * 130)
-        return
-    print(
-        f"{'Rank':<5}"
-        f"{'Ticker':<8}"
-        f"{'Direction':<10}"
-        f"{'Contracts':>10}"
-        f"{'Premium':>13}"
-        f"{'Max Loss':>13}"
-        f"{'TradeScore':>12}"
-        f"  {'Option':<24}"
-    )
-    print("-" * 130)
-    total_premium = 0.0
-    total_risk = 0.0
-    for rank, position in enumerate(positions, start=1):
-        trade = position.trade
-        print(
-            f"{rank:<5}"
-            f"{trade.stock_symbol:<8}"
-            f"{trade.direction:<10}"
-            f"{position.contracts:>10}"
-            f"${position.premium_deployed:>12,.2f}"
-            f"${position.max_loss:>12,.2f}"
-            f"{trade.trade_score:>12.1f}"
-            f"  {trade.option_symbol:<24}"
-        )
-        total_premium += position.premium_deployed
-        total_risk += position.max_loss
-    print("-" * 130)
-    print(
-        f"Total premium deployed: ${total_premium:,.2f}"
-    )
-    print(
-        f"Total planned max loss: ${total_risk:,.2f} "
-        f"({total_risk / account_equity:.2%})"
-    )
-    print(
-        f"Account equity:          ${account_equity:,.2f}"
-    )
-    print(
-        f"Remaining capital:       "
-        f"${account_equity - total_premium:,.2f}"
-    )
-    print("=" * 130)
-=====
-# FILE: strategy/research_agent.py
-=====
-from __future__ import annotations
-import json
-import os
-import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Any, Mapping, Sequence
-import requests
-from dotenv import load_dotenv
-from strategy.scanner import ScannedStock
-load_dotenv()
-ALPACA_NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
-FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
-DEFAULT_LOOKBACK_DAYS = 5
-DEFAULT_MAX_ARTICLES = 3
-DEFAULT_MAX_ARTICLE_SUMMARY_CHARS = 350
-DEFAULT_MAX_WORKERS = 8
-DEFAULT_TEMPERATURE = 0.0
-DEFAULT_MAX_TOKENS = 160
-DEFAULT_TIMEOUT_SECONDS = 30
-SYSTEM_PROMPT = """
-You are a market-news compression agent for an autonomous short-horizon options system.
-Your job is NOT to rank the stock, score it, recommend a trade, or predict a return.
-Compress the recent news into only the information that could matter over the next few
-trading sessions.
-The quantitative setup has already been computed deterministically. Translate it into
-short qualitative descriptors when useful, but do not repeat the raw numbers.
-Use only the supplied evidence. Do not invent catalysts, risks, dates, or facts.
-If there is no meaningful recent news, say so.
-Return ONLY JSON with exactly these keys:
-{
-  "news": "one concise sentence, maximum 40 words",
-  "catalyst": "one concise near-term catalyst, or null",
-  "risk": "one concise news-related risk/contradiction, or null",
-  "timing": "IMMEDIATE | NEAR_TERM | UNKNOWN | NONE"
-}
-IMMEDIATE means likely relevant within 1-2 trading days.
-NEAR_TERM means relevant within the short evaluation window but not clearly immediate.
-UNKNOWN means potentially relevant but timing is unclear.
-NONE means there is no meaningful recent catalyst.
-""".strip()
-@dataclass(frozen=True)
-class NewsArticle:
-    symbol: str
-    headline: str
-    summary: str
-    source: str
-    published_at: str
-    url: str | None = None
-@dataclass(frozen=True)
-class ResearchReport:
-    symbol: str
-    quantitative_summary: str
-    news: str
-    catalyst: str | None
-    risk: str | None
-    timing: str
-    article_count: int
-    articles: tuple[NewsArticle, ...] = ()
-    def to_text(self) -> str:
-        parts = [self.symbol, f"Quant: {self.quantitative_summary}"]
-        parts.append(f"News: {self.news}")
-        if self.catalyst:
-            parts.append(f"Catalyst: {self.catalyst}")
-        if self.risk:
-            parts.append(f"Risk: {self.risk}")
-        parts.append(f"Timing: {self.timing}")
-        return "\n".join(parts)
-class ResearchAgentError(RuntimeError):
-    """Raised when research retrieval or compression fails."""
-def _get_alpaca_credentials() -> tuple[str, str]:
-    api_key = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
-    secret_key = os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
-    if not api_key or not secret_key:
-        raise ResearchAgentError(
-            "Missing Alpaca API credentials. Set ALPACA_API_KEY and ALPACA_SECRET_KEY "
-            "(or APCA_API_KEY_ID and APCA_API_SECRET_KEY) in .env."
-        )
-    return api_key, secret_key
-def _get_research_model(model: str | None) -> str:
-    selected = model or os.getenv("FEATHERLESS_RESEARCH_MODEL")
-    if not selected:
-        raise ResearchAgentError(
-            "No research model selected. Pass model=... to research_stock(s) "
-            "or set FEATHERLESS_RESEARCH_MODEL in .env."
-        )
-    return selected
-def _clean_text(value: Any, max_chars: int | None = None) -> str:
-    if value is None:
-        return ""
-    text = re.sub(r"\s+", " ", str(value)).strip()
-    if max_chars is not None and len(text) > max_chars:
-        text = text[: max_chars - 1].rstrip() + "…"
-    return text
-def _qualitative_quant_summary(stock: ScannedStock) -> str:
-    """Turn scanner values into compact semantic labels without an LLM call."""
-    labels: list[str] = []
-    # Momentum
-    if stock.return_20d >= 0.20 or stock.momentum_score >= 90:
-        labels.append("exceptionally strong momentum")
-    elif stock.return_20d >= 0.08 or stock.momentum_score >= 70:
-        labels.append("strong momentum")
-    elif stock.return_20d <= -0.20 or stock.momentum_score <= 10:
-        labels.append("exceptionally weak momentum")
-    elif stock.return_20d <= -0.08 or stock.momentum_score <= 30:
-        labels.append("weak momentum")
-    # Volume
-    if stock.volume_ratio >= 2.0 or stock.volume_score >= 90:
-        labels.append("unusually high volume")
-    elif stock.volume_ratio >= 1.25 or stock.volume_score >= 70:
-        labels.append("elevated volume")
-    # Volatility
-    if stock.realized_volatility >= 0.70 or stock.volatility_score >= 90:
-        labels.append("very high volatility")
-    elif stock.realized_volatility >= 0.45 or stock.volatility_score >= 70:
-        labels.append("elevated volatility")
-    # Relative strength
-    if stock.relative_strength_spy >= 0.15 or stock.relative_strength_score >= 90:
-        labels.append("exceptional relative strength")
-    elif stock.relative_strength_spy >= 0.05 or stock.relative_strength_score >= 70:
-        labels.append("strong relative strength")
-    elif stock.relative_strength_spy <= -0.15 or stock.relative_strength_score <= 10:
-        labels.append("exceptionally weak relative strength")
-    elif stock.relative_strength_spy <= -0.05 or stock.relative_strength_score <= 30:
-        labels.append("weak relative strength")
-    # Trend / extension
-    max_distance = max(abs(stock.distance_sma20), abs(stock.distance_sma50))
-    if max_distance >= 0.15:
-        labels.append("materially extended from trend")
-    elif max_distance >= 0.08:
-        labels.append("noticeably extended from trend")
-    if not labels:
-        return "mixed or moderate quantitative setup"
-    return ", ".join(labels)
-def _parse_article(raw: Mapping[str, Any], symbol: str) -> NewsArticle:
-    return NewsArticle(
-        symbol=symbol,
-        headline=_clean_text(raw.get("headline") or raw.get("title")),
-        summary=_clean_text(
-            raw.get("summary") or raw.get("content"),
-            DEFAULT_MAX_ARTICLE_SUMMARY_CHARS,
-        ),
-        source=_clean_text(raw.get("source") or raw.get("author") or "Unknown source", 80),
-        published_at=_clean_text(raw.get("created_at") or raw.get("updated_at") or "Unknown time", 40),
-        url=raw.get("url"),
-    )
-def _article_dedupe_key(article: NewsArticle) -> str:
-    title = re.sub(r"[^a-z0-9 ]+", "", article.headline.lower())
-    title = re.sub(r"\s+", " ", title).strip()
-    return title
-def _dedupe_articles(articles: Sequence[NewsArticle]) -> list[NewsArticle]:
-    seen: set[str] = set()
-    result: list[NewsArticle] = []
-    for article in articles:
-        key = _article_dedupe_key(article)
-        if not key:
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(article)
-    return result
-def fetch_stock_news(
-    symbol: str,
-    *,
-    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
-    max_articles: int = DEFAULT_MAX_ARTICLES,
-    timeout: int = DEFAULT_TIMEOUT_SECONDS,
-) -> list[NewsArticle]:
-    """Fetch recent Alpaca news for one stock, newest first."""
-    if lookback_days <= 0:
-        raise ValueError("lookback_days must be positive")
-    if max_articles <= 0:
-        return []
-    api_key, secret_key = _get_alpaca_credentials()
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=lookback_days)
-    params = {
-        "symbols": symbol.upper(),
-        "start": start.isoformat().replace("+00:00", "Z"),
-        "end": end.isoformat().replace("+00:00", "Z"),
-        "sort": "desc",
-        # Small on purpose: research is a compression step.
-        "limit": max_articles,
-        "include_content": "false",
-        "exclude_contentless": "true",
-    }
-    response = requests.get(
-        ALPACA_NEWS_URL,
-        headers={
-            "APCA-API-KEY-ID": api_key,
-            "APCA-API-SECRET-KEY": secret_key,
-        },
-        params=params,
-        timeout=timeout,
-    )
-    try:
-        response.raise_for_status()
-        payload = response.json()
-    except requests.RequestException as exc:
-        raise ResearchAgentError(
-            f"Alpaca news request failed for {symbol}: {exc}"
-        ) from exc
-    except ValueError as exc:
-        raise ResearchAgentError(
-            f"Alpaca returned invalid news JSON for {symbol}."
-        ) from exc
-    raw_articles = payload.get("news", [])
-    if not isinstance(raw_articles, list):
-        raise ResearchAgentError(
-            f"Unexpected Alpaca news response for {symbol}."
-        )
-    parsed = [_parse_article(item, symbol.upper()) for item in raw_articles]
-    return _dedupe_articles(parsed)[:max_articles]
-def _format_news_for_llm(articles: Sequence[NewsArticle]) -> str:
-    if not articles:
-        return "NO MATERIAL RECENT NEWS FOUND."
-    lines: list[str] = []
-    for index, article in enumerate(articles, start=1):
-        headline = article.headline or "(no headline)"
-        summary = article.summary or "(no provider summary available)"
-        lines.extend(
-            [
-                f"ARTICLE {index}: {article.source} | {article.published_at}",
-                f"Headline: {headline}",
-                f"Summary: {summary}",
-            ]
-        )
-    return "\n".join(lines)
-def build_research_prompt(
-    stock: ScannedStock,
-    articles: Sequence[NewsArticle],
-) -> str:
-    """Build a compact stock-specific prompt for the cheap research model."""
-    return "\n".join(
-        [
-            "STOCK:",
-            stock.symbol.upper(),
-            "",
-            "QUANTITATIVE SETUP (already computed; do not repeat raw numbers):",
-            _qualitative_quant_summary(stock),
-            "",
-            "RECENT ALPACA NEWS:",
-            _format_news_for_llm(articles),
-            "",
-            "TASK:",
-            "Compress only the news/context that could matter over the next few trading sessions.",
-            "Do not score, rank, recommend a trade, or invent information.",
-        ]
-    )
-def _extract_json_object(content: str) -> dict[str, Any]:
-    text = content.strip()
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-    match = re.search(r"\{[\s\S]*\}", text)
-    if match:
-        try:
-            parsed = json.loads(match.group(0))
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-    raise ResearchAgentError(
-        f"Featherless returned invalid research JSON: {content!r}"
-    )
-def _normalize_field(value: Any, max_words: int | None = None) -> str | None:
-    if value is None:
-        return None
-    text = _clean_text(value)
-    if not text or text.lower() in {"null", "none", "n/a"}:
-        return None
-    if max_words is not None:
-        words = text.split()
-        text = " ".join(words[:max_words])
-    return text or None
-def compress_news(
-    stock: ScannedStock,
-    articles: Sequence[NewsArticle],
-    *,
-    model: str | None = None,
-    temperature: float = DEFAULT_TEMPERATURE,
-    max_tokens: int = DEFAULT_MAX_TOKENS,
-    timeout: int = DEFAULT_TIMEOUT_SECONDS,
-) -> ResearchReport:
-    """Compress one stock's recent news into a small structured report."""
-    selected_model = _get_research_model(model)
-    # If there is no news, avoid spending an LLM call just to say so.
-    if not articles:
-        return ResearchReport(
-            symbol=stock.symbol.upper(),
-            quantitative_summary=_qualitative_quant_summary(stock),
-            news="No material recent news found.",
-            catalyst=None,
-            risk=None,
-            timing="NONE",
-            article_count=0,
-            articles=tuple(articles),
-        )
-    prompt = build_research_prompt(stock, articles)
-    api_key = os.getenv("FEATHERLESS_API_KEY")
-    if not api_key:
-        raise ResearchAgentError(
-            "Missing FEATHERLESS_API_KEY. Add it to .env or the environment."
-        )
-    try:
-        response = requests.post(
-            f"{FEATHERLESS_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "alpaca-agent",
-                "X-Title": "Alpaca Options Trading Agent - Research",
-            },
-            json={
-                "model": selected_model,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "chat_template_kwargs": {"thinking": False},
-            },
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        payload = response.json()
-    except requests.RequestException as exc:
-        raise ResearchAgentError(
-            f"Featherless research request failed for {stock.symbol}: {exc}"
-        ) from exc
-    except ValueError as exc:
-        raise ResearchAgentError(
-            f"Featherless returned non-JSON response for {stock.symbol}."
-        ) from exc
-    try:
-        content = payload["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise ResearchAgentError(
-            f"Unexpected Featherless response format for {stock.symbol}: {payload!r}"
-        ) from exc
-    if not content:
-        raise ResearchAgentError(
-            f"Featherless returned an empty research response for {stock.symbol}."
-        )
-    result = _extract_json_object(content)
-    timing = _normalize_field(result.get("timing")) or "UNKNOWN"
-    timing = timing.upper()
-    if timing not in {"IMMEDIATE", "NEAR_TERM", "UNKNOWN", "NONE"}:
-        timing = "UNKNOWN"
-    return ResearchReport(
-        symbol=stock.symbol.upper(),
-        quantitative_summary=_qualitative_quant_summary(stock),
-        news=_normalize_field(result.get("news"), max_words=40)
-        or "No material recent news summary was produced.",
-        catalyst=_normalize_field(result.get("catalyst"), max_words=22),
-        risk=_normalize_field(result.get("risk"), max_words=22),
-        timing=timing,
-        article_count=len(articles),
-        articles=tuple(articles),
-    )
-def research_stock(
-    stock: ScannedStock,
-    *,
-    model: str | None = None,
-    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
-    max_articles: int = DEFAULT_MAX_ARTICLES,
-    temperature: float = DEFAULT_TEMPERATURE,
-    max_tokens: int = DEFAULT_MAX_TOKENS,
-) -> ResearchReport:
-    """Fetch Alpaca news and produce a compact research report for one stock."""
-    articles = fetch_stock_news(
-        stock.symbol,
-        lookback_days=lookback_days,
-        max_articles=max_articles,
-    )
-    return compress_news(
-        stock,
-        articles,
-        model=model,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-def research_stocks(
-    stocks: Sequence[ScannedStock],
-    *,
-    model: str | None = None,
-    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
-    max_articles: int = DEFAULT_MAX_ARTICLES,
-    max_workers: int = DEFAULT_MAX_WORKERS,
-    temperature: float = DEFAULT_TEMPERATURE,
-    max_tokens: int = DEFAULT_MAX_TOKENS,
-) -> dict[str, ResearchReport]:
-    """
-    Research multiple scanner candidates concurrently.
-    Failures for individual symbols are converted to compact fallback reports so one
-    bad news/model response does not kill the whole scanner -> research -> ranker path.
-    """
-    if not stocks:
-        return {}
-    if max_workers <= 0:
-        raise ValueError("max_workers must be positive")
-    reports: dict[str, ResearchReport] = {}
-    def _run(stock: ScannedStock) -> ResearchReport:
-        try:
-            return research_stock(
-                stock,
-                model=model,
-                lookback_days=lookback_days,
-                max_articles=max_articles,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-        except ResearchAgentError as exc:
-            return ResearchReport(
-                symbol=stock.symbol.upper(),
-                quantitative_summary=_qualitative_quant_summary(stock),
-                news=f"Research unavailable: {str(exc)[:120]}",
-                catalyst=None,
-                risk="Recent news could not be evaluated.",
-                timing="UNKNOWN",
-                article_count=0,
-                articles=(),
-            )
-    with ThreadPoolExecutor(max_workers=min(max_workers, len(stocks))) as executor:
-        futures = {executor.submit(_run, stock): stock.symbol.upper() for stock in stocks}
-        for future in as_completed(futures):
-            symbol = futures[future]
-            report = future.result()
-            reports[symbol] = report
-    # Preserve scanner order for deterministic downstream prompt construction.
-    return {stock.symbol.upper(): reports[stock.symbol.upper()] for stock in stocks}
-def print_research_reports(
-    reports: Sequence[ResearchReport] | Mapping[str, ResearchReport],
-) -> None:
-    report_items = reports.values() if isinstance(reports, Mapping) else reports
-    print("\n" + "=" * 120)
-    print(" RESEARCH REPORTS")
-    print("=" * 120)
-    for report in report_items:
-        print(f"\n[{report.symbol}]")
-        print(f"Articles:  {report.article_count}")
-        print(f"Quant:     {report.quantitative_summary}")
-        print(f"News:      {report.news}")
-        print(f"Catalyst:  {report.catalyst or 'None'}")
-        print(f"Risk:      {report.risk or 'None'}")
-        print(f"Timing:    {report.timing}")
-        if report.articles:
-            print("Source articles:")
-            for article in report.articles:
-                print(
-                    f"  - {article.source} | "
-                    f"{article.published_at} | "
-                    f"{article.headline}"
-                )
-def research_text_by_symbol(
-    reports: Mapping[str, ResearchReport],
-) -> dict[str, str]:
-    """Convert reports into the mapping expected by strategy.llm_ranker.rank_stocks()."""
-    return {
-        symbol.upper(): report.to_text()
-        for symbol, report in reports.items()
-    }
-if __name__ == "__main__":
-    raise SystemExit(
-        "research_agent.py is a library module; call research_stock(s) from the orchestration layer."
-    )
-=====
 # FILE: strategy/scanner.py
 =====
+
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
+
 from strategy.universe import BENCHMARK_SYMBOL, UNIVERSE
+
 # ---------------------------------------------------------------------------
 # Market clock
 # ---------------------------------------------------------------------------
 # ZoneInfo needs the IANA database, which a bare Windows install does not ship.
 # Falling back to a fixed offset keeps the module importable; the exchange date
 # is what matters here and an hour of DST drift cannot change it.
+
 try:  # pragma: no cover - environment dependent
     from zoneinfo import ZoneInfo
+
     MARKET_TZ = ZoneInfo("America/New_York")
 except Exception:  # pragma: no cover - environment dependent
     from datetime import timezone
+
     MARKET_TZ = timezone(timedelta(hours=-4), name="America/New_York")
+
 # ---------------------------------------------------------------------------
 # Scoring configuration
 # ---------------------------------------------------------------------------
+
 # Composite weights. These sum to 1.0 and each component is on a 0-100 scale.
 WEIGHT_MOMENTUM = 0.30
 WEIGHT_VOLUME = 0.25
 WEIGHT_VOLATILITY = 0.20
 WEIGHT_RELATIVE_STRENGTH = 0.15
 WEIGHT_TREND = 0.10
+
 # Realized-volatility regime preference, annualized.
 #
 # The previous implementation scored volatility as an unsigned percentile, so the
@@ -796,16 +51,25 @@ WEIGHT_TREND = 0.10
 # risk dominates. Whether the premium is fairly priced is a different question,
 # and it is answered in one place only - the option selector's IV-vs-realized-vol
 # gate - so the two stages no longer fight over the same signal.
-VOL_BAND_LOW = 0.25       # below this, the name is too quiet to pay for premium
-VOL_BAND_HIGH = 0.55      # above this, premium gets expensive fast
+# Calibrated against a live 249-name scan: with a [0.25, 0.55] band, 14 of the
+# top 20 scored exactly 100 and this factor contributed no discrimination at all,
+# because anything surviving a momentum screen already realizes 25-55% vol. The
+# tighter band separates the field again and prices blow-off names (MSTR at 82%,
+# CRM at 79%) well below merely-active ones.
+VOL_BAND_LOW = 0.30       # below this, the name is too quiet to pay for premium
+VOL_BAND_HIGH = 0.45      # above this, premium gets expensive fast
 VOL_FLOOR = 0.10          # scores 0
-VOL_CEILING = 1.20        # scores 0
+VOL_CEILING = 0.90        # scores 0
+
 MIN_BARS_REQUIRED = 21
+
+
 @dataclass
 class ScannedStock:
     """Represents a scanned stock with raw technical metrics, component sub-scores,
     and its composite score.
     """
+
     symbol: str
     price: float
     return_1d: float
@@ -827,11 +91,16 @@ class ScannedStock:
     trend_score: float
     score: float
     rank: Optional[int] = None
+
+
 # ---------------------------------------------------------------------------
 # Bar preparation
 # ---------------------------------------------------------------------------
+
+
 def _exchange_today(as_of: Optional[datetime] = None) -> date:
     """Today's date on the exchange clock.
+
     Never use the local system date. On a machine east of New York, the local
     date rolls over hours before the exchange date does, which would classify the
     most recent completed session as "today" and silently drop it.
@@ -841,17 +110,22 @@ def _exchange_today(as_of: Optional[datetime] = None) -> date:
     if as_of.tzinfo is None:
         return as_of.date()
     return as_of.astimezone(MARKET_TZ).date()
+
+
 def _completed_daily_bars(
     df: pd.DataFrame,
     as_of: Optional[datetime] = None,
 ) -> pd.DataFrame:
     """Return only completed daily bars, strictly before the exchange date.
+
     `as_of` lets the scanner be replayed at a historical decision timestamp
     instead of the wall clock, which is what makes a deterministic backtest
     possible. Default behaviour is unchanged.
     """
     cutoff = _exchange_today(as_of)
+
     sorted_df = df.sort_index()
+
     index = sorted_df.index
     # A tz-naive DatetimeIndex still HAS a `.tz` attribute (it is None), so
     # testing with hasattr calls tz_convert on naive data and raises. Test the
@@ -865,27 +139,38 @@ def _completed_daily_bars(
             index_dates = pd.to_datetime(index).date
         except (TypeError, ValueError):
             return sorted_df
+
     return sorted_df.loc[index_dates < cutoff]
+
+
 def _clean_close_volume(sorted_df: pd.DataFrame) -> Optional[tuple[np.ndarray, np.ndarray]]:
     """Extract close/volume arrays, or None if the data cannot support metrics.
+
     Missing or non-positive prices are treated as a data gap and reject the
     symbol. They are deliberately NOT forward-filled or zero-filled: a fabricated
     price produces a real-looking score, which is worse than no score at all.
     """
     if "close" not in sorted_df.columns or "volume" not in sorted_df.columns:
         return None
+
     closes = pd.to_numeric(sorted_df["close"], errors="coerce").to_numpy(dtype=float)
     volumes = pd.to_numeric(sorted_df["volume"], errors="coerce").to_numpy(dtype=float)
+
     if closes.size < MIN_BARS_REQUIRED:
         return None
     if not np.all(np.isfinite(closes)) or np.any(closes <= 0):
         return None
     if not np.all(np.isfinite(volumes)) or np.any(volumes < 0):
         return None
+
     return closes, volumes
+
+
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
+
+
 def extract_stock_metrics(
     symbol: str,
     stock_df: pd.DataFrame,
@@ -893,48 +178,61 @@ def extract_stock_metrics(
     as_of: Optional[datetime] = None,
 ) -> Optional[Dict]:
     """Calculate raw technical metrics for a single stock from its daily bars.
+
     Returns None when the bars cannot support a trustworthy metric set, so the
     symbol is dropped rather than scored on defaults.
     """
     sorted_df = _completed_daily_bars(stock_df, as_of=as_of)
     if len(sorted_df) < MIN_BARS_REQUIRED:
         return None
+
     cleaned = _clean_close_volume(sorted_df)
     if cleaned is None:
         return None
+
     closes, volumes = cleaned
     current_price = float(closes[-1])
+
     # 1. Returns: 1-day, 5-day, 20-day
     ret_1d = float((closes[-1] - closes[-2]) / closes[-2])
     ret_5d = float((closes[-1] - closes[-6]) / closes[-6])
     ret_20d = float((closes[-1] - closes[-21]) / closes[-21])
+
     # 2. Volume / Average Volume (20-day historical average excluding current bar)
     current_volume = float(volumes[-1])
     avg_volume_20d = float(np.mean(volumes[-21:-1]))
+
     if avg_volume_20d <= 0:
         # No traded history to compare against; the ratio would be meaningless.
         return None
+
     volume_ratio = current_volume / avg_volume_20d
+
     # 3. Distance from Moving Averages (20d & 50d)
     sma_20 = float(np.mean(closes[-20:]))
     dist_sma20 = (current_price - sma_20) / sma_20 if sma_20 > 0 else 0.0
+
     if len(closes) >= 50:
         sma_50 = float(np.mean(closes[-50:]))
         dist_sma50 = (current_price - sma_50) / sma_50 if sma_50 > 0 else dist_sma20
     else:
         sma_50 = sma_20
         dist_sma50 = dist_sma20
+
     # 4. Realized Volatility (Annualized 20-day log return standard deviation)
     log_returns = np.diff(np.log(closes[-21:]))
     realized_vol = float(np.std(log_returns, ddof=1) * np.sqrt(252)) if log_returns.size > 1 else 0.0
+
     # 5. Relative Strength vs SPY (20-day excess return over benchmark)
     rs_spy = float(ret_20d - spy_return_20d)
+
     # Raw factor indicators for ranking
     raw_momentum = 0.20 * ret_1d + 0.30 * ret_5d + 0.50 * ret_20d
     raw_volume = volume_ratio
     raw_volatility = realized_vol
     raw_relative_strength = rs_spy
     raw_trend = 0.50 * dist_sma20 + 0.50 * dist_sma50
+
     return {
         "symbol": symbol,
         "price": current_price,
@@ -956,11 +254,16 @@ def extract_stock_metrics(
         "raw_relative_strength": raw_relative_strength,
         "raw_trend": raw_trend,
     }
+
+
 # ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
+
+
 def _average_rank(values: np.ndarray) -> np.ndarray:
     """Average-method ranks, identical to scipy.stats.rankdata(values).
+
     Implemented locally so the scanner does not pull scipy in for one function.
     Ties receive the mean of the ranks they span.
     """
@@ -968,6 +271,7 @@ def _average_rank(values: np.ndarray) -> np.ndarray:
     order = np.argsort(values, kind="mergesort")
     ordered = values[order]
     ranks = np.empty(n, dtype=float)
+
     start = 0
     while start < n:
         stop = start
@@ -975,15 +279,21 @@ def _average_rank(values: np.ndarray) -> np.ndarray:
             stop += 1
         ranks[order[start : stop + 1]] = (start + stop) / 2.0 + 1.0
         start = stop + 1
+
     return ranks
+
+
 def _percentile_scores(values: np.ndarray) -> np.ndarray:
     """Map raw indicator values onto a 0-100 percentile scale."""
     n = values.size
     if n <= 1:
         return np.full(n, 100.0)
     return (_average_rank(values) - 1.0) / (n - 1.0) * 100.0
+
+
 def volatility_regime_score(realized_vol: float) -> float:
     """Score a realized-volatility regime for tradeability, on 0-100.
+
     Piecewise linear: full marks inside the band, tapering to zero at the floor
     and the ceiling. This is an ABSOLUTE score, not a percentile, so it does not
     depend on which other symbols happened to be scanned in the same batch -
@@ -998,8 +308,11 @@ def volatility_regime_score(realized_vol: float) -> float:
     if realized_vol < VOL_BAND_LOW:
         return (realized_vol - VOL_FLOOR) / (VOL_BAND_LOW - VOL_FLOOR) * 100.0
     return (VOL_CEILING - realized_vol) / (VOL_CEILING - VOL_BAND_HIGH) * 100.0
+
+
 def score_and_rank_stocks(metrics_list: List[Dict]) -> List[ScannedStock]:
     """Normalize raw indicators into 0-100 scores and compute the weighted composite:
+
         score = (
             0.30 * momentum_score
             + 0.25 * volume_score
@@ -1007,6 +320,7 @@ def score_and_rank_stocks(metrics_list: List[Dict]) -> List[ScannedStock]:
             + 0.15 * relative_strength_score
             + 0.10 * trend_score
         )
+
     Momentum, volume, relative strength and trend are cross-sectional percentiles
     - they are comparative measures by nature. Volatility is scored absolutely
     against a regime band (see volatility_regime_score).
@@ -1014,14 +328,17 @@ def score_and_rank_stocks(metrics_list: List[Dict]) -> List[ScannedStock]:
     n = len(metrics_list)
     if n == 0:
         return []
+
     raw_momentum = np.array([m["raw_momentum"] for m in metrics_list], dtype=float)
     raw_volume = np.array([m["raw_volume"] for m in metrics_list], dtype=float)
     raw_relative_strength = np.array([m["raw_relative_strength"] for m in metrics_list], dtype=float)
     raw_trend = np.array([m["raw_trend"] for m in metrics_list], dtype=float)
+
     momentum_scores = _percentile_scores(raw_momentum)
     volume_scores = _percentile_scores(raw_volume)
     rs_scores = _percentile_scores(raw_relative_strength)
     trend_scores = _percentile_scores(raw_trend)
+
     scanned_stocks: List[ScannedStock] = []
     for i, m in enumerate(metrics_list):
         mom_score = float(momentum_scores[i])
@@ -1029,6 +346,7 @@ def score_and_rank_stocks(metrics_list: List[Dict]) -> List[ScannedStock]:
         vola_score = float(volatility_regime_score(m["raw_volatility"]))
         rs_score = float(rs_scores[i])
         tr_score = float(trend_scores[i])
+
         composite_score = (
             WEIGHT_MOMENTUM * mom_score
             + WEIGHT_VOLUME * vol_score
@@ -1036,6 +354,7 @@ def score_and_rank_stocks(metrics_list: List[Dict]) -> List[ScannedStock]:
             + WEIGHT_RELATIVE_STRENGTH * rs_score
             + WEIGHT_TREND * tr_score
         )
+
         scanned_stocks.append(
             ScannedStock(
                 symbol=m["symbol"],
@@ -1060,17 +379,24 @@ def score_and_rank_stocks(metrics_list: List[Dict]) -> List[ScannedStock]:
                 score=composite_score,
             )
         )
+
     # Sort descending by score, breaking ties on symbol so an identical universe
     # always produces an identical ordering regardless of input order.
     scanned_stocks.sort(key=lambda s: (-s.score, s.symbol))
     for rank_idx, stock in enumerate(scanned_stocks, start=1):
         stock.rank = rank_idx
+
     return scanned_stocks
+
+
 # ---------------------------------------------------------------------------
 # Universe scan
 # ---------------------------------------------------------------------------
+
+
 def _available_symbols(bars_df: pd.DataFrame) -> set:
     """Symbols that actually have rows in the frame.
+
     `index.levels[0]` returns every category the index was BUILT with, including
     symbols with no surviving rows, so membership tests against it report symbols
     that are not really present. Use the realized values instead.
@@ -1079,12 +405,15 @@ def _available_symbols(bars_df: pd.DataFrame) -> set:
     if isinstance(index, pd.MultiIndex):
         return set(index.get_level_values(0).unique())
     return set()
+
+
 def _benchmark_return_20d(
     bars_df: pd.DataFrame,
     benchmark_symbol: str,
     as_of: Optional[datetime] = None,
 ) -> float:
     """20-day benchmark return, or 0.0 when the benchmark is unavailable.
+
     A missing benchmark makes relative strength collapse to plain return_20d,
     which is a defensible fallback because the factor is only ever used as a
     cross-sectional percentile: with no benchmark every symbol is offset by the
@@ -1092,17 +421,22 @@ def _benchmark_return_20d(
     """
     if benchmark_symbol not in _available_symbols(bars_df):
         return 0.0
+
     spy_df = _completed_daily_bars(bars_df.xs(benchmark_symbol, level=0), as_of=as_of)
     if "close" not in spy_df.columns:
         return 0.0
+
     spy_closes = pd.to_numeric(spy_df["close"], errors="coerce").to_numpy(dtype=float)
     spy_closes = spy_closes[np.isfinite(spy_closes)]
     spy_closes = spy_closes[spy_closes > 0]
+
     if spy_closes.size >= MIN_BARS_REQUIRED:
         return float((spy_closes[-1] - spy_closes[-21]) / spy_closes[-21])
     if spy_closes.size > 1:
         return float((spy_closes[-1] - spy_closes[0]) / spy_closes[0])
     return 0.0
+
+
 def scan_stock_bars(
     bars_df: pd.DataFrame,
     universe: Optional[List[str]] = None,
@@ -1111,16 +445,21 @@ def scan_stock_bars(
     as_of: Optional[datetime] = None,
 ) -> List[ScannedStock]:
     """Pure strategy scanner logic that processes a DataFrame of daily bars
+
     and returns the top N ranked candidates. Makes no API calls.
     """
     target_universe = list(universe) if universe else list(UNIVERSE)
+
     if bars_df is None or len(bars_df) == 0:
         return []
+
     # 1. Benchmark return for the relative-strength factor
     spy_return_20d = _benchmark_return_20d(bars_df, benchmark_symbol, as_of=as_of)
+
     # 2. Extract metrics for all available stocks in universe
     metrics_list = []
     available_symbols = _available_symbols(bars_df)
+
     for symbol in target_universe:
         if symbol not in available_symbols:
             continue
@@ -1128,20 +467,25 @@ def scan_stock_bars(
         metrics = extract_stock_metrics(symbol, sdf, spy_return_20d, as_of=as_of)
         if metrics is not None:
             metrics_list.append(metrics)
+
     # 3. Score and rank
     ranked_stocks = score_and_rank_stocks(metrics_list)
     return ranked_stocks[:top_n]
+
+
 def print_scan_results(stocks: List[ScannedStock], title: str = "Top Stock Scanner Picks") -> None:
     """Display scan results in a clear terminal table."""
     print(f"\n{'=' * 118}")
     print(f" {title.upper()} (Top {len(stocks)})")
     print(f"{'=' * 118}")
+
     header = (
         f"{'Rank':<5} {'Symbol':<7} {'Price':>8} {'1D Ret':>8} {'5D Ret':>8} {'20D Ret':>9} "
         f"{'Vol/Avg':>8} {'SMA20%':>8} {'RealVol':>8} {'RS vs SPY':>10} {'Score':>7}"
     )
     print(header)
     print(f"{'-' * 118}")
+
     for stock in stocks:
         rank_str = f"#{stock.rank}" if stock.rank is not None else "-"
         print(
@@ -1157,70 +501,548 @@ def print_scan_results(stocks: List[ScannedStock], title: str = "Top Stock Scann
             f"{stock.relative_strength_spy:>+9.2%} "
             f"{stock.score:>7.1f}"
         )
+
     print(f"{'=' * 118}\n")
+
+
+=====
+# FILE: strategy/state.py
+=====
+
+"""Local position state.
+
+Alpaca is the source of truth for WHAT is held and at what average price. It does
+not know when we opened a position or how far it ran before fading. Only those
+two things are stored here.
+
+Every read path degrades to empty rather than raising. A corrupt state file must
+never stop the agent from exiting real positions - losing the trailing high-water
+mark is a small problem, being unable to close is a large one.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from typing import Any, Iterable, Mapping
+
+from config import STATE_FILE
+from strategy.exits import market_now
+
+
+@dataclass
+class PositionState:
+    option_symbol: str
+    stock_symbol: str
+    direction: str
+    opened_at: str                 # ISO 8601, exchange clock
+    entry_price: float
+    contracts: int
+    peak_pnl_pct: float = 0.0
+    trade_score: float = 0.0
+    thesis: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "PositionState | None":
+        try:
+            return cls(
+                option_symbol=str(raw["option_symbol"]),
+                stock_symbol=str(raw.get("stock_symbol", "")),
+                direction=str(raw.get("direction", "")),
+                opened_at=str(raw.get("opened_at", "")),
+                entry_price=float(raw.get("entry_price", 0.0) or 0.0),
+                contracts=int(raw.get("contracts", 0) or 0),
+                peak_pnl_pct=float(raw.get("peak_pnl_pct", 0.0) or 0.0),
+                trade_score=float(raw.get("trade_score", 0.0) or 0.0),
+                thesis=str(raw.get("thesis", "")),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+
+def _state_path() -> str:
+    return STATE_FILE
+
+
+def load_state(path: str | None = None) -> dict[str, PositionState]:
+    """Load position state. Returns {} on any failure - never raises."""
+    target = path or _state_path()
+    try:
+        with open(target, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (FileNotFoundError, PermissionError, OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+
+    if not isinstance(raw, dict):
+        return {}
+
+    state: dict[str, PositionState] = {}
+    for symbol, payload in raw.items():
+        if not isinstance(payload, dict):
+            continue
+        entry = PositionState.from_dict(payload)
+        if entry is not None:
+            state[str(symbol)] = entry
+    return state
+
+
+def save_state(state: Mapping[str, PositionState], path: str | None = None) -> bool:
+    """Atomically persist state. Returns False on failure instead of raising.
+
+    Writes to a temp file in the same directory then os.replace()s it, so a crash
+    mid-write leaves the previous good file intact. A half-written state file is
+    worse than no state file.
+    """
+    target = path or _state_path()
+    directory = os.path.dirname(os.path.abspath(target))
+
+    try:
+        os.makedirs(directory, exist_ok=True)
+        payload = {symbol: entry.to_dict() for symbol, entry in state.items()}
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=directory,
+            prefix=".positions-", suffix=".tmp", delete=False,
+        )
+        try:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        finally:
+            handle.close()
+        os.replace(handle.name, target)
+        return True
+    except (OSError, TypeError, ValueError):
+        try:
+            os.unlink(handle.name)  # type: ignore[possibly-undefined]
+        except Exception:
+            pass
+        return False
+
+
+def record_entry(
+    state: dict[str, PositionState],
+    *,
+    option_symbol: str,
+    stock_symbol: str,
+    direction: str,
+    entry_price: float,
+    contracts: int,
+    trade_score: float = 0.0,
+    thesis: str = "",
+    now: datetime | None = None,
+) -> PositionState:
+    """Register a newly opened position."""
+    entry = PositionState(
+        option_symbol=option_symbol,
+        stock_symbol=stock_symbol,
+        direction=str(direction).upper(),
+        opened_at=market_now(now).isoformat(),
+        entry_price=float(entry_price),
+        contracts=int(contracts),
+        peak_pnl_pct=0.0,
+        trade_score=float(trade_score),
+        thesis=thesis,
+    )
+    state[option_symbol] = entry
+    return entry
+
+
+def update_peak(state: dict[str, PositionState], option_symbol: str, pnl_pct: float) -> float:
+    """Raise the high-water mark. Never lowers it."""
+    entry = state.get(option_symbol)
+    if entry is None:
+        return 0.0
+    entry.peak_pnl_pct = max(entry.peak_pnl_pct, float(pnl_pct))
+    return entry.peak_pnl_pct
+
+
+def forget(state: dict[str, PositionState], option_symbol: str) -> None:
+    state.pop(option_symbol, None)
+
+
+def reconcile(state: dict[str, PositionState], open_symbols: Iterable[str]) -> list[str]:
+    """Drop state for anything the broker no longer shows.
+
+    Positions disappear via expiry, assignment, or a manual close in the
+    dashboard. Without pruning, the time stop starts firing at positions that do
+    not exist. Returns the symbols removed.
+    """
+    live = {str(symbol) for symbol in open_symbols}
+    stale = [symbol for symbol in state if symbol not in live]
+    for symbol in stale:
+        state.pop(symbol, None)
+    return stale
+
+
+def adopt_untracked(
+    state: dict[str, PositionState],
+    *,
+    option_symbol: str,
+    stock_symbol: str,
+    entry_price: float,
+    contracts: int,
+    now: datetime | None = None,
+) -> PositionState:
+    """Create state for a broker position we have no record of.
+
+    Happens after a crash, a manual trade, or a fill that landed after the run
+    that placed it exited. Adopting with opened_at = now means the time stop
+    restarts rather than firing immediately on an unknown position.
+    """
+    return record_entry(
+        state,
+        option_symbol=option_symbol,
+        stock_symbol=stock_symbol,
+        direction="BULLISH",
+        entry_price=entry_price,
+        contracts=contracts,
+        thesis="adopted: no local state at reconcile time",
+        now=now,
+    )
+
+
+__all__ = [
+    "PositionState",
+    "adopt_untracked",
+    "forget",
+    "load_state",
+    "reconcile",
+    "record_entry",
+    "save_state",
+    "update_peak",
+]
+
+
 =====
 # FILE: strategy/universe.py
 =====
+
 BENCHMARK_SYMBOL = "SPY"
-# 50 liquid US equities with active options markets
+
+# 200 liquid U.S. equities selected for a short-horizon,
+# options-oriented opportunity scanner.
+#
+# Design goals:
+# - broad sector coverage
+# - large/mid-cap liquidity
+# - active options markets
+# - exposure to high-beta / high-volatility names
+# - exposure to earnings / macro / thematic catalysts
+# - avoid excessive dependence on mega-cap technology
+#
+# The scanner remains responsible for deciding which names are
+# actually attractive on a given day.
+
 UNIVERSE = [
+    # ============================================================
+    # INFORMATION TECHNOLOGY / SOFTWARE / SEMICONDUCTORS
+    # ============================================================
     "AAPL",
     "MSFT",
     "NVDA",
-    "AMZN",
-    "GOOGL",
-    "META",
-    "TSLA",
-    "NFLX",
-    "AMD",
     "AVGO",
+    "ORCL",
+    "CRM",
+    "ADBE",
+    "CSCO",
+    "ACN",
+    "IBM",
+    "INTU",
+    "NOW",
     "QCOM",
+    "AMD",
     "TXN",
     "AMAT",
     "MU",
+    "LRCX",
+    "KLAC",
+    "ADI",
+    "MRVL",
     "INTC",
-    "TSM",
-    "CRM",
-    "ORCL",
-    "ADBE",
-    "INTU",
-    "PLTR",
-    "NOW",
-    "IBM",
+    "NXPI",
+    "MCHP",
+    "ON",
+    "MPWR",
+    "CDNS",
+    "SNPS",
+    "ANSS",
+    "FTNT",
     "PANW",
     "CRWD",
-    "JPM",
-    "GS",
-    "BAC",
-    "MS",
-    "V",
-    "MA",
+    "PLTR",
+    "APP",
+    "ADSK",
+    "ROP",
+    "APH",
+    "KEYS",
+    "DELL",
+    "HPQ",
+    
+    # ============================================================
+    # COMMUNICATION SERVICES / INTERNET / MEDIA
+    # ============================================================
+    "GOOGL",
+    "META",
+    "NFLX",
+    "TMUS",
+    "T",
+    "VZ",
+    "CMCSA",
+    "CHTR",
+    "DIS",
+    "WBD",
+    "TTWO",
+    "EA",
+    "RBLX",
+    "PINS",
+    "SNAP",
+    "SPOT",
+    "LYV",
+
+    # ============================================================
+    # CONSUMER DISCRETIONARY / RETAIL / TRAVEL
+    # ============================================================
+    "AMZN",
+    "TSLA",
+    "HD",
+    "LOW",
+    "TJX",
+    "COST",
+    "ORLY",
+    "AZO",
+    "ROST",
+    "CMG",
+    "MCD",
+    "SBUX",
+    "NKE",
+    "BKNG",
+    "MAR",
+    "HLT",
+    "GM",
+    "F",
+    "DRI",
+    "YUM",
+    "DHI",
+    "LEN",
+    "PHM",
+    "TGT",
+    "EBAY",
+    "ETSY",
+    "CVNA",
+    "UBER",
+    "ABNB",
+    "DASH",
+    "LULU",
+    "DECK",
+    "ULTA",
+    "DPZ",
+    "MGM",
+
+    # ============================================================
+    # CONSUMER STAPLES
+    # ============================================================
+    "WMT",
+    "PG",
+    "KO",
+    "PEP",
+    "PM",
+    "MO",
+    "MDLZ",
+    "CL",
+    "KMB",
+    "GIS",
+    "HSY",
+    "KHC",
+    "SYY",
+    "KR",
+    "KDP",
+    "EL",
+    "STZ",
+
+    # ============================================================
+    # HEALTHCARE / PHARMA / BIOTECH / MEDTECH
+    # ============================================================
     "LLY",
     "UNH",
     "JNJ",
     "ABBV",
     "MRK",
+    "PFE",
+    "BMY",
+    "AMGN",
+    "GILD",
+    "VRTX",
+    "REGN",
+    "ISRG",
+    "ABT",
+    "TMO",
+    "DHR",
+    "SYK",
+    "BSX",
+    "MDT",
+    "ELV",
+    "CI",
+    "HUM",
+    "CVS",
+    "MCK",
+    "COR",
+    "ZBH",
+    "RMD",
+    "HCA",
+    "BDX",
+    "ALGN",
+    "BIIB",
+    "MRNA",
+    "DXCM",
+    "GEHC",
+    "IQV",
+
+    # ============================================================
+    # FINANCIALS / BANKS / BROKERS / EXCHANGES / PAYMENTS
+    # ============================================================
+    "JPM",
+    "BAC",
+    "WFC",
+    "C",
+    "GS",
+    "MS",
+    "BLK",
+    "SCHW",
+    "USB",
+    "PNC",
+    "TFC",
+    "COF",
+    "AXP",
+    "BK",
+    "STT",
+    "CME",
+    "ICE",
+    "SPGI",
+    "MCO",
+    "V",
+    "MA",
+    "PYPL",
+    "COIN",
+    "HOOD",
+    "AIG",
+    "MET",
+    "PRU",
+    "ALL",
+    "TRV",
+    "CB",
+
+    # ============================================================
+    # INDUSTRIALS / AEROSPACE / DEFENSE / TRANSPORT / MACHINERY
+    # ============================================================
+    "CAT",
+    "DE",
+    "GE",
+    "HON",
+    "RTX",
+    "LMT",
+    "NOC",
+    "GD",
+    "BA",
+    "UPS",
+    "FDX",
+    "UNP",
+    "CSX",
+    "NSC",
+    "ETN",
+    "EMR",
+    "PH",
+    "ITW",
+    "MMM",
+    "WM",
+    "RSG",
+    "CARR",
+    "OTIS",
+    "JCI",
+    "CMI",
+    "PCAR",
+    "URI",
+    "FAST",
+    "VRSK",
+    "CTAS",
+    "ADP",
+    "GWW",
+
+    # ============================================================
+    # ENERGY / OIL / GAS / OILFIELD SERVICES
+    # ============================================================
     "XOM",
     "CVX",
     "COP",
-    "WMT",
-    "COST",
-    "TGT",
-    "HD",
-    "NKE",
-    "SBUX",
-    "COIN",
+    "EOG",
+    "SLB",
+    "HAL",
+    "OXY",
+    "PSX",
+    "VLO",
+    "MPC",
+    "ET",
+    "WMB",
+    "KMI",
+    "OKE",
+    "BKR",
+
+    # ============================================================
+    # MATERIALS / CHEMICALS / MINING
+    # ============================================================
+    "FCX",
+    "NEM",
+    "NUE",
+    "STLD",
+    "LIN",
+    "APD",
+    "SHW",
+    "DOW",
+    "DD",
+    "CE",
+
+    # ============================================================
+    # UTILITIES / REAL ESTATE
+    # ============================================================
+    "NEE",
+    "DUK",
+    "SO",
+    "AEP",
+    "SRE",
+    "D",
+    "PLD",
+    "AMT",
+    "EQIX",
+    "CCI",
+
+    # ============================================================
+    # HIGH-BETA / THEMATIC / SPECIAL-SITUATION
+    # ============================================================
     "MSTR",
-    "CAT",
-    "BA",
-    "UBER",
+    "SNOW",
+    "DDOG",
+    "NET",
+    "ZS",
+    "OKTA",
+    "MDB",
+    "RIVN",
+    "LCID",
 ]
+
 =====
 # FILE: risk/risk.py
 =====
+
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Dict, List
+
 from config import (
     MAX_TOTAL_RISK_PCT,
     MAX_SINGLE_TRADE_RISK_PCT,
@@ -1231,30 +1053,52 @@ from config import (
     MAX_ABS_PORTFOLIO_VEGA,
     EMERGENCY_DRAWDOWN_PCT,
 )
+
 from strategy.portfolio import PortfolioPosition
+
+
 @dataclass
 class RiskAssessment:
     approved: bool
     adjusted_contracts: int
     reason: str
+
+
 @dataclass
 class PortfolioRiskReport:
     approved_positions: List[PortfolioPosition]
     rejected_positions: List[PortfolioPosition]
+
     total_max_loss: float
     max_loss_pct: float
+
     bullish_risk_pct: float
     bearish_risk_pct: float
+
     portfolio_delta: float
     portfolio_gamma: float
     portfolio_vega: float
     portfolio_theta: float
+
     emergency_stop: bool
+
     warnings: List[str]
+
+
 def _per_contract_loss(position: PortfolioPosition) -> float:
     if position.contracts <= 0:
         return 0.0
+
     return position.max_loss / position.contracts
+
+
+def _trade_priority_key(position: PortfolioPosition):
+    rank = getattr(position.trade, "option_llm_rank", 0)
+    if rank > 0:
+        return (rank, -getattr(position.trade, "trade_score", 0.0))
+    return (float("inf"), -getattr(position.trade, "trade_score", 0.0))
+
+
 def assess_position(
     position: PortfolioPosition,
     account_equity: float,
@@ -1262,38 +1106,46 @@ def assess_position(
     """
     Validate and cap a single proposed position.
     """
+
     if account_equity <= 0:
         return RiskAssessment(
             approved=False,
             adjusted_contracts=0,
             reason="Invalid account equity.",
         )
+
     if position.contracts <= 0:
         return RiskAssessment(
             approved=False,
             adjusted_contracts=0,
             reason="Position has no contracts.",
         )
+
     per_contract_loss = _per_contract_loss(position)
+
     if per_contract_loss <= 0:
         return RiskAssessment(
             approved=False,
             adjusted_contracts=0,
             reason="Invalid per-contract loss.",
         )
+
     max_allowed_loss = (
         account_equity
         * MAX_SINGLE_TRADE_RISK_PCT
     )
+
     allowed_contracts = int(
         max_allowed_loss // per_contract_loss
     )
+
     if allowed_contracts <= 0:
         return RiskAssessment(
             approved=False,
             adjusted_contracts=0,
             reason="Single-trade risk limit exceeded.",
         )
+
     if allowed_contracts < position.contracts:
         return RiskAssessment(
             approved=True,
@@ -1303,17 +1155,22 @@ def assess_position(
                 f"to {allowed_contracts} contracts."
             ),
         )
+
     return RiskAssessment(
         approved=True,
         adjusted_contracts=position.contracts,
         reason="Passed position-level limits.",
     )
+
+
 def _adjust_position(
     position: PortfolioPosition,
     contracts: int,
 ) -> PortfolioPosition:
     per_contract_loss = _per_contract_loss(position)
+
     new_loss = contracts * per_contract_loss
+
     return PortfolioPosition(
         trade=position.trade,
         contracts=contracts,
@@ -1321,6 +1178,8 @@ def _adjust_position(
         premium_deployed=new_loss,
         risk_weight=position.risk_weight,
     )
+
+
 def _directional_risk(
     positions: List[PortfolioPosition],
 ) -> tuple[float, float]:
@@ -1329,12 +1188,16 @@ def _directional_risk(
         for p in positions
         if p.trade.direction == "BULLISH"
     )
+
     bearish = sum(
         p.max_loss
         for p in positions
         if p.trade.direction == "BEARISH"
     )
+
     return bullish, bearish
+
+
 def _calculate_greeks(
     positions: List[PortfolioPosition],
 ) -> tuple[float, float, float, float]:
@@ -1342,78 +1205,103 @@ def _calculate_greeks(
     gamma = 0.0
     vega = 0.0
     theta = 0.0
+
     for position in positions:
         trade = position.trade
         multiplier = position.contracts * 100
+
         delta += (
             (trade.option_delta or 0.0)
             * multiplier
         )
+
         gamma += (
             (trade.option_gamma or 0.0)
             * multiplier
         )
+
         vega += (
             (trade.option_vega or 0.0)
             * multiplier
         )
+
         theta += (
             (trade.option_theta or 0.0)
             * multiplier
         )
+
     return delta, gamma, vega, theta
+
+
 def _enforce_directional_limits(
     positions: List[PortfolioPosition],
     max_direction_risk: float,
 ) -> tuple[List[PortfolioPosition], List[PortfolioPosition], List[str]]:
     """
     Enforce hard directional risk limits.
+
     Positions are considered independently for bullish and bearish
     exposure. Within each direction, higher trade-score positions
     receive priority.
+
     The returned approved set is guaranteed not to exceed the
     directional risk limit.
     """
+
     approved: List[PortfolioPosition] = []
     rejected: List[PortfolioPosition] = []
     warnings: List[str] = []
+
     for direction in ("BULLISH", "BEARISH"):
+
         direction_positions = [
             position
             for position in positions
             if position.trade.direction == direction
         ]
+
         direction_positions.sort(
-            key=lambda position: position.trade.trade_score,
-            reverse=True,
+            key=_trade_priority_key,
         )
+
         running_risk = 0.0
+
         for position in direction_positions:
+
             proposed_risk = (
                 running_risk
                 + position.max_loss
             )
+
             if proposed_risk <= max_direction_risk:
                 approved.append(position)
                 running_risk = proposed_risk
                 continue
+
             rejected.append(position)
+
             warnings.append(
                 f"{position.trade.stock_symbol}: "
                 f"{direction.lower()} concentration limit "
                 "would be exceeded; position rejected."
             )
+
+    approved.sort(key=_trade_priority_key)
     return approved, rejected, warnings
+
+
 def assess_portfolio(
     positions: List[PortfolioPosition],
     account_equity: float,
     current_equity: float | None = None,
     peak_equity: float | None = None,
 ) -> PortfolioRiskReport:
+
     if account_equity <= 0:
         raise ValueError(
             "account_equity must be positive"
         )
+
     for position in positions:
         if position.contracts <= 0:
             raise ValueError(
@@ -1427,22 +1315,29 @@ def assess_portfolio(
                 f"{position.trade.stock_symbol}: "
                 "max_loss must be positive."
             )
+
     warnings: List[str] = []
+
     # ========================================================
     # EMERGENCY ACCOUNT PROTECTION
     # ========================================================
+
     if (
         current_equity is not None
         and peak_equity is not None
     ):
+
         if peak_equity <= 0:
             raise ValueError(
                 "peak_equity must be positive."
             )
+
         drawdown_pct = (
             peak_equity - current_equity
         ) / peak_equity
+
         if drawdown_pct >= EMERGENCY_DRAWDOWN_PCT:
+
             return PortfolioRiskReport(
                 approved_positions=[],
                 rejected_positions=positions,
@@ -1463,16 +1358,21 @@ def assess_portfolio(
                     )
                 ],
             )
+
     # ========================================================
     # STEP 1 — POSITION-LEVEL LIMITS
     # ========================================================
+
     approved: List[PortfolioPosition] = []
     rejected: List[PortfolioPosition] = []
+
     for position in positions:
+
         assessment = assess_position(
             position,
             account_equity,
         )
+
         if not assessment.approved:
             rejected.append(position)
             warnings.append(
@@ -1480,36 +1380,46 @@ def assess_portfolio(
                 f"{assessment.reason}"
             )
             continue
+
         approved.append(
             _adjust_position(
                 position,
                 assessment.adjusted_contracts,
             )
         )
+
         if assessment.adjusted_contracts < position.contracts:
             warnings.append(
                 f"{position.trade.stock_symbol}: "
                 f"{assessment.reason}"
             )
+
     # ========================================================
     # STEP 2 — UNDERLYING CONCENTRATION
     # ========================================================
+
     max_underlying_risk = (
         account_equity
         * MAX_UNDERLYING_RISK_PCT
     )
+
     final_positions: List[PortfolioPosition] = []
+
     for position in approved:
+
         if position.max_loss <= max_underlying_risk:
             final_positions.append(position)
             continue
+
         per_contract_loss = _per_contract_loss(
             position
         )
+
         contracts = int(
             max_underlying_risk
             // per_contract_loss
         )
+
         if contracts <= 0:
             rejected.append(position)
             warnings.append(
@@ -1517,68 +1427,88 @@ def assess_portfolio(
                 "rejected by underlying-risk limit."
             )
             continue
+
         adjusted = _adjust_position(
             position,
             contracts,
         )
+
         final_positions.append(adjusted)
+
         warnings.append(
             f"{position.trade.stock_symbol}: "
             f"reduced to {contracts} contracts "
             "by underlying-risk limit."
         )
+
     # ========================================================
     # STEP 3 — TOTAL PORTFOLIO RISK
     # ========================================================
+
     max_total_risk = (
         account_equity
         * MAX_TOTAL_RISK_PCT
     )
+
     final_positions.sort(
-        key=lambda p: p.trade.trade_score,
-        reverse=True,
+        key=_trade_priority_key,
     )
+
     risk_limited: List[PortfolioPosition] = []
+
     total_risk = 0.0
+
     for position in final_positions:
+
         remaining = (
             max_total_risk
             - total_risk
         )
+
         if remaining <= 0:
             rejected.append(position)
             continue
+
         if position.max_loss <= remaining:
             risk_limited.append(position)
             total_risk += position.max_loss
             continue
+
         per_contract_loss = _per_contract_loss(
             position
         )
+
         contracts = int(
             remaining
             // per_contract_loss
         )
+
         if contracts <= 0:
             rejected.append(position)
             continue
+
         adjusted = _adjust_position(
             position,
             contracts,
         )
+
         risk_limited.append(adjusted)
         total_risk += adjusted.max_loss
+
         warnings.append(
             f"{position.trade.stock_symbol}: "
             "reduced by total portfolio risk limit."
         )
+
     # ========================================================
     # STEP 4 — DIRECTIONAL CONCENTRATION
     # ========================================================
+
     max_direction_risk = (
         account_equity
         * MAX_DIRECTION_RISK_PCT
     )
+
     (
         risk_limited,
         directional_rejected,
@@ -1587,38 +1517,48 @@ def assess_portfolio(
         positions=risk_limited,
         max_direction_risk=max_direction_risk,
     )
+
     rejected.extend(directional_rejected)
     warnings.extend(directional_warnings)
+
     # ========================================================
     # STEP 5 — GREEKS
     # ========================================================
+
     delta, gamma, vega, theta = _calculate_greeks(
         risk_limited
     )
+
     # Greeks are currently advisory rather than hard vetoes.
     # The hard safety controls are defined-loss and concentration limits.
     if abs(delta) > MAX_ABS_PORTFOLIO_DELTA:
         warnings.append(
             f"Portfolio delta above advisory threshold: {delta:.1f}"
         )
+
     if abs(gamma) > MAX_ABS_PORTFOLIO_GAMMA:
         warnings.append(
             f"Portfolio gamma above advisory threshold: {gamma:.1f}"
         )
+
     if abs(vega) > MAX_ABS_PORTFOLIO_VEGA:
         warnings.append(
             f"Portfolio vega above advisory threshold: {vega:.1f}"
         )
+
     # ========================================================
     # FINAL METRICS
     # ========================================================
+
     total_risk = sum(
         p.max_loss
         for p in risk_limited
     )
+
     bullish, bearish = _directional_risk(
         risk_limited
     )
+
     return PortfolioRiskReport(
         approved_positions=risk_limited,
         rejected_positions=rejected,
@@ -1642,84 +1582,1940 @@ def assess_portfolio(
         emergency_stop=False,
         warnings=warnings,
     )
+
+
 def print_risk_report(
     report: PortfolioRiskReport,
     account_equity: float,
 ) -> None:
+
     print("\n" + "=" * 130)
     print(" RISK ASSESSMENT")
     print("=" * 130)
+
     if report.emergency_stop:
         print(
             "🚨 EMERGENCY STOP — "
             "NO NEW POSITIONS APPROVED"
         )
+
         for warning in report.warnings:
             print(f"  ⚠ {warning}")
+
         print("=" * 130)
         return
+
     print(
         f"Total max loss:  "
         f"${report.total_max_loss:,.2f} "
         f"({report.max_loss_pct:.2%})"
     )
+
     print(
         f"Bullish risk:    "
         f"{report.bullish_risk_pct:.2%}"
     )
+
     print(
         f"Bearish risk:    "
         f"{report.bearish_risk_pct:.2%}"
     )
+
     print(
         f"Portfolio Delta: "
         f"{report.portfolio_delta:,.2f}"
     )
+
     print(
         f"Portfolio Gamma: "
         f"{report.portfolio_gamma:,.2f}"
     )
+
     print(
         f"Portfolio Vega:  "
         f"{report.portfolio_vega:,.2f}"
     )
+
     print(
         f"Portfolio Theta: "
         f"{report.portfolio_theta:,.2f}"
     )
+
     print("\nAPPROVED POSITIONS")
     print("-" * 130)
+
     for position in report.approved_positions:
+
         trade = position.trade
+        llm_rank = getattr(trade, "option_llm_rank", None)
+        rank_str = f"rank=#{llm_rank:<2}" if llm_rank else f"score={trade.trade_score:>5.1f}"
+
         print(
             f"{trade.stock_symbol:<7} "
             f"{trade.direction:<9} "
             f"{position.contracts:>3} contracts  "
             f"risk=${position.max_loss:>8,.2f}  "
-            f"score={trade.trade_score:>5.1f}  "
+            f"{rank_str}  "
             f"{trade.option_symbol}"
         )
+
     print("\nREJECTED POSITIONS")
     print("-" * 130)
+
     for position in report.rejected_positions:
+
         trade = position.trade
+        llm_rank = getattr(trade, "option_llm_rank", None)
+        rank_str = f"rank=#{llm_rank:<2}" if llm_rank else f"score={trade.trade_score:>5.1f}"
+
         print(
             f"{trade.stock_symbol:<7} "
             f"{trade.direction:<9} "
             f"{position.contracts:>3} contracts  "
             f"risk=${position.max_loss:>8,.2f}  "
-            f"score={trade.trade_score:>5.1f}  "
+            f"{rank_str}  "
             f"{trade.option_symbol}"
         )
+
     if report.warnings:
         print("\nWARNINGS")
         print("-" * 130)
+
         for warning in report.warnings:
             print(f"⚠ {warning}")
+
     print("=" * 130)
+
+=====
+# FILE: execution/__init__.py
+=====
+
+from .alpaca_broker import AlpacaBroker
+from .confirmation import CONFIRM_FLAG, parse_execution_args, print_confirmation_block
+from .errors import BrokerError, ExecutionError, MCPBrokerError, SafetyViolation
+from .executor import execute_intents
+from .journal import ExecutionJournal
+from .mcp_broker import AlpacaMCPBroker
+from .models import (
+    ExecutionIntent,
+    ExecutionReport,
+    ExecutionResult,
+    ExecutionStatus,
+    LiveOptionQuote,
+    OrderInstruction,
+    TradeCandidate,
+    ValidationResult,
+)
+from .planner import build_execution_intents, build_order_instruction, make_strategy_run_id
+from .policy import ExecutionPolicy, execution_policy_from_env
+from .report import print_execution_report
+from .stage import run_execution_stage
+from .trade_factory import build_trade_candidates
+from .validator import validate_intent
+
+__all__ = [
+    "CONFIRM_FLAG",
+    "AlpacaBroker",
+    "AlpacaMCPBroker",
+    "BrokerError",
+    "ExecutionError",
+    "ExecutionIntent",
+    "ExecutionJournal",
+    "ExecutionPolicy",
+    "ExecutionReport",
+    "ExecutionResult",
+    "ExecutionStatus",
+    "LiveOptionQuote",
+    "MCPBrokerError",
+    "OrderInstruction",
+    "SafetyViolation",
+    "TradeCandidate",
+    "ValidationResult",
+    "build_execution_intents",
+    "build_order_instruction",
+    "build_trade_candidates",
+    "execute_intents",
+    "execution_policy_from_env",
+    "make_strategy_run_id",
+    "parse_execution_args",
+    "print_confirmation_block",
+    "print_execution_report",
+    "run_execution_stage",
+    "validate_intent",
+]
+
+
+=====
+# FILE: execution/alpaca_broker.py
+=====
+
+from __future__ import annotations
+
+import os
+from datetime import datetime, timezone
+from typing import Any
+
+from dotenv import load_dotenv
+
+from alpaca.common.exceptions import APIError
+from alpaca.data.historical.option import OptionHistoricalDataClient
+from alpaca.data.requests import OptionLatestQuoteRequest
+from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import (
+    OrderSide,
+    OrderType,
+    PositionIntent,
+    QueryOrderStatus,
+    TimeInForce,
+)
+from alpaca.trading.requests import (
+    ClosePositionRequest,
+    GetOrdersRequest,
+    LimitOrderRequest,
+    MarketOrderRequest,
+    ReplaceOrderRequest,
+)
+
+from alpaca_client.client import get_option_data_client, get_trading_client
+from .errors import BrokerError, SafetyViolation
+from .models import LiveOptionQuote
+
+load_dotenv()
+
+
+class AlpacaBroker:
+    """Direct Alpaca API broker implementation for paper trading."""
+
+    def __init__(
+        self,
+        *,
+        trading_client: TradingClient | None = None,
+        option_data_client: OptionHistoricalDataClient | None = None,
+        paper: bool = True,
+    ) -> None:
+        paper_env = os.getenv("ALPACA_PAPER_TRADE", "true").strip().lower()
+        if paper_env != "true" or not paper:
+            raise SafetyViolation("Refusing to initialize broker: ALPACA_PAPER_TRADE must be true. Live trading is strictly forbidden.")
+
+        self.trading_client = trading_client or get_trading_client(paper=True)
+        self.option_data_client = option_data_client or get_option_data_client()
+
+        # Deterministic paper safety guard: confirm client endpoint is paper.
+        self._verify_paper_environment()
+
+    def _verify_paper_environment(self) -> None:
+        """Enforce paper trading endpoint safety check."""
+        base_url = str(getattr(self.trading_client, "_base_url", "")).lower()
+        is_paper = getattr(self.trading_client, "_paper", None)
+        if is_paper is False or ("api.alpaca.markets" in base_url and "paper" not in base_url):
+            raise SafetyViolation(
+                f"Live API endpoint detected ({base_url}). Execution is restricted to the Alpaca paper-trading environment only."
+            )
+
+    def get_account(self) -> Any:
+        """Fetch and return account details."""
+        try:
+            return self.trading_client.get_account()
+        except APIError as exc:
+            raise BrokerError(f"Alpaca API error fetching account: {exc}") from exc
+        except Exception as exc:
+            raise BrokerError(f"Failed to fetch Alpaca account: {exc}") from exc
+
+    def get_positions(self) -> list[Any]:
+        """Fetch all current open positions."""
+        try:
+            positions = self.trading_client.get_all_positions()
+            return list(positions) if positions else []
+        except APIError as exc:
+            raise BrokerError(f"Alpaca API error fetching positions: {exc}") from exc
+        except Exception as exc:
+            raise BrokerError(f"Failed to fetch Alpaca positions: {exc}") from exc
+
+    def get_open_orders(self) -> list[Any]:
+        """Fetch all active open orders."""
+        try:
+            orders = self.trading_client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
+            return list(orders) if orders else []
+        except APIError as exc:
+            raise BrokerError(f"Alpaca API error fetching open orders: {exc}") from exc
+        except Exception as exc:
+            raise BrokerError(f"Failed to fetch Alpaca open orders: {exc}") from exc
+
+    def get_order_by_client_id(self, client_order_id: str) -> Any | None:
+        """Fetch an order by its unique client_order_id, returning None if not found."""
+        try:
+            return self.trading_client.get_order_by_client_id(client_order_id)
+        except APIError as exc:
+            code = None
+            try:
+                code = exc.code
+            except Exception:
+                pass
+            status_code = getattr(exc, "status_code", None)
+            err_str = str(exc).lower()
+            if status_code == 404 or code == 40410000 or "not found" in err_str or "404" in err_str:
+                return None
+            raise BrokerError(f"Alpaca API error fetching order by client_order_id '{client_order_id}': {exc}") from exc
+        except Exception as exc:
+            raise BrokerError(f"Failed to fetch order by client_order_id '{client_order_id}': {exc}") from exc
+
+    def get_order_by_id(self, order_id: str) -> Any:
+        """Fetch an order by its broker order ID."""
+        try:
+            return self.trading_client.get_order_by_id(order_id)
+        except APIError as exc:
+            raise BrokerError(f"Alpaca API error fetching order '{order_id}': {exc}") from exc
+        except Exception as exc:
+            raise BrokerError(f"Failed to fetch order '{order_id}': {exc}") from exc
+
+    def get_option_contract(self, symbol: str) -> Any:
+        """Fetch option contract details for symbol."""
+        try:
+            return self.trading_client.get_option_contract(symbol)
+        except APIError as exc:
+            raise BrokerError(f"Alpaca API error fetching contract '{symbol}': {exc}") from exc
+        except Exception as exc:
+            raise BrokerError(f"Failed to fetch option contract '{symbol}': {exc}") from exc
+
+    def get_option_quote(self, symbol: str) -> LiveOptionQuote:
+        """Fetch live bid/ask quote for option contract symbol."""
+        try:
+            req = OptionLatestQuoteRequest(symbol_or_symbols=symbol)
+            quotes = self.option_data_client.get_option_latest_quote(req)
+            raw_quote = quotes.get(symbol) if isinstance(quotes, dict) else quotes
+            if not raw_quote:
+                raise BrokerError(f"No live quote returned by Alpaca for {symbol}")
+
+            bid = getattr(raw_quote, "bid_price", None)
+            ask = getattr(raw_quote, "ask_price", None)
+            ts = getattr(raw_quote, "timestamp", None)
+
+            if bid is None and isinstance(raw_quote, dict):
+                bid = raw_quote.get("bid_price", raw_quote.get("bid", raw_quote.get("b", 0.0)))
+                ask = raw_quote.get("ask_price", raw_quote.get("ask", raw_quote.get("a", 0.0)))
+                ts = raw_quote.get("timestamp") or raw_quote.get("t")
+
+            return LiveOptionQuote(
+                symbol=symbol,
+                bid=float(bid or 0.0),
+                ask=float(ask or 0.0),
+                timestamp=ts if isinstance(ts, datetime) else None,
+                source="alpaca-api",
+            )
+        except APIError as exc:
+            raise BrokerError(f"Alpaca API error fetching quote for '{symbol}': {exc}") from exc
+        except Exception as exc:
+            if isinstance(exc, BrokerError):
+                raise
+            raise BrokerError(f"Failed to fetch quote for '{symbol}': {exc}") from exc
+
+    def place_option_order(
+        self,
+        *,
+        symbol: str,
+        qty: int,
+        side: str,
+        position_intent: str,
+        order_type: str,
+        time_in_force: str,
+        limit_price: float | None,
+        client_order_id: str,
+    ) -> Any:
+        """Place an option order via the Alpaca Trading API."""
+        self._verify_paper_environment()
+
+        try:
+            side_norm = side.strip().lower()
+            side_enum = OrderSide.BUY if side_norm == "buy" else OrderSide.SELL
+
+            tif_norm = time_in_force.strip().lower()
+            tif_map = {
+                "day": TimeInForce.DAY,
+                "gtc": TimeInForce.GTC,
+                "ioc": TimeInForce.IOC,
+                "fok": TimeInForce.FOK,
+                "opg": TimeInForce.OPG,
+                "cls": TimeInForce.CLS,
+            }
+            tif_enum = tif_map.get(tif_norm, TimeInForce.DAY)
+
+            intent_norm = position_intent.strip().lower()
+            intent_map = {
+                "buy_to_open": PositionIntent.BUY_TO_OPEN,
+                "buy_to_close": PositionIntent.BUY_TO_CLOSE,
+                "sell_to_open": PositionIntent.SELL_TO_OPEN,
+                "sell_to_close": PositionIntent.SELL_TO_CLOSE,
+            }
+            intent_enum = intent_map.get(intent_norm, PositionIntent.BUY_TO_OPEN)
+
+            order_type_norm = order_type.strip().lower()
+
+            if order_type_norm == "limit":
+                if limit_price is None or limit_price <= 0:
+                    raise ValueError(f"Limit price must be positive for limit orders (got {limit_price})")
+                order_req = LimitOrderRequest(
+                    symbol=symbol,
+                    qty=float(qty),
+                    side=side_enum,
+                    time_in_force=tif_enum,
+                    position_intent=intent_enum,
+                    limit_price=round(float(limit_price), 2),
+                    client_order_id=client_order_id,
+                )
+            elif order_type_norm == "market":
+                order_req = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=float(qty),
+                    side=side_enum,
+                    time_in_force=tif_enum,
+                    position_intent=intent_enum,
+                    client_order_id=client_order_id,
+                )
+            else:
+                raise ValueError(f"Unsupported option order type: {order_type}")
+
+            return self.trading_client.submit_order(order_req)
+        except APIError as exc:
+            raise BrokerError(f"Alpaca API error placing order: {exc}") from exc
+        except Exception as exc:
+            if isinstance(exc, (BrokerError, SafetyViolation, ValueError)):
+                raise
+            raise BrokerError(f"Failed to submit option order: {exc}") from exc
+
+    def cancel_order(self, order_id: str) -> Any:
+        """Cancel an open order by ID."""
+        try:
+            return self.trading_client.cancel_order_by_id(order_id)
+        except APIError as exc:
+            raise BrokerError(f"Alpaca API error canceling order '{order_id}': {exc}") from exc
+        except Exception as exc:
+            raise BrokerError(f"Failed to cancel order '{order_id}': {exc}") from exc
+
+    def replace_order(
+        self,
+        order_id: str,
+        *,
+        qty: int | None = None,
+        limit_price: float | None = None,
+    ) -> Any:
+        """Replace an existing open order with updated quantity or limit price."""
+        try:
+            req = ReplaceOrderRequest(
+                qty=qty,
+                limit_price=round(float(limit_price), 2) if limit_price is not None else None,
+            )
+            return self.trading_client.replace_order_by_id(order_id, req)
+        except APIError as exc:
+            raise BrokerError(f"Alpaca API error replacing order '{order_id}': {exc}") from exc
+        except Exception as exc:
+            raise BrokerError(f"Failed to replace order '{order_id}': {exc}") from exc
+
+    def close_position(self, symbol: str, qty: int | None = None) -> Any:
+        """Close an open position."""
+        try:
+            req = ClosePositionRequest(qty=str(qty) if qty is not None else None)
+            return self.trading_client.close_position(symbol, req)
+        except APIError as exc:
+            raise BrokerError(f"Alpaca API error closing position '{symbol}': {exc}") from exc
+        except Exception as exc:
+            raise BrokerError(f"Failed to close position '{symbol}': {exc}") from exc
+
+
+=====
+# FILE: execution/confirmation.py
+=====
+
+from __future__ import annotations
+
+import argparse
+
+from .models import ExecutionIntent
+
+CONFIRM_FLAG = "--confirm-paper-trades"
+
+
+def parse_execution_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        CONFIRM_FLAG,
+        action="store_true",
+        help="Authorize submission of risk-approved orders to the configured Alpaca PAPER account.",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single exit+entry cycle and stop, instead of looping for the session.",
+    )
+    return parser.parse_args(argv)
+
+
+def print_confirmation_block(intents: list[ExecutionIntent], *, paper_required: bool = True) -> None:
+    print("\n" + "=" * 76)
+    print("PAPER TRADE EXECUTION CONFIRMATION")
+    print("=" * 76)
+    print("The following exact orders are authorized for submission to the configured Alpaca PAPER account:")
+    print()
+    if not intents:
+        print("No orders are authorized.")
+    total_risk = 0.0
+    for i, intent in enumerate(intents, start=1):
+        total_risk += intent.authorized_max_loss
+        print(f"{i}.")
+        print(f"  Symbol:              {intent.option_symbol}")
+        print("  Action:              BUY TO OPEN")
+        print(f"  Quantity:            {intent.contracts} contract(s)")
+        print("  Order type:          LIMIT")
+        print(f"  Reference limit:     ${intent.reference_entry_price:.2f}")
+        print("  Time in force:       DAY")
+        print(f"  Authorized max loss: ${intent.authorized_max_loss:,.2f}")
+        print(f"  Underlying:          {intent.stock_symbol}")
+        print(f"  Direction:           {intent.direction}")
+        print()
+    print(f"Total authorized orders: {len(intents)}")
+    print(f"Total authorized max loss: ${total_risk:,.2f}")
+    print("Account mode: ALPACA PAPER ACCOUNT")
+    if paper_required:
+        print("Execution safety: paper-only broker guard is required.")
+    print("=" * 76)
+
+
+=====
+# FILE: execution/errors.py
+=====
+
+class ExecutionError(RuntimeError):
+    """Base execution-layer error."""
+
+
+class BrokerError(ExecutionError):
+    """Alpaca API or broker communication failure."""
+
+
+class MCPBrokerError(BrokerError):
+    """MCP connection or tool-call failure (legacy compatibility)."""
+
+
+class SafetyViolation(ExecutionError):
+    """An order failed a deterministic safety check."""
+
+
+
+=====
+# FILE: execution/executor.py
+=====
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Protocol
+
+from .errors import BrokerError, ExecutionError, MCPBrokerError
+from .journal import ExecutionJournal
+from .models import ExecutionIntent, ExecutionReport, ExecutionResult, ExecutionStatus
+from .planner import build_order_instruction
+from .policy import ExecutionPolicy
+from .validator import validate_intent
+
+
+class BrokerLike(Protocol):
+    def get_positions(self) -> list: ...
+    def get_open_orders(self) -> list: ...
+    def get_option_contract(self, symbol: str): ...
+    def get_option_quote(self, symbol: str): ...
+    def get_order_by_client_id(self, client_order_id: str): ...
+    def place_option_order(self, **kwargs): ...
+
+
+def _to_data_dict(raw) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    if hasattr(raw, "model_dump"):
+        return raw.model_dump()
+    if hasattr(raw, "to_dict"):
+        return raw.to_dict()
+    if hasattr(raw, "dict"):
+        return raw.dict()
+    return getattr(raw, "__dict__", {})
+
+
+def _extract_status(raw) -> tuple[str, Any]:
+    if raw is None:
+        return "unknown", {}
+    if isinstance(raw, dict):
+        data = raw.get("order") if isinstance(raw.get("order"), dict) else raw
+        status_val = data.get("status", "unknown")
+        status_str = status_val.value if hasattr(status_val, "value") else str(status_val)
+        return status_str.lower(), data
+    status_val = getattr(raw, "status", "unknown")
+    status_str = status_val.value if hasattr(status_val, "value") else str(status_val)
+    return status_str.lower(), raw
+
+
+def _extract_order_id(data) -> str | None:
+    if isinstance(data, dict):
+        raw_id = data.get("id") or data.get("order_id")
+        return str(raw_id) if raw_id is not None else None
+    raw_id = getattr(data, "id", None) or getattr(data, "order_id", None)
+    return str(raw_id) if raw_id is not None else None
+
+
+def _fill_qty(data) -> int:
+    if isinstance(data, dict):
+        value = data.get("filled_qty", data.get("filled_quantity", 0))
+    else:
+        value = getattr(data, "filled_qty", getattr(data, "filled_quantity", 0))
+    try:
+        return int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _avg_fill(data) -> float | None:
+    for key in ("filled_avg_price", "average_fill_price", "avg_fill_price"):
+        if isinstance(data, dict):
+            value = data.get(key)
+        else:
+            value = getattr(data, key, None)
+        if value not in (None, ""):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def execute_intents(
+    intents: list[ExecutionIntent],
+    *,
+    broker: BrokerLike,
+    policy: ExecutionPolicy,
+    journal: ExecutionJournal | None = None,
+    dry_run: bool = False,
+    now: datetime | None = None,
+) -> ExecutionReport:
+    now = now or datetime.now(timezone.utc)
+    journal = journal or ExecutionJournal()
+    report = ExecutionReport(strategy_run_id=intents[0].strategy_run_id if intents else "none", dry_run=dry_run)
+
+    positions = broker.get_positions() if not dry_run else []
+    open_orders = broker.get_open_orders() if not dry_run else []
+
+    for intent in intents:
+        journal.record_intent(intent)
+        if dry_run:
+            instruction = build_order_instruction(intent, live_ask=intent.reference_entry_price, policy=policy)
+            result = ExecutionResult(
+                intent=intent,
+                instruction=instruction,
+                status=ExecutionStatus.DRY_RUN,
+                approved=True,
+                reason="Dry run: no order submitted.",
+                requested_qty=intent.contracts,
+                submitted_qty=0,
+                filled_qty=0,
+                limit_price=instruction.limit_price,
+            )
+            report.results.append(result)
+            journal.record_result(result)
+            continue
+
+        try:
+            # Idempotency/recovery check before any write.
+            instruction = build_order_instruction(intent, live_ask=intent.reference_entry_price, policy=policy)
+            try:
+                existing = broker.get_order_by_client_id(instruction.client_order_id)
+            except (BrokerError, MCPBrokerError, ExecutionError, Exception):
+                existing = None
+            if existing:
+                status, data = _extract_status(existing)
+                status_map = {
+                    "filled": ExecutionStatus.FILLED,
+                    "partially_filled": ExecutionStatus.PARTIALLY_FILLED,
+                    "canceled": ExecutionStatus.CANCELED,
+                    "expired": ExecutionStatus.EXPIRED,
+                    "new": ExecutionStatus.SUBMITTED,
+                    "accepted": ExecutionStatus.SUBMITTED,
+                    "pending_new": ExecutionStatus.SUBMITTED,
+                    "accepted_for_bidding": ExecutionStatus.SUBMITTED,
+                    "done_for_day": ExecutionStatus.SUBMITTED,
+                    "stopped": ExecutionStatus.SUBMITTED,
+                    "rejected": ExecutionStatus.FAILED,
+                    "suspended": ExecutionStatus.FAILED,
+                }
+                order_id = _extract_order_id(data)
+                result = ExecutionResult(
+                    intent=intent,
+                    instruction=instruction,
+                    status=status_map.get(status, ExecutionStatus.SUBMITTED),
+                    approved=True,
+                    reason="Existing Alpaca order found by client_order_id; no duplicate submitted.",
+                    order_id=order_id,
+                    requested_qty=intent.contracts,
+                    submitted_qty=intent.contracts,
+                    filled_qty=_fill_qty(data),
+                    average_fill_price=_avg_fill(data),
+                    limit_price=instruction.limit_price,
+                    raw_order=_to_data_dict(data),
+                )
+                report.results.append(result)
+                journal.record_result(result)
+                continue
+
+            live_quote = broker.get_option_quote(intent.option_symbol)
+            contract = broker.get_option_contract(intent.option_symbol)
+            validation = validate_intent(
+                intent,
+                live_quote_raw=live_quote,
+                contract_raw=contract,
+                positions=positions,
+                open_orders=open_orders,
+                now=now,
+                policy=policy,
+            )
+            if not validation.approved or validation.live_quote is None:
+                result = ExecutionResult(
+                    intent=intent,
+                    instruction=None,
+                    status=ExecutionStatus.REJECTED,
+                    approved=False,
+                    reason="; ".join(validation.reasons),
+                    requested_qty=intent.contracts,
+                )
+                report.results.append(result)
+                journal.record_result(result)
+                continue
+
+            instruction = build_order_instruction(intent, live_ask=validation.live_quote.ask, policy=policy)
+            # Recheck actual executable premium against authorized max loss with policy price move tolerance.
+            max_tolerated_risk = intent.authorized_max_loss * (1.0 + policy.max_reference_price_move_pct)
+            actual_authorized_risk = validation.live_quote.ask * 100.0 * intent.contracts
+            if actual_authorized_risk > max_tolerated_risk + 1e-9:
+                result = ExecutionResult(
+                    intent=intent,
+                    instruction=instruction,
+                    status=ExecutionStatus.REJECTED,
+                    approved=False,
+                    reason=(
+                        f"live ask implies ${actual_authorized_risk:,.2f} max loss, "
+                        f"above authorized ${intent.authorized_max_loss:,.2f} "
+                        f"(max allowed with {policy.max_reference_price_move_pct:.0%} price move buffer: ${max_tolerated_risk:,.2f})"
+                    ),
+                    requested_qty=intent.contracts,
+                    limit_price=instruction.limit_price,
+                )
+                report.results.append(result)
+                journal.record_result(result)
+                continue
+
+            raw_order = broker.place_option_order(
+                symbol=instruction.option_symbol,
+                qty=instruction.qty,
+                side=instruction.side,
+                position_intent=instruction.position_intent,
+                order_type=instruction.order_type,
+                time_in_force=instruction.time_in_force,
+                limit_price=instruction.limit_price,
+                client_order_id=instruction.client_order_id,
+            )
+            status, data = _extract_status(raw_order)
+            order_id = _extract_order_id(data)
+            status_enum = {
+                "filled": ExecutionStatus.FILLED,
+                "partially_filled": ExecutionStatus.PARTIALLY_FILLED,
+                "canceled": ExecutionStatus.CANCELED,
+                "expired": ExecutionStatus.EXPIRED,
+                "rejected": ExecutionStatus.FAILED,
+                "suspended": ExecutionStatus.FAILED,
+            }.get(status, ExecutionStatus.SUBMITTED)
+            result = ExecutionResult(
+                intent=intent,
+                instruction=instruction,
+                status=status_enum,
+                approved=True,
+                reason="Order submitted to Alpaca paper account.",
+                order_id=order_id,
+                requested_qty=intent.contracts,
+                submitted_qty=intent.contracts,
+                filled_qty=_fill_qty(data),
+                average_fill_price=_avg_fill(data),
+                limit_price=instruction.limit_price,
+                raw_order=_to_data_dict(data),
+            )
+        except (BrokerError, MCPBrokerError, ExecutionError, ValueError, Exception) as exc:
+            result = ExecutionResult(
+                intent=intent,
+                instruction=locals().get("instruction"),
+                status=ExecutionStatus.FAILED,
+                approved=False,
+                reason=str(exc),
+                requested_qty=intent.contracts,
+            )
+        report.results.append(result)
+        journal.record_result(result)
+
+    return report
+
+
+=====
+# FILE: execution/journal.py
+=====
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+class ExecutionJournal:
+    """Append-only JSONL execution audit log."""
+
+    def __init__(self, path: str | Path = "logs/execution.jsonl") -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append(self, event: dict[str, Any]) -> None:
+        record = dict(event)
+        record.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, default=str, sort_keys=True) + "\n")
+
+    def record_intent(self, intent: Any) -> None:
+        self.append({
+            "event": "EXECUTION_INTENT",
+            "intent_id": intent.intent_id,
+            "strategy_run_id": intent.strategy_run_id,
+            "stock_symbol": intent.stock_symbol,
+            "option_symbol": intent.option_symbol,
+            "contracts": intent.contracts,
+            "authorized_max_loss": intent.authorized_max_loss,
+            "reference_entry_price": intent.reference_entry_price,
+            "direction": intent.direction,
+        })
+
+    def record_result(self, result: Any) -> None:
+        self.append({
+            "event": "EXECUTION_RESULT",
+            "intent_id": result.intent.intent_id,
+            "strategy_run_id": result.intent.strategy_run_id,
+            "option_symbol": result.intent.option_symbol,
+            "status": result.status.value,
+            "approved": result.approved,
+            "reason": result.reason,
+            "order_id": result.order_id,
+            "requested_qty": result.requested_qty,
+            "submitted_qty": result.submitted_qty,
+            "filled_qty": result.filled_qty,
+            "average_fill_price": result.average_fill_price,
+            "limit_price": result.limit_price,
+        })
+
+
+=====
+# FILE: execution/mcp_broker.py
+=====
+
+from __future__ import annotations
+
+# Backwards compatibility alias: redirect AlpacaMCPBroker to AlpacaBroker
+from .alpaca_broker import AlpacaBroker as AlpacaMCPBroker
+from .errors import MCPBrokerError
+
+__all__ = ["AlpacaMCPBroker", "MCPBrokerError"]
+
+
+=====
+# FILE: execution/models.py
+=====
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from enum import Enum
+from typing import Any, Mapping
+
+
+class OrderIntent(str, Enum):
+    BUY_TO_OPEN = "BUY_TO_OPEN"
+
+
+class ExecutionStatus(str, Enum):
+    PLANNED = "PLANNED"
+    REJECTED = "REJECTED"
+    SUBMITTED = "SUBMITTED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
+    CANCELED = "CANCELED"
+    EXPIRED = "EXPIRED"
+    FAILED = "FAILED"
+    DRY_RUN = "DRY_RUN"
+
+
+@dataclass(frozen=True)
+class TradeCandidate:
+    stock_symbol: str
+    direction: str
+    option_symbol: str
+    option_type: str
+    expiration: date
+    strike: float
+    option_bid: float
+    option_ask: float
+    option_mid: float
+    option_delta: float | None
+    option_gamma: float | None
+    option_vega: float | None
+    option_theta: float | None
+    trade_score: float
+    scanner_score: float
+    option_selector_score: float
+    stock_llm_rank: int
+    option_llm_rank: int
+    dte: int
+
+    @classmethod
+    def from_ranked_option(
+        cls,
+        option: Any,
+        stock: Any,
+        direction: str,
+        stock_llm_rank: int,
+        option_llm_rank: int,
+    ) -> "TradeCandidate":
+        return cls(
+            stock_symbol=stock.symbol,
+            direction=str(direction).upper(),
+            option_symbol=option.symbol,
+            option_type=option.option_type,
+            expiration=option.expiration,
+            strike=float(option.strike),
+            option_bid=float(option.bid),
+            option_ask=float(option.ask),
+            option_mid=float(option.mid),
+            option_delta=option.delta,
+            option_gamma=option.gamma,
+            option_vega=option.vega,
+            option_theta=option.theta,
+            trade_score=float(option.score),
+            scanner_score=float(stock.score),
+            option_selector_score=float(option.score),
+            stock_llm_rank=int(stock_llm_rank),
+            option_llm_rank=int(option_llm_rank),
+            dte=int(option.dte),
+        )
+
+
+@dataclass(frozen=True)
+class ExecutionIntent:
+    intent_id: str
+    strategy_run_id: str
+    stock_symbol: str
+    option_symbol: str
+    direction: str
+    order_intent: OrderIntent
+    contracts: int
+    authorized_max_loss: float
+    reference_entry_price: float
+    created_at: datetime
+    expiration: date
+    option_type: str
+    strike: float
+    trade_score: float
+    stock_llm_rank: int
+    option_llm_rank: int
+
+
+@dataclass(frozen=True)
+class LiveOptionQuote:
+    symbol: str
+    bid: float
+    ask: float
+    timestamp: datetime | None = None
+    source: str = "alpaca-api"
+
+    @property
+    def mid(self) -> float:
+        return (self.bid + self.ask) / 2.0
+
+    @property
+    def spread_pct(self) -> float:
+        mid = self.mid
+        return (self.ask - self.bid) / mid if mid > 0 else float("inf")
+
+
+@dataclass(frozen=True)
+class OrderInstruction:
+    intent_id: str
+    option_symbol: str
+    side: str
+    position_intent: str
+    qty: int
+    order_type: str
+    limit_price: float
+    time_in_force: str
+    client_order_id: str
+
+
+@dataclass(frozen=True)
+class ValidationResult:
+    approved: bool
+    reasons: tuple[str, ...] = ()
+    live_quote: LiveOptionQuote | None = None
+
+
+@dataclass
+class ExecutionResult:
+    intent: ExecutionIntent
+    instruction: OrderInstruction | None
+    status: ExecutionStatus
+    approved: bool
+    reason: str
+    order_id: str | None = None
+    requested_qty: int = 0
+    submitted_qty: int = 0
+    filled_qty: int = 0
+    average_fill_price: float | None = None
+    limit_price: float | None = None
+    raw_order: Mapping[str, Any] | None = None
+
+
+@dataclass
+class ExecutionReport:
+    strategy_run_id: str
+    dry_run: bool
+    results: list[ExecutionResult] = field(default_factory=list)
+
+    @property
+    def submitted_count(self) -> int:
+        return sum(1 for r in self.results if r.status not in {ExecutionStatus.DRY_RUN, ExecutionStatus.REJECTED, ExecutionStatus.FAILED})
+
+    @property
+    def filled_count(self) -> int:
+        return sum(1 for r in self.results if r.status == ExecutionStatus.FILLED)
+
+    @property
+    def rejected_count(self) -> int:
+        return sum(1 for r in self.results if not r.approved)
+
+
+=====
+# FILE: execution/planner.py
+=====
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import hashlib
+
+from .models import ExecutionIntent, OrderInstruction, OrderIntent
+from .policy import ExecutionPolicy
+
+
+def make_strategy_run_id(now: datetime | None = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    return now.strftime("%Y%m%dT%H%M%SZ")
+
+
+def build_execution_intents(positions, *, strategy_run_id: str | None = None, created_at: datetime | None = None) -> list[ExecutionIntent]:
+    created_at = created_at or datetime.now(timezone.utc)
+    strategy_run_id = strategy_run_id or make_strategy_run_id(created_at)
+    intents: list[ExecutionIntent] = []
+    for index, position in enumerate(positions, start=1):
+        trade = position.trade
+        option_symbol = trade.option_symbol
+        raw = f"{strategy_run_id}|{trade.stock_symbol}|{option_symbol}|{index}"
+        intent_id = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+        expiration = getattr(trade, "expiration", None)
+        option_type = getattr(trade, "option_type", "")
+        strike = float(getattr(trade, "strike", 0.0))
+        intents.append(
+            ExecutionIntent(
+                intent_id=intent_id,
+                strategy_run_id=strategy_run_id,
+                stock_symbol=trade.stock_symbol,
+                option_symbol=option_symbol,
+                direction=trade.direction,
+                order_intent=OrderIntent.BUY_TO_OPEN,
+                contracts=int(position.contracts),
+                authorized_max_loss=float(position.max_loss),
+                reference_entry_price=float(getattr(trade, "option_ask", position.max_loss / max(position.contracts * 100, 1))),
+                created_at=created_at,
+                expiration=expiration,
+                option_type=option_type,
+                strike=strike,
+                trade_score=float(trade.trade_score),
+                stock_llm_rank=int(getattr(trade, "stock_llm_rank", 0)),
+                option_llm_rank=int(getattr(trade, "option_llm_rank", 0)),
+            )
+        )
+    return intents
+
+
+def build_order_instruction(intent: ExecutionIntent, *, live_ask: float, policy: ExecutionPolicy) -> OrderInstruction:
+    if live_ask <= 0:
+        raise ValueError("live_ask must be positive")
+    limit_price = round(live_ask * (1.0 + policy.limit_price_buffer_pct), 2)
+    client_order_id = f"oa-{intent.strategy_run_id}-{intent.intent_id}"[:48]
+    return OrderInstruction(
+        intent_id=intent.intent_id,
+        option_symbol=intent.option_symbol,
+        side="buy",
+        position_intent="buy_to_open",
+        qty=intent.contracts,
+        order_type=policy.order_type,
+        limit_price=limit_price,
+        time_in_force=policy.time_in_force,
+        client_order_id=client_order_id,
+    )
+
+
+=====
+# FILE: execution/policy.py
+=====
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from datetime import timedelta
+
+from config import MAX_OPTION_SPREAD_PCT
+
+
+@dataclass(frozen=True)
+class ExecutionPolicy:
+    max_intent_age: timedelta = timedelta(seconds=120)
+    max_reference_price_move_pct: float = 0.08
+    max_reference_price_drop_pct: float = 0.20
+    max_spread_pct: float = MAX_OPTION_SPREAD_PCT
+    cheap_contract_absolute_spread: float = 0.05
+    limit_price_buffer_pct: float = 0.0
+    time_in_force: str = "day"
+    order_type: str = "limit"
+    allow_existing_position: bool = False
+    allow_existing_open_order: bool = False
+
+
+def execution_policy_from_env() -> ExecutionPolicy:
+    return ExecutionPolicy(
+        max_intent_age=timedelta(seconds=float(os.getenv("EXECUTION_MAX_INTENT_AGE_SEC", "120"))),
+        max_reference_price_move_pct=float(os.getenv("EXECUTION_MAX_PRICE_MOVE_PCT", "0.08")),
+        max_reference_price_drop_pct=float(os.getenv("EXECUTION_MAX_PRICE_DROP_PCT", "0.20")),
+        max_spread_pct=float(os.getenv("EXECUTION_MAX_SPREAD_PCT", str(MAX_OPTION_SPREAD_PCT))),
+        cheap_contract_absolute_spread=float(os.getenv("EXECUTION_CHEAP_CONTRACT_ABS_SPREAD", "0.05")),
+        limit_price_buffer_pct=float(os.getenv("EXECUTION_LIMIT_BUFFER_PCT", "0.00")),
+        time_in_force=os.getenv("EXECUTION_TIME_IN_FORCE", "day").lower(),
+        order_type=os.getenv("EXECUTION_ORDER_TYPE", "limit").lower(),
+        allow_existing_position=os.getenv("EXECUTION_ALLOW_EXISTING_POSITION", "false").lower() == "true",
+        allow_existing_open_order=os.getenv("EXECUTION_ALLOW_EXISTING_ORDER", "false").lower() == "true",
+    )
+
+
+=====
+# FILE: execution/position_manager.py
+=====
+
+"""Open-position management: mark, decide, close.
+
+Exits run BEFORE entries in every cycle. They free risk budget, and a position
+the exit engine wants gone should not be competing for capital with a new idea in
+the same cycle.
+
+Every broker call is individually wrapped. One symbol throwing must not prevent
+the remaining positions from being closed.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Optional
+
+from strategy import state as position_state
+from strategy.exits import (
+    ExitDecision,
+    dte_from_occ_symbol,
+    evaluate_exit,
+    market_now,
+    realisable_pnl_pct,
+    sort_closes_immediate_first,
+)
+from .errors import BrokerError
+
+EXIT_LIMIT_TOLERANCE = 0.02   # cross slightly THROUGH the bid: exits must fill
+
+
+@dataclass
+class ManagedPosition:
+    option_symbol: str
+    stock_symbol: str
+    contracts: int
+    entry_price: float
+    bid: float
+    ask: float
+    pnl_pct: Optional[float]
+    peak_pnl_pct: float
+    dte: Optional[int]
+    decision: ExitDecision
+
+
+@dataclass
+class PositionReport:
+    positions: list[ManagedPosition]
+    closed: list[tuple[str, str]]          # (symbol, reason)
+    failed: list[tuple[str, str]]          # (symbol, error)
+    quote_gaps: list[str]
+    adopted: list[str]
+    pruned: list[str]
+
+    @property
+    def open_count(self) -> int:
+        return len(self.positions)
+
+    @property
+    def held_count(self) -> int:
+        return sum(1 for p in self.positions if not p.decision.should_close)
+
+
+def _is_option_position(position: Any) -> bool:
+    """Alpaca's asset_class enum spelling varies across alpaca-py versions."""
+    return "option" in str(getattr(position, "asset_class", "")).lower()
+
+
+def _underlying_of(option_symbol: str) -> str:
+    # OCC suffix is 6 (date) + 1 (type) + 8 (strike) = 15 characters.
+    return option_symbol[:-15] if len(option_symbol) > 15 else option_symbol
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def manage_open_positions(
+    broker: Any,
+    *,
+    now: Optional[datetime] = None,
+    dry_run: bool = False,
+    state_path: str | None = None,
+    verbose: bool = True,
+) -> PositionReport:
+    """Mark every open option position, evaluate exits, and submit the closes."""
+
+    reference = market_now(now)
+    state = position_state.load_state(state_path)
+
+    try:
+        raw_positions = broker.get_positions()
+    except BrokerError as exc:
+        if verbose:
+            print(f"Could not fetch positions: {exc}")
+        return PositionReport([], [], [("<fetch>", str(exc))], [], [], [])
+
+    option_positions = [p for p in raw_positions if _is_option_position(p)]
+    open_symbols = [str(getattr(p, "symbol", "")) for p in option_positions]
+
+    pruned = position_state.reconcile(state, open_symbols)
+
+    managed: list[ManagedPosition] = []
+    quote_gaps: list[str] = []
+    adopted: list[str] = []
+
+    for position in option_positions:
+        symbol = str(getattr(position, "symbol", ""))
+        if not symbol:
+            continue
+
+        contracts = abs(int(_safe_float(getattr(position, "qty", 0))))
+        entry_price = _safe_float(getattr(position, "avg_entry_price", 0.0))
+        broker_pnl_pct = _safe_float(getattr(position, "unrealized_plpc", 0.0))
+
+        if symbol not in state:
+            position_state.adopt_untracked(
+                state,
+                option_symbol=symbol,
+                stock_symbol=_underlying_of(symbol),
+                entry_price=entry_price,
+                contracts=contracts,
+                now=reference,
+            )
+            adopted.append(symbol)
+
+        # A live BID is required: we sell into it, and the midpoint lies.
+        bid = 0.0
+        ask = 0.0
+        try:
+            quote = broker.get_option_quote(symbol)
+            bid = _safe_float(getattr(quote, "bid", 0.0))
+            ask = _safe_float(getattr(quote, "ask", 0.0))
+        except BrokerError as exc:
+            quote_gaps.append(symbol)
+            if verbose:
+                print(f"  {symbol}: no live quote ({exc}); falling back to broker mark")
+
+        pnl_pct = realisable_pnl_pct(entry_price, bid, fallback_pnl_pct=broker_pnl_pct)
+
+        peak = state[symbol].peak_pnl_pct
+        if pnl_pct is not None:
+            peak = position_state.update_peak(state, symbol, pnl_pct)
+
+        dte = dte_from_occ_symbol(symbol, reference)
+
+        decision = evaluate_exit(
+            pnl_pct=pnl_pct if pnl_pct is not None else 0.0,
+            peak_pnl_pct=peak,
+            dte=dte if dte is not None else 99,
+            opened_at=state[symbol].opened_at,
+            now=reference,
+        )
+
+        managed.append(
+            ManagedPosition(
+                option_symbol=symbol,
+                stock_symbol=state[symbol].stock_symbol or _underlying_of(symbol),
+                contracts=contracts,
+                entry_price=entry_price,
+                bid=bid,
+                ask=ask,
+                pnl_pct=pnl_pct,
+                peak_pnl_pct=peak,
+                dte=dte,
+                decision=decision,
+            )
+        )
+
+    if verbose:
+        _print_position_report(managed, reference)
+
+    closes = sort_closes_immediate_first(
+        [(p.option_symbol, p.decision) for p in managed if p.decision.should_close]
+    )
+    by_symbol = {p.option_symbol: p for p in managed}
+
+    closed: list[tuple[str, str]] = []
+    failed: list[tuple[str, str]] = []
+
+    for symbol, decision in closes:
+        position = by_symbol[symbol]
+
+        if dry_run:
+            closed.append((symbol, f"DRY_RUN {decision.reason}"))
+            if verbose:
+                print(f"  [dry-run] would close {symbol} x{position.contracts} - {decision.reason}")
+            continue
+
+        try:
+            if position.bid > 0:
+                # Marketable limit placed slightly through the bid. Exits are the
+                # half of the round trip you cannot afford to miss.
+                limit_price = max(0.01, round(position.bid * (1.0 - EXIT_LIMIT_TOLERANCE), 2))
+                broker.place_option_order(
+                    symbol=symbol,
+                    qty=position.contracts,
+                    side="sell",
+                    position_intent="sell_to_close",
+                    order_type="limit",
+                    time_in_force="day",
+                    limit_price=limit_price,
+                    client_order_id=_exit_client_order_id(symbol, reference),
+                )
+            else:
+                # No usable bid; fall back to the broker's own close endpoint
+                # rather than guessing a price.
+                broker.close_position(symbol, qty=position.contracts)
+
+            position_state.forget(state, symbol)
+            closed.append((symbol, decision.reason))
+            if verbose:
+                print(f"  CLOSING {symbol} x{position.contracts} - {decision.reason}: {decision.detail}")
+        except (BrokerError, ValueError) as exc:
+            failed.append((symbol, str(exc)))
+            if verbose:
+                print(f"  FAILED to close {symbol}: {exc}")
+
+    position_state.save_state(state, state_path)
+
+    return PositionReport(
+        positions=managed,
+        closed=closed,
+        failed=failed,
+        quote_gaps=quote_gaps,
+        adopted=adopted,
+        pruned=pruned,
+    )
+
+
+def cancel_stale_orders(
+    broker: Any,
+    *,
+    now: Optional[datetime] = None,
+    max_age_seconds: int | None = None,
+    dry_run: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Cancel resting orders that have outlived the quote they were priced against.
+
+    A limit sitting on the book is stale information: it was priced against a
+    chain that has since moved, so letting it fill means filling at a price the
+    model never approved. Run this at the top of every cycle.
+
+    Exit orders are NEVER cancelled - getting out is the half of the round trip
+    you cannot afford to miss, so a resting sell is left to work.
+    """
+    from config import ENTRY_ORDER_TIMEOUT_SECONDS
+
+    timeout = ENTRY_ORDER_TIMEOUT_SECONDS if max_age_seconds is None else max_age_seconds
+    reference = market_now(now)
+    cancelled: list[str] = []
+
+    try:
+        open_orders = broker.get_open_orders()
+    except BrokerError as exc:
+        if verbose:
+            print(f"  Could not list open orders: {exc}")
+        return cancelled
+
+    for order in open_orders:
+        order_id = str(getattr(order, "id", "") or "")
+        symbol = str(getattr(order, "symbol", "") or "")
+        side = str(getattr(order, "side", "")).lower()
+        client_id = str(getattr(order, "client_order_id", "") or "")
+
+        # Never pull a working exit.
+        if "sell" in side or client_id.startswith("exit-"):
+            continue
+
+        submitted = getattr(order, "submitted_at", None) or getattr(order, "created_at", None)
+        age = None
+        if submitted is not None:
+            if submitted.tzinfo is None:
+                submitted = submitted.replace(tzinfo=reference.tzinfo)
+            age = (reference - submitted).total_seconds()
+
+        if age is not None and age < timeout:
+            continue
+
+        if dry_run:
+            cancelled.append(symbol)
+            if verbose:
+                print(f"  [dry-run] would cancel stale entry order {symbol} (age {age or 0:.0f}s)")
+            continue
+
+        try:
+            broker.cancel_order(order_id)
+            cancelled.append(symbol)
+            if verbose:
+                print(f"  Cancelled stale entry order {symbol} (age {age or 0:.0f}s)")
+        except BrokerError as exc:
+            if verbose:
+                print(f"  Could not cancel stale order {symbol}: {exc}")
+
+    return cancelled
+
+
+def seconds_until_close(broker: Any, now: Optional[datetime] = None) -> Optional[float]:
+    """Seconds until the session close, or None if it cannot be determined."""
+    reference = market_now(now)
+    try:
+        clock = broker.trading_client.get_clock()
+    except Exception:  # noqa: BLE001
+        return None
+
+    next_close = getattr(clock, "next_close", None)
+    if next_close is None:
+        return None
+    if next_close.tzinfo is None:
+        next_close = next_close.replace(tzinfo=reference.tzinfo)
+    if not getattr(clock, "is_open", False):
+        return 0.0
+    return max(0.0, (next_close - reference).total_seconds())
+
+
+def entry_window_status(broker: Any, now: Optional[datetime] = None) -> tuple[bool, str]:
+    """Whether it is safe to OPEN new risk right now.
+
+    Spreads are widest in the first and last minutes of the session, which is
+    exactly when a marketable limit costs the most. Exits are never blocked by
+    this - only entries.
+
+    Uses the broker clock so market holidays are handled by Alpaca rather than a
+    hand-maintained calendar. Falls back to a plain time check if the clock call
+    fails, so a transient API error cannot silently open the window.
+    """
+    from config import NO_TRADE_MINUTES_AFTER_OPEN, NO_TRADE_MINUTES_BEFORE_CLOSE
+
+    reference = market_now(now)
+
+    try:
+        clock = broker.trading_client.get_clock()
+    except Exception as exc:  # noqa: BLE001 - any clock failure is non-fatal
+        if reference.weekday() >= 5:
+            return False, f"weekend (clock unavailable: {exc})"
+        minutes = reference.hour * 60 + reference.minute
+        if not (570 + NO_TRADE_MINUTES_AFTER_OPEN <= minutes <= 960 - NO_TRADE_MINUTES_BEFORE_CLOSE):
+            return False, f"outside the entry window (clock unavailable: {exc})"
+        return True, "entry window open (assumed; broker clock unavailable)"
+
+    if not getattr(clock, "is_open", False):
+        return False, "market is closed"
+
+    clock_now = getattr(clock, "timestamp", None) or reference
+    next_close = getattr(clock, "next_close", None)
+
+    if clock_now.tzinfo is None:
+        clock_now = clock_now.replace(tzinfo=reference.tzinfo)
+
+    minutes_of_day = market_now(clock_now).hour * 60 + market_now(clock_now).minute
+    if minutes_of_day < 570 + NO_TRADE_MINUTES_AFTER_OPEN:
+        return False, f"within {NO_TRADE_MINUTES_AFTER_OPEN} min of the open - spreads are widest"
+
+    if next_close is not None:
+        if next_close.tzinfo is None:
+            next_close = next_close.replace(tzinfo=reference.tzinfo)
+        minutes_left = (next_close - clock_now).total_seconds() / 60.0
+        if minutes_left <= NO_TRADE_MINUTES_BEFORE_CLOSE:
+            return False, f"within {NO_TRADE_MINUTES_BEFORE_CLOSE} min of the close"
+
+    return True, "entry window open"
+
+
+def verify_fills(
+    broker: Any,
+    report: Any,
+    *,
+    state_path: str | None = None,
+    verbose: bool = True,
+) -> list[tuple[str, str, int]]:
+    """Re-check submitted entry orders and record only what actually filled.
+
+    Without this the agent believes it holds positions it never got. A resting
+    DAY limit that has not filled is stale information: it was priced against a
+    quote we may no longer accept, so it is cancelled rather than left to fill
+    later at a price the model never approved.
+
+    Returns [(symbol, status, filled_qty)].
+    """
+    outcomes: list[tuple[str, str, int]] = []
+    state = position_state.load_state(state_path)
+    changed = False
+
+    for result in getattr(report, "results", []):
+        order_id = getattr(result, "order_id", None)
+        symbol = getattr(getattr(result, "intent", None), "option_symbol", "")
+        if not order_id or not symbol:
+            continue
+
+        try:
+            order = broker.get_order_by_id(order_id)
+        except BrokerError as exc:
+            outcomes.append((symbol, f"UNKNOWN ({exc})", 0))
+            continue
+
+        status = str(getattr(order, "status", "")).lower()
+        filled_qty = int(_safe_float(getattr(order, "filled_qty", 0)))
+        fill_price = _safe_float(getattr(order, "filled_avg_price", 0.0))
+
+        if filled_qty > 0:
+            entry = state.get(symbol)
+            if entry is not None:
+                entry.contracts = filled_qty
+                if fill_price > 0:
+                    entry.entry_price = fill_price
+                changed = True
+            outcomes.append((symbol, "FILLED", filled_qty))
+            if verbose:
+                print(f"  {symbol}: filled {filled_qty} @ ${fill_price:.2f}")
+            continue
+
+        # Nothing filled. Drop the optimistic state entry and cancel the order.
+        if symbol in state:
+            position_state.forget(state, symbol)
+            changed = True
+
+        if "cancel" not in status and "expired" not in status and "reject" not in status:
+            try:
+                broker.cancel_order(order_id)
+                outcomes.append((symbol, "UNFILLED_CANCELLED", 0))
+                if verbose:
+                    print(f"  {symbol}: no fill ({status}) - order cancelled, state cleared")
+            except BrokerError as exc:
+                outcomes.append((symbol, f"UNFILLED_CANCEL_FAILED ({exc})", 0))
+                if verbose:
+                    print(f"  {symbol}: no fill and cancel failed: {exc}")
+        else:
+            outcomes.append((symbol, status.upper(), 0))
+            if verbose:
+                print(f"  {symbol}: {status} - state cleared")
+
+    if changed:
+        position_state.save_state(state, state_path)
+
+    return outcomes
+
+
+def _exit_client_order_id(symbol: str, now: datetime) -> str:
+    return f"exit-{symbol}-{now.strftime('%Y%m%dT%H%M%S')}"
+
+
+def _print_position_report(positions: list[ManagedPosition], now: datetime) -> None:
+    print()
+    print("=" * 118)
+    print(f" OPEN POSITIONS - {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    print("=" * 118)
+
+    if not positions:
+        print(" No open option positions.")
+        print("=" * 118)
+        return
+
+    print(
+        f"{'Contract':<24}{'Qty':>5}{'Entry':>9}{'Bid':>9}{'P&L':>10}"
+        f"{'Peak':>10}{'DTE':>5}  {'Action':<16}{'Why'}"
+    )
+    print("-" * 118)
+
+    for p in positions:
+        pnl_str = f"{p.pnl_pct:+.1%}" if p.pnl_pct is not None else "N/A"
+        action = p.decision.reason if p.decision.should_close else "HOLD"
+        print(
+            f"{p.option_symbol:<24}{p.contracts:>5}{p.entry_price:>9.2f}{p.bid:>9.2f}"
+            f"{pnl_str:>10}{p.peak_pnl_pct:>+10.1%}"
+            f"{(p.dte if p.dte is not None else -1):>5}  {action:<16}{p.decision.detail}"
+        )
+
+    print("=" * 118)
+
+
+__all__ = [
+    "ManagedPosition",
+    "PositionReport",
+    "entry_window_status",
+    "manage_open_positions",
+    "verify_fills",
+]
+
+
+=====
+# FILE: execution/report.py
+=====
+
+from __future__ import annotations
+
+from .models import ExecutionReport
+
+
+def print_execution_report(report: ExecutionReport) -> None:
+    print("\n" + "=" * 110)
+    print("EXECUTION REPORT")
+    print("=" * 110)
+    print(f"Strategy run: {report.strategy_run_id}")
+    print(f"Mode: {'DRY RUN' if report.dry_run else 'PAPER EXECUTION'}")
+    if not report.results:
+        print("No execution intents.")
+        print("=" * 110)
+        return
+    for index, result in enumerate(report.results, start=1):
+        print(f"\n{index}. {result.intent.option_symbol}")
+        print(f"  Action:       BUY TO OPEN")
+        print(f"  Requested:    {result.requested_qty}")
+        print(f"  Submitted:    {result.submitted_qty}")
+        print(f"  Filled:       {result.filled_qty}")
+        print(f"  Status:       {result.status.value}")
+        if result.order_id:
+            print(f"  Order ID:     {result.order_id}")
+        if result.limit_price is not None:
+            print(f"  Limit price:  ${result.limit_price:.2f}")
+        if result.average_fill_price is not None:
+            print(f"  Avg fill:     ${result.average_fill_price:.2f}")
+        print(f"  Result:       {result.reason}")
+    print("\n" + "-" * 110)
+    print(f"Intents:        {len(report.results)}")
+    print(f"Filled:         {report.filled_count}")
+    print(f"Rejected:       {report.rejected_count}")
+    if report.dry_run:
+        print("DRY RUN — no trading orders were submitted to Alpaca.")
+    print("=" * 110)
+
+
+=====
+# FILE: execution/stage.py
+=====
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from .alpaca_broker import AlpacaBroker
+from .confirmation import print_confirmation_block
+from .executor import execute_intents
+from .journal import ExecutionJournal
+from .planner import build_execution_intents
+from .policy import execution_policy_from_env
+from .report import print_execution_report
+
+
+def run_execution_stage(
+    positions,
+    *,
+    confirmed: bool,
+    strategy_run_id: str | None = None,
+    journal_path: str = "logs/execution.jsonl",
+    expected_account_id: str | None = None,
+):
+    """Run the one-shot execution stage.
+
+    Dry mode creates order instructions but never initializes the write-capable
+    Alpaca broker. Confirmed mode is paper-only and submits approved orders.
+    """
+    intents = build_execution_intents(
+        positions,
+        strategy_run_id=strategy_run_id,
+        created_at=datetime.now(timezone.utc),
+    )
+    print_confirmation_block(intents)
+    journal = ExecutionJournal(journal_path)
+    policy = execution_policy_from_env()
+
+    if not confirmed:
+        report = execute_intents(
+            intents,
+            broker=_NoBroker(),
+            policy=policy,
+            journal=journal,
+            dry_run=True,
+        )
+        print_execution_report(report)
+        print("\nDRY RUN")
+        return report
+
+    broker = AlpacaBroker()
+    if expected_account_id:
+        account = broker.get_account()
+        account_data = account.get("account") if isinstance(account, dict) and isinstance(account.get("account"), dict) else account
+        actual_account_id = getattr(account_data, "id", None) or (account_data.get("id") if isinstance(account_data, dict) else None)
+        if actual_account_id and str(actual_account_id) != str(expected_account_id):
+            raise RuntimeError(
+                "Alpaca account mismatch: the execution credentials do not "
+                f"match the Alpaca account read by main.py ({expected_account_id}). "
+                f"Broker returned account {actual_account_id}."
+            )
+    report = execute_intents(
+        intents,
+        broker=broker,
+        policy=policy,
+        journal=journal,
+        dry_run=False,
+    )
+    print_execution_report(report)
+    return report
+
+
+class _NoBroker:
+    """Guard object used by dry-run mode; any accidental broker access explodes."""
+
+    def __getattr__(self, name):
+        raise RuntimeError(f"Dry-run safety violation: broker method {name!r} was called")
+
+
+=====
+# FILE: execution/trade_factory.py
+=====
+
+from __future__ import annotations
+
+from .models import TradeCandidate
+
+
+def build_trade_candidates(
+    ranked_options,
+    *,
+    stocks_by_symbol,
+    directions_by_symbol,
+    stock_rank_by_symbol,
+    option_rank_by_symbol,
+) -> list[TradeCandidate]:
+    """Turn globally-ranked OptionCandidate objects into portfolio-ready trades."""
+    result: list[TradeCandidate] = []
+    for option in ranked_options:
+        matches = [
+            symbol
+            for symbol in stocks_by_symbol
+            if option.symbol.startswith(symbol.upper())
+        ]
+        if not matches:
+            continue
+        stock_symbol = max(matches, key=len)
+        stock = stocks_by_symbol[stock_symbol]
+        direction = directions_by_symbol[stock_symbol]
+        result.append(
+            TradeCandidate.from_ranked_option(
+                option=option,
+                stock=stock,
+                direction=direction,
+                stock_llm_rank=stock_rank_by_symbol.get(stock_symbol, 0),
+                option_llm_rank=option_rank_by_symbol.get(option.symbol, 0),
+            )
+        )
+    return result
+
+
+=====
+# FILE: execution/validator.py
+=====
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from .models import ExecutionIntent, LiveOptionQuote, ValidationResult
+from .policy import ExecutionPolicy
+
+
+def _quote_from_any(symbol: str, raw) -> LiveOptionQuote:
+    if isinstance(raw, LiveOptionQuote):
+        return raw
+    if hasattr(raw, "bid_price") and hasattr(raw, "ask_price"):
+        bid = getattr(raw, "bid_price", 0.0) or 0.0
+        ask = getattr(raw, "ask_price", 0.0) or 0.0
+        ts = getattr(raw, "timestamp", None)
+        sym = getattr(raw, "symbol", symbol) or symbol
+        return LiveOptionQuote(
+            symbol=str(sym),
+            bid=float(bid),
+            ask=float(ask),
+            timestamp=ts if isinstance(ts, datetime) else None,
+            source="alpaca-api",
+        )
+    if isinstance(raw, dict):
+        data = raw
+        direct_bid = data.get("bid_price", data.get("bid", data.get("b")))
+        direct_ask = data.get("ask_price", data.get("ask", data.get("a")))
+        if direct_bid is None and direct_ask is None:
+            nested = data.get(symbol)
+            if isinstance(nested, dict):
+                data = nested
+            elif hasattr(nested, "bid_price"):
+                return _quote_from_any(symbol, nested)
+            elif isinstance(data.get("data"), dict):
+                nested = data["data"].get(symbol)
+                if isinstance(nested, dict):
+                    data = nested
+                elif hasattr(nested, "bid_price"):
+                    return _quote_from_any(symbol, nested)
+        bid = data.get("bid_price", data.get("bid", data.get("b", 0)))
+        ask = data.get("ask_price", data.get("ask", data.get("a", 0)))
+        ts = data.get("timestamp") or data.get("t") or data.get("updated_at")
+        parsed_ts = None
+        if ts:
+            if isinstance(ts, datetime):
+                parsed_ts = ts
+            else:
+                try:
+                    parsed_ts = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                except ValueError:
+                    parsed_ts = None
+        return LiveOptionQuote(
+            symbol=symbol,
+            bid=float(bid or 0),
+            ask=float(ask or 0),
+            timestamp=parsed_ts,
+            source="alpaca-api",
+        )
+    elif isinstance(raw, list) and raw:
+        return _quote_from_any(symbol, raw[0])
+    return LiveOptionQuote(symbol=symbol, bid=0.0, ask=0.0, source="alpaca-api")
+
+
+def validate_intent(
+    intent: ExecutionIntent,
+    *,
+    live_quote_raw,
+    contract_raw,
+    account_raw=None,
+    positions: list | None = None,
+    open_orders: list | None = None,
+    now: datetime | None = None,
+    policy: ExecutionPolicy,
+) -> ValidationResult:
+    now = now or datetime.now(timezone.utc)
+    quote = _quote_from_any(intent.option_symbol, live_quote_raw)
+    reasons: list[str] = []
+
+    if intent.order_intent.value != "BUY_TO_OPEN":
+        reasons.append("unsupported order intent")
+    if intent.contracts <= 0:
+        reasons.append("contracts must be positive")
+    if intent.authorized_max_loss <= 0:
+        reasons.append("authorized max loss must be positive")
+    if intent.expiration is None:
+        reasons.append("missing expiration")
+    elif intent.expiration <= now.date():
+        reasons.append("option expiration is not in the future")
+
+    age = now - intent.created_at
+    if age.total_seconds() < 0:
+        reasons.append("execution intent timestamp is in the future")
+    elif age > policy.max_intent_age:
+        reasons.append(f"execution intent is stale ({age.total_seconds():.0f}s > {policy.max_intent_age.total_seconds():.0f}s)")
+
+    if quote.symbol != intent.option_symbol:
+        reasons.append("live quote symbol does not match execution intent")
+    if quote.bid <= 0 or quote.ask <= 0:
+        reasons.append("invalid live option quote")
+    elif quote.ask < quote.bid:
+        reasons.append("live option ask is below bid")
+    else:
+        absolute_spread = quote.ask - quote.bid
+        if quote.spread_pct > policy.max_spread_pct and absolute_spread > policy.cheap_contract_absolute_spread + 1e-9:
+            reasons.append(f"live spread {quote.spread_pct:.1%} exceeds {policy.max_spread_pct:.1%}")
+        if intent.reference_entry_price > 0:
+            move = (quote.ask - intent.reference_entry_price) / intent.reference_entry_price
+            if move > policy.max_reference_price_move_pct:
+                reasons.append(f"live ask moved {move:.1%} above reference (limit: {policy.max_reference_price_move_pct:.0%})")
+            if move < -policy.max_reference_price_drop_pct:
+                reasons.append(f"live ask dropped {abs(move):.1%} below reference (limit: {policy.max_reference_price_drop_pct:.0%})")
+
+    # Contract validation is deliberately defensive and tolerates SDK objects and raw dicts.
+    if contract_raw is not None:
+        tradable = getattr(contract_raw, "tradable", None) if hasattr(contract_raw, "tradable") else (contract_raw.get("tradable") if isinstance(contract_raw, dict) else None)
+        if tradable is False:
+            reasons.append("option contract is not tradable")
+        c_symbol = getattr(contract_raw, "symbol", None) if hasattr(contract_raw, "symbol") else (contract_raw.get("symbol") or contract_raw.get("id") if isinstance(contract_raw, dict) else None)
+        if c_symbol and str(c_symbol) != intent.option_symbol:
+            reasons.append("option contract identity mismatch")
+        expiration = getattr(contract_raw, "expiration_date", None) if hasattr(contract_raw, "expiration_date") else (contract_raw.get("expiration_date") or contract_raw.get("expiration") if isinstance(contract_raw, dict) else None)
+        if expiration:
+            exp_str = expiration.isoformat() if hasattr(expiration, "isoformat") else str(expiration)[:10]
+            if exp_str != intent.expiration.isoformat():
+                reasons.append("option contract expiration mismatch")
+
+    if positions and not policy.allow_existing_position:
+        for p in positions:
+            p_symbol = getattr(p, "symbol", None) if hasattr(p, "symbol") else (p.get("symbol") if isinstance(p, dict) else None)
+            if p_symbol == intent.option_symbol:
+                reasons.append("existing position already held for option")
+                break
+
+    if open_orders and not policy.allow_existing_open_order:
+        for o in open_orders:
+            o_symbol = getattr(o, "symbol", None) if hasattr(o, "symbol") else (o.get("symbol") if isinstance(o, dict) else None)
+            if o_symbol == intent.option_symbol:
+                reasons.append("existing open order already exists for option")
+                break
+
+    return ValidationResult(approved=not reasons, reasons=tuple(reasons), live_quote=quote)
+
+
 =====
 # FILE: main.py
 =====
+
+import time
+
 from alpaca_client.client import get_trading_client
 from alpaca_client.options import get_option_chain
 from alpaca_client.stocks import (
@@ -1735,120 +3531,460 @@ from strategy.research_agent import (
 )
 from strategy.llm_ranker import rank_stocks
 from strategy.option_ranker import rank_option_pool
-from config import STOCK_SCANNER_TOP_N, LLM_STOCK_TOP_K
-def main() -> None:
+from strategy.portfolio import build_portfolio, print_portfolio_plan
+from risk.risk import assess_portfolio, print_risk_report
+from execution.alpaca_broker import AlpacaBroker
+from execution.confirmation import parse_execution_args
+from execution.position_manager import (
+    cancel_stale_orders,
+    entry_window_status,
+    manage_open_positions,
+    seconds_until_close,
+    verify_fills,
+)
+from execution.stage import run_execution_stage
+from execution.trade_factory import build_trade_candidates
+from strategy.earnings import filter_earnings_risk
+from strategy.exits import in_flatten_window, market_now
+from strategy.universe import UNIVERSE
+from config import (
+    STOCK_SCANNER_TOP_N,
+    LLM_STOCK_TOP_K,
+    MAX_OPTIONS_PER_STOCK,
+    MAX_DTE,
+    MAX_POSITIONS,
+    NO_TRADE_MINUTES_AFTER_OPEN,
+    NO_TRADE_MINUTES_BEFORE_CLOSE,
+    OPTION_LLM_TOP_K,
+)
+from strategy import state as position_state
+
+# Give marketable limits a moment to fill before deciding they have not.
+FILL_CHECK_DELAY_SECONDS = 20
+
+# ---------------------------------------------------------------------------
+# Loop cadence
+# ---------------------------------------------------------------------------
+
+# Exits are cheap (no LLM, ~2 API calls) and this is where P&L is decided, so
+# they run often. Short-dated contracts move fast enough that a long gap between
+# marks is a real cost.
+EXIT_INTERVAL_SECONDS = 300           # 5 minutes
+
+# Entries are expensive (research + two model calls) and, crucially, the scanner
+# reads COMPLETED daily bars - its ranking cannot change during a session. Running
+# the entry pipeline more often just re-ranks identical inputs. It is retried
+# sooner only when an exit frees a slot, which is genuinely new information.
+ENTRY_INTERVAL_MINUTES = 120          # 2 hours
+
+# Transient API errors are expected; a persistent failure is not. Stop rather
+# than hammer the API, and say clearly that positions were left open.
+MAX_CONSECUTIVE_ERRORS = 5
+
+
+def _record_submitted_entries(execution_report) -> None:
+    """Write local state for every submitted entry.
+
+    Recorded optimistically at submission and corrected (or removed) by
+    verify_fills, so a crash between the two leaves a record we can reconcile
+    against the broker rather than an untracked position.
+    """
+    state = position_state.load_state()
+    for result in getattr(execution_report, "results", []):
+        intent = getattr(result, "intent", None)
+        if intent is None or not getattr(result, "order_id", None):
+            continue
+        position_state.record_entry(
+            state,
+            option_symbol=intent.option_symbol,
+            stock_symbol=intent.stock_symbol,
+            direction=intent.direction,
+            entry_price=float(getattr(result, "limit_price", None) or intent.reference_entry_price),
+            contracts=int(getattr(result, "submitted_qty", 0) or intent.contracts),
+            trade_score=float(intent.trade_score),
+        )
+    position_state.save_state(state)
+
+
+
+def run_entry_cycle(
+    broker,
+    *,
+    account_id: str,
+    account_equity: float,
+    open_slots: int,
+    held_underlyings: set,
+    confirmed: bool,
+) -> bool:
+    """Scan -> research -> rank -> select -> size -> risk -> execute.
+
+    Every bail-out path returns early and says why. A cycle that opens nothing is
+    a normal outcome, not a failure.
+    """
+    print(f"\nScanning {len(UNIVERSE)}-stock universe...")
+    top_candidates = print_top_scanned_stocks(top_n=STOCK_SCANNER_TOP_N)
+    if not top_candidates:
+        print("No scanner candidates.")
+        return
+
+    research_reports = research_stocks(top_candidates)
+    print_research_reports(research_reports)
+    research = research_text_by_symbol(research_reports)
+
+    # Earnings veto BEFORE the ranker. A model asked to weigh a catalyst will
+    # sometimes weigh a binary event positively; deterministic code cannot.
+    # Vetoing here also means no tokens are spent ranking untradeable names.
+    safe_symbols, earnings_vetoed = filter_earnings_risk(
+        [stock.symbol for stock in top_candidates],
+        research,
+        as_of=market_now().date(),
+        horizon_days=MAX_DTE,
+    )
+    if earnings_vetoed:
+        print("\n" + "=" * 120)
+        print(" EARNINGS VETO")
+        print("=" * 120)
+        for symbol, risk in earnings_vetoed.items():
+            print(f"  {symbol:<6} [{risk.confidence}] {risk.reason}")
+        print("=" * 120)
+
+    top_candidates = [s for s in top_candidates if s.symbol in set(safe_symbols)]
+    if not top_candidates:
+        print("Every scanner candidate carries earnings risk. Refusing to trade.")
+        return
+
+    ranked_symbols = rank_stocks(
+        stocks=top_candidates,
+        research=research,
+        debug=True,
+    )
+    stocks_by_symbol = {stock.symbol: stock for stock in top_candidates}
+    ranked_candidates = [stocks_by_symbol[symbol] for symbol in ranked_symbols]
+
+    print("\n" + "=" * 120)
+    print(" LLM STOCK RANKING")
+    print("=" * 120)
+    for llm_rank, symbol in enumerate(ranked_symbols, start=1):
+        stock = stocks_by_symbol[symbol]
+        scanner_rank = stock.rank if stock.rank is not None else "-"
+        print(
+            f"#{llm_rank:<2} {symbol:<6} Scanner=#{scanner_rank:<3} "
+            f"ScannerScore={stock.score:>5.1f}"
+        )
+
+    ranked_candidates = [s for s in ranked_candidates if s.symbol not in held_underlyings]
+    if not ranked_candidates:
+        print("Every ranked candidate is already held. No new entries.")
+        return
+
+    selected_stocks = ranked_candidates[:LLM_STOCK_TOP_K]
+    print("\nLLM-RANKED STOCKS")
+    for rank, stock in enumerate(selected_stocks, start=1):
+        print(
+            f"#{rank:<2} {stock.symbol:<6} Scanner=#{stock.rank:<2} "
+            f"ScannerScore={stock.score:.1f}"
+        )
+
+    latest_prices = get_latest_underlying_prices([stock.symbol for stock in selected_stocks])
+    all_options = []
+    stocks_by_symbol = {}
+    directions_by_symbol = {}
+
+    for stock in selected_stocks:
+        underlying_price = latest_prices.get(stock.symbol)
+        if underlying_price is None or underlying_price <= 0:
+            print(f"Skipping {stock.symbol}: no valid live price.")
+            continue
+        direction = determine_direction(stock)
+        if direction == TradeDirection.NEUTRAL:
+            print(f"Skipping {stock.symbol}: direction is neutral.")
+            continue
+        chain = get_option_chain(stock.symbol)
+        options = select_directional_options(
+            chain=chain,
+            underlying_price=underlying_price,
+            direction=direction.value.lower(),
+            realized_vol=stock.realized_volatility,
+            max_candidates=MAX_OPTIONS_PER_STOCK,
+        )
+        if not options:
+            print(f"Skipping {stock.symbol}: no option candidates survived deterministic filtering.")
+            continue
+        stocks_by_symbol[stock.symbol] = stock
+        directions_by_symbol[stock.symbol] = direction.value
+        all_options.extend(options)
+
+    if not all_options:
+        print("No option candidates survived deterministic filtering.")
+        return
+
+    ranked_option_symbols = rank_option_pool(
+        options=all_options,
+        stocks=stocks_by_symbol,
+        directions=directions_by_symbol,
+        research=research,
+        top_k=OPTION_LLM_TOP_K,
+        debug=True,
+    )
+    options_by_symbol = {option.symbol: option for option in all_options}
+    selected_options = [options_by_symbol[symbol] for symbol in ranked_option_symbols]
+
+    print("\n" + "=" * 120)
+    print(" TOP RANKED OPTIONS (GLOBAL)")
+    print("=" * 120)
+    for rank, option in enumerate(selected_options, start=1):
+        print(
+            f"#{rank:<2} {option.symbol:<24} "
+            f"Type={option.option_type.upper():<4} Strike=${option.strike:<7.2f} "
+            f"DTE={option.dte:<3} Mid=${option.mid:<6.2f} "
+            f"Spread={option.spread_pct:<6.1%} "
+            f"Delta={option.delta if option.delta is not None else 0.0:+.3f} "
+            f"Score={option.score:>5.1f}"
+        )
+
+    stock_rank_by_symbol = {stock.symbol: rank for rank, stock in enumerate(selected_stocks, start=1)}
+    option_rank_by_symbol = {symbol: rank for rank, symbol in enumerate(ranked_option_symbols, start=1)}
+
+    trade_candidates = build_trade_candidates(
+        selected_options,
+        stocks_by_symbol=stocks_by_symbol,
+        directions_by_symbol=directions_by_symbol,
+        stock_rank_by_symbol=stock_rank_by_symbol,
+        option_rank_by_symbol=option_rank_by_symbol,
+    )
+
+    # ------------------------------------------------------------------
+    # PHASE 3 - size, risk-check and execute.
+    #
+    # Size against the slots actually free, not the global cap: positions we
+    # already hold are consuming both risk budget and position count.
+    # ------------------------------------------------------------------
+    positions = build_portfolio(
+        trades=trade_candidates,
+        account_equity=account_equity,
+        max_positions=open_slots,
+    )
+    print_portfolio_plan(positions, account_equity)
+
+    risk_report = assess_portfolio(
+        positions=positions,
+        account_equity=account_equity,
+        current_equity=account_equity,
+        peak_equity=account_equity,
+    )
+    print_risk_report(risk_report, account_equity)
+
+    if risk_report.emergency_stop:
+        print("Execution skipped: emergency risk stop is active.")
+        return
+
+    execution_report = run_execution_stage(
+        risk_report.approved_positions,
+        confirmed=confirmed,
+        expected_account_id=account_id,
+    )
+
+    # ------------------------------------------------------------------
+    # PHASE 4 - confirm what actually filled.
+    #
+    # A submitted order is not a position. Without this the agent believes it
+    # holds contracts it never got, and a stale resting limit can fill later
+    # against a quote the model already rejected.
+    # ------------------------------------------------------------------
+    if confirmed and execution_report is not None:
+        _record_submitted_entries(execution_report)
+        print("\n" + "=" * 78)
+        print(" FILL VERIFICATION")
+        print("=" * 78)
+        time.sleep(FILL_CHECK_DELAY_SECONDS)
+        outcomes = verify_fills(broker, execution_report)
+        filled = sum(1 for _, status, _ in outcomes if status == "FILLED")
+        print(f" {filled} of {len(outcomes)} order(s) filled.")
+        print("=" * 78)
+
+
+
+    return True
+
+
+def run_exit_cycle(broker, *, confirmed: bool):
+    """Cancel stale entry orders, then mark and manage every open position."""
+    cancel_stale_orders(broker, dry_run=not confirmed)
+    return manage_open_positions(broker, dry_run=not confirmed)
+
+
+def _heartbeat(message: str) -> None:
+    print(f"[{market_now().strftime('%H:%M:%S ET')}] {message}", flush=True)
+
+
+def run_loop(args) -> None:
+    """Run the agent across a single trading session.
+
+    Two cadences, deliberately different:
+
+      * EXITS every EXIT_INTERVAL_SECONDS. Deterministic, no LLM, ~2 API calls.
+        This is where P&L is actually made or lost, and short-dated contracts
+        move fast enough that a long gap is a real cost.
+
+      * ENTRIES at most every ENTRY_INTERVAL_MINUTES, and only when a slot is
+        free. The scanner reads COMPLETED daily bars, so its ranking cannot
+        change during a session - re-running it more often re-ranks identical
+        inputs and burns model budget for nothing. Entries are retried sooner
+        when an exit frees a slot, because that is genuinely new information.
+
+    No exception from a single cycle is allowed to end the session.
+    """
     trading_client = get_trading_client()
     account = trading_client.get_account()
+    account_id = str(account.id)
+
     print("=== Connected to Alpaca (Paper Trading) ===")
-    print(f"Account ID:     {account.id}")
+    print(f"Account ID:     {account_id}")
     print(f"Equity:         ${float(account.equity):,.2f}")
     print(f"Buying power:   ${float(account.buying_power):,.2f}")
     print(f"Options level:  {account.options_trading_level} (approved: {account.options_approved_level})")
-    # 1. Scan 50-stock universe and display top 15 ranked candidates
-    print("\nScanning 50-stock universe...")
-    top_candidates = print_top_scanned_stocks(
-        top_n=STOCK_SCANNER_TOP_N
-    )
-    if top_candidates:
-        # Research all scanner-selected stocks.
-        research_reports = research_stocks(top_candidates)
-        print_research_reports(research_reports)
-        research = research_text_by_symbol(research_reports)
-        # LLM ranks stocks comparatively.
-        ranked_symbols = rank_stocks(
-            stocks=top_candidates,
-            research=research,
-            debug=True,
-        )
-        # Restore ScannedStock objects in LLM order.
-        stocks_by_symbol = {
-            stock.symbol: stock
-            for stock in top_candidates
-        }
-        ranked_candidates = [
-            stocks_by_symbol[symbol]
-            for symbol in ranked_symbols
-        ]
-        print("\n" + "=" * 120)
-        print(" LLM STOCK RANKING")
-        print("=" * 120)
-        for llm_rank, symbol in enumerate(ranked_symbols, start=1):
-            stock = stocks_by_symbol[symbol]
-            scanner_rank = stock.rank if stock.rank is not None else "-"
-            print(
-                f"#{llm_rank:<2} "
-                f"{symbol:<6} "
-                f"Scanner=#{scanner_rank:<3} "
-                f"ScannerScore={stock.score:>5.1f}"
+    mode = "LIVE PAPER EXECUTION" if args.confirm_paper_trades else "DRY RUN (no orders will be sent)"
+    print(f"Mode:           {mode}")
+    print(f"Cadence:        exits every {EXIT_INTERVAL_SECONDS // 60} min | "
+          f"entries at most every {ENTRY_INTERVAL_MINUTES} min")
+    print("Press Ctrl+C to stop. Positions are LEFT OPEN on stop.")
+
+    broker = AlpacaBroker()
+    last_entry_at = None
+    previous_slots = None
+    consecutive_errors = 0
+
+    while True:
+        try:
+            now = market_now()
+
+            if in_flatten_window(now):
+                _heartbeat("Flatten window reached - closing everything and stopping.")
+                run_exit_cycle(broker, confirmed=args.confirm_paper_trades)
+                _heartbeat("Flatten complete. Session over.")
+                return
+
+            remaining = seconds_until_close(broker)
+            if remaining is not None and remaining <= 0:
+                _heartbeat("Market is closed. Session over.")
+                return
+
+            # ---- exits: every cycle, unconditionally ----
+            position_report = run_exit_cycle(broker, confirmed=args.confirm_paper_trades)
+            equity = float(broker.get_account().equity)
+            open_slots = max(0, MAX_POSITIONS - position_report.held_count)
+
+            _heartbeat(
+                f"equity ${equity:,.2f} | held {position_report.held_count} "
+                f"| closed {len(position_report.closed)} | free slots {open_slots}"
             )
-        # Only send LLM top-K into option selection.
-        selected_stocks = ranked_candidates[:LLM_STOCK_TOP_K]
-        print("\nLLM-RANKED STOCKS")
-        for rank, stock in enumerate(selected_stocks, start=1):
-            print(
-                f"#{rank:<2} {stock.symbol:<6} "
-                f"Scanner=#{stock.rank:<2} "
-                f"ScannerScore={stock.score:.1f}"
+
+            # ---- entries: scheduled, and only when there is room ----
+            slots_freed = previous_slots is not None and open_slots > previous_slots
+            minutes_since_entry = (
+                None if last_entry_at is None
+                else (now - last_entry_at).total_seconds() / 60.0
             )
-        latest_prices = get_latest_underlying_prices(
-            [stock.symbol for stock in selected_stocks]
-        )
-        all_options = []
-        stocks_by_symbol = {}
-        directions_by_symbol = {}
-        for stock in selected_stocks:
-            underlying_price = latest_prices.get(stock.symbol)
-            if underlying_price is None or underlying_price <= 0:
-                print(f"Skipping {stock.symbol}: no valid live price.")
-                continue
-            direction = determine_direction(stock)
-            if direction == TradeDirection.NEUTRAL:
-                continue
-            chain = get_option_chain(stock.symbol)
-            options = select_directional_options(
-                chain=chain,
-                underlying_price=underlying_price,
-                direction=direction.value.lower(),
+            due = (
+                last_entry_at is None
+                or slots_freed
+                or (minutes_since_entry is not None and minutes_since_entry >= ENTRY_INTERVAL_MINUTES)
             )
-            if not options:
-                continue
-            stocks_by_symbol[stock.symbol] = stock
-            directions_by_symbol[stock.symbol] = direction.value
-            all_options.extend(options)
-        if not all_options:
-            print("No option candidates survived deterministic filtering.")
+            window_open, window_reason = entry_window_status(broker, now)
+
+            if open_slots <= 0:
+                pass
+            elif not window_open:
+                _heartbeat(f"entries held: {window_reason}")
+            elif not due:
+                pass
+            else:
+                held_underlyings = {
+                    p.stock_symbol for p in position_report.positions
+                    if not p.decision.should_close
+                }
+                _heartbeat(f"running entry cycle ({open_slots} slot(s) free)")
+                try:
+                    run_entry_cycle(
+                        broker,
+                        account_id=account_id,
+                        account_equity=equity,
+                        open_slots=open_slots,
+                        held_underlyings=held_underlyings,
+                        confirmed=args.confirm_paper_trades,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"Entry cycle failed ({type(exc).__name__}: {exc}). "
+                          "Exits continue on schedule.")
+                last_entry_at = now
+
+            previous_slots = open_slots
+            consecutive_errors = 0
+
+        except KeyboardInterrupt:
+            print("\nInterrupted. Open positions are LEFT OPEN and unmanaged - "
+                  "re-run to resume management, or flatten from the dashboard.")
             return
-        ranked_option_symbols = rank_option_pool(
-            options=all_options,
-            stocks=stocks_by_symbol,
-            directions=directions_by_symbol,
-            research=research,
-            debug=True,
-        )
-        TOP_OPTIONS = 5
-        ranked_option_symbols = ranked_option_symbols[:TOP_OPTIONS]
-        options_by_symbol = {
-            option.symbol: option
-            for option in all_options
-        }
-        selected_options = [
-            options_by_symbol[symbol]
-            for symbol in ranked_option_symbols
-        ]
-        print("\n" + "=" * 120)
-        print(" TOP RANKED OPTIONS (GLOBAL)")
-        print("=" * 120)
-        for rank, option in enumerate(selected_options, start=1):
-            print(
-                f"#{rank:<2} "
-                f"{option.symbol:<24} "
-                f"Type={option.option_type.upper():<4} "
-                f"Strike=${option.strike:<7.2f} "
-                f"DTE={option.dte:<3} "
-                f"Mid=${option.mid:<6.2f} "
-                f"Spread={option.spread_pct:<6.1%} "
-                f"Delta={option.delta if option.delta is not None else 0.0:+.3f} "
-                f"Score={option.score:>5.1f}"
-            )
+        except Exception as exc:  # noqa: BLE001
+            consecutive_errors += 1
+            print(f"Cycle error #{consecutive_errors} ({type(exc).__name__}: {exc})")
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                print(f"Aborting after {MAX_CONSECUTIVE_ERRORS} consecutive failures. "
+                      "Positions are left open - check the dashboard.")
+                return
+
+        try:
+            time.sleep(EXIT_INTERVAL_SECONDS)
+        except KeyboardInterrupt:
+            print("\nInterrupted between cycles. Open positions are LEFT OPEN.")
+            return
+
+
+def run_single_cycle(args) -> None:
+    """One exit pass plus, if a slot is free, one entry pass. Then stop."""
+    trading_client = get_trading_client()
+    account = trading_client.get_account()
+    broker = AlpacaBroker()
+
+    position_report = run_exit_cycle(broker, confirmed=args.confirm_paper_trades)
+    open_slots = max(0, MAX_POSITIONS - position_report.held_count)
+    print(f"\nOpen positions: {position_report.open_count} "
+          f"(closing {len(position_report.closed)}) | free slots: {open_slots}")
+
+    if in_flatten_window():
+        print("Flatten window is active. No new positions will be opened.")
+        return
+    if open_slots <= 0:
+        print("All position slots are full. No new entries this cycle.")
+        return
+
+    window_open, reason = entry_window_status(broker)
+    if not window_open:
+        print(f"Entry stage skipped: {reason}")
+        return
+
+    run_entry_cycle(
+        broker,
+        account_id=str(account.id),
+        account_equity=float(account.equity),
+        open_slots=open_slots,
+        held_underlyings={
+            p.stock_symbol for p in position_report.positions
+            if not p.decision.should_close
+        },
+        confirmed=args.confirm_paper_trades,
+    )
+
+
+def main() -> None:
+    args = parse_execution_args()
+    if getattr(args, "once", False):
+        run_single_cycle(args)
+    else:
+        run_loop(args)
+
+
 if __name__ == "__main__":
     main()
+
+

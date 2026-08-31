@@ -57,59 +57,52 @@ def _per_contract_risk(trade) -> float:
     return entry_price * 100.0
 
 
-def _trade_weight(trade) -> float:
+def _trade_weight(
+    trade: object,
+    rank_index: int = 0,
+    total_candidates: int = 1,
+) -> float:
     """
-    Convert trade quality into an allocation weight.
+    Convert trade priority into an allocation weight.
 
-    Higher-scoring trades receive disproportionately more
-    risk budget, rather than everything being allocated equally.
+    Higher-ranked trades receive higher risk allocation weight.
     """
+    if total_candidates <= 1:
+        return 1.0
 
-    # Start with score above our minimum acceptable threshold.
-    excess_score = max(
-        0.0,
-        trade.trade_score - MIN_TRADE_SCORE,
-    )
-
-    if excess_score <= 0:
-        return 0.0
-
-    # Square the advantage so materially better trades receive
-    # noticeably more capital.
-    return excess_score ** 2
+    # Rank-based decay weight: rank #1 gets the highest weight
+    return float(max(1, total_candidates - rank_index) ** 1.5)
 
 
 def select_best_trade_per_stock(
     trades: List[object],
 ) -> List[object]:
     """
-    Only keep the best complete trade for each underlying.
+    Only keep the highest-priority trade for each underlying.
 
-    This prevents the portfolio from accidentally holding:
-        MSTR 130C
-        MSTR 128C
-        MSTR 129C
-        ...
-
-    and treating them as independent opportunities.
+    Preserves incoming LLM rank order so that the LLM's top choice
+    for each underlying is retained and evaluated first.
     """
+    # If trades have explicit option_llm_rank > 0, ensure sorted by rank
+    has_llm_ranks = any(getattr(t, "option_llm_rank", 0) > 0 for t in trades)
+    if has_llm_ranks:
+        sorted_trades = sorted(
+            trades,
+            key=lambda t: getattr(t, "option_llm_rank", 0) if getattr(t, "option_llm_rank", 0) > 0 else float("inf"),
+        )
+    else:
+        sorted_trades = trades
 
-    best_by_symbol = {}
+    best_trades: List[object] = []
+    seen_symbols = set()
 
-    for trade in trades:
-        existing = best_by_symbol.get(trade.stock_symbol)
+    for trade in sorted_trades:
+        symbol = trade.stock_symbol
+        if symbol not in seen_symbols:
+            seen_symbols.add(symbol)
+            best_trades.append(trade)
 
-        if (
-            existing is None
-            or trade.trade_score > existing.trade_score
-        ):
-            best_by_symbol[trade.stock_symbol] = trade
-
-    return sorted(
-        best_by_symbol.values(),
-        key=lambda t: t.trade_score,
-        reverse=True,
-    )
+    return best_trades
 
 
 def build_portfolio(
@@ -122,20 +115,14 @@ def build_portfolio(
     min_trade_score: float = MIN_TRADE_SCORE,
 ) -> List[PortfolioPosition]:
     """
-    Convert ranked trades into a proposed portfolio.
+    Convert ranked trades into a sized portfolio.
 
     Current instrument assumption:
         long calls / long puts.
 
     The portfolio is allocated by MAXIMUM LOSS, not buying power.
-
-    Example:
-        $100,000 account
-        total_risk = 12%
-        => max planned loss = $12,000
-
-    This is a proposed portfolio. The risk engine gets the
-    final veto before anything can be executed.
+    Priority order is determined upstream by the LLM option ranker;
+    the portfolio layer decides sizing and risk allocation ("how much").
     """
 
     if account_equity <= 0:
@@ -156,23 +143,13 @@ def build_portfolio(
     max_trade_risk = account_equity * max_trade_risk_pct
 
     # ---------------------------------------------------------
-    # 1. Remove weak trades.
+    # 1. One trade per underlying, preserving LLM rank priority.
     # ---------------------------------------------------------
 
-    eligible = [
-        trade
-        for trade in trades
-        if trade.trade_score >= min_trade_score
-    ]
+    eligible = select_best_trade_per_stock(trades)
 
     # ---------------------------------------------------------
-    # 2. One trade per underlying.
-    # ---------------------------------------------------------
-
-    eligible = select_best_trade_per_stock(eligible)
-
-    # ---------------------------------------------------------
-    # 3. Keep only best N underlyings.
+    # 2. Keep only top N underlyings by LLM rank.
     # ---------------------------------------------------------
 
     eligible = eligible[:max_positions]
@@ -181,13 +158,18 @@ def build_portfolio(
         return []
 
     # ---------------------------------------------------------
-    # 4. Calculate relative weights.
+    # 3. Calculate relative weights based on priority.
     # ---------------------------------------------------------
 
     weighted_trades = []
+    total_eligible = len(eligible)
 
-    for trade in eligible:
-        weight = _trade_weight(trade)
+    for rank_idx, trade in enumerate(eligible):
+        weight = _trade_weight(
+            trade,
+            rank_index=rank_idx,
+            total_candidates=total_eligible,
+        )
 
         if weight <= 0:
             continue
@@ -210,7 +192,7 @@ def build_portfolio(
     )
 
     # ---------------------------------------------------------
-    # 5. Convert risk budget into contracts.
+    # 4. Convert risk budget into contracts.
     # ---------------------------------------------------------
 
     positions: List[PortfolioPosition] = []
@@ -249,13 +231,8 @@ def build_portfolio(
         )
 
     # ---------------------------------------------------------
-    # 6. Ensure we never exceed total risk because of rounding.
+    # 5. Ensure total risk never exceeds budget (preserving rank order).
     # ---------------------------------------------------------
-
-    positions.sort(
-        key=lambda p: p.trade.trade_score,
-        reverse=True,
-    )
 
     final_positions: List[PortfolioPosition] = []
     running_risk = 0.0
@@ -316,13 +293,13 @@ def print_portfolio_plan(
         return
 
     print(
-        f"{'Rank':<5}"
+        f"{'Rank':<6}"
         f"{'Ticker':<8}"
         f"{'Direction':<10}"
         f"{'Contracts':>10}"
         f"{'Premium':>13}"
         f"{'Max Loss':>13}"
-        f"{'TradeScore':>12}"
+        f"{'LLM Rank':>10}"
         f"  {'Option':<24}"
     )
 
@@ -333,15 +310,17 @@ def print_portfolio_plan(
 
     for rank, position in enumerate(positions, start=1):
         trade = position.trade
+        llm_rank = getattr(trade, "option_llm_rank", None)
+        llm_rank_str = f"#{llm_rank}" if llm_rank else f"#{rank}"
 
         print(
-            f"{rank:<5}"
+            f"#{rank:<5}"
             f"{trade.stock_symbol:<8}"
             f"{trade.direction:<10}"
             f"{position.contracts:>10}"
             f"${position.premium_deployed:>12,.2f}"
             f"${position.max_loss:>12,.2f}"
-            f"{trade.trade_score:>12.1f}"
+            f"{llm_rank_str:>10}"
             f"  {trade.option_symbol:<24}"
         )
 

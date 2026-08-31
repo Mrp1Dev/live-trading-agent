@@ -16,7 +16,7 @@ load_dotenv()
 
 FEATHERLESS_URL = "https://api.featherless.ai/v1/chat/completions"
 DEFAULT_MODEL_ENV = "FEATHERLESS_MODEL"
-DEFAULT_MAX_TOKENS = 96
+DEFAULT_MAX_TOKENS = 256
 DEFAULT_TEMPERATURE = 0.0
 
 
@@ -199,6 +199,7 @@ Judge each contract using:
 - implied volatility
 - delta, gamma, theta, and vega
 - overall efficiency relative to ALL other contracts in the pool
+- selection diversity: select the best setup for each promising underlying to build a diverse candidate pool across different stocks
 
 Do not simply follow scanner rank or selector score.
 
@@ -211,6 +212,7 @@ AVAILABLE OPTION POOL
 FINAL OUTPUT REQUIREMENTS:
 Return ONLY a JSON array.
 Return exactly {top_k} identifiers.
+Include at most 2 option identifiers from any single stock (include multiple different underlyings).
 Use identifiers like OPT001, OPT002, OPT003.
 Do not return option symbols.
 Do not repeat identifiers.

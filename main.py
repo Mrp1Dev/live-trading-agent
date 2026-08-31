@@ -40,6 +40,8 @@ from config import (
     NO_TRADE_MINUTES_AFTER_OPEN,
     NO_TRADE_MINUTES_BEFORE_CLOSE,
     OPTION_LLM_TOP_K,
+    ENTRY_INTERVAL_MINUTES,
+    EXIT_INTERVAL_SECONDS,
 )
 from strategy import state as position_state
 
@@ -50,16 +52,8 @@ FILL_CHECK_DELAY_SECONDS = 20
 # Loop cadence
 # ---------------------------------------------------------------------------
 
-# Exits are cheap (no LLM, ~2 API calls) and this is where P&L is decided, so
-# they run often. Short-dated contracts move fast enough that a long gap between
-# marks is a real cost.
-EXIT_INTERVAL_SECONDS = 300           # 5 minutes
-
-# Entries are expensive (research + two model calls) and, crucially, the scanner
-# reads COMPLETED daily bars - its ranking cannot change during a session. Running
-# the entry pipeline more often just re-ranks identical inputs. It is retried
-# sooner only when an exit frees a slot, which is genuinely new information.
-ENTRY_INTERVAL_MINUTES = 120          # 2 hours
+# Exits are cheap (no LLM, ~2 API calls) and run often (configured in config.py).
+# Entries run on ENTRY_INTERVAL_MINUTES and immediately whenever an exit frees a slot.
 
 # Transient API errors are expected; a persistent failure is not. Stop rather
 # than hammer the API, and say clearly that positions were left open.
