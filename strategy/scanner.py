@@ -47,10 +47,15 @@ WEIGHT_TREND = 0.10
 # risk dominates. Whether the premium is fairly priced is a different question,
 # and it is answered in one place only - the option selector's IV-vs-realized-vol
 # gate - so the two stages no longer fight over the same signal.
-VOL_BAND_LOW = 0.25       # below this, the name is too quiet to pay for premium
-VOL_BAND_HIGH = 0.55      # above this, premium gets expensive fast
+# Calibrated against a live 249-name scan: with a [0.25, 0.55] band, 14 of the
+# top 20 scored exactly 100 and this factor contributed no discrimination at all,
+# because anything surviving a momentum screen already realizes 25-55% vol. The
+# tighter band separates the field again and prices blow-off names (MSTR at 82%,
+# CRM at 79%) well below merely-active ones.
+VOL_BAND_LOW = 0.30       # below this, the name is too quiet to pay for premium
+VOL_BAND_HIGH = 0.45      # above this, premium gets expensive fast
 VOL_FLOOR = 0.10          # scores 0
-VOL_CEILING = 1.20        # scores 0
+VOL_CEILING = 0.90        # scores 0
 
 MIN_BARS_REQUIRED = 21
 

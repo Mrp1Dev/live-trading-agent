@@ -1,3 +1,5 @@
+import time
+
 from alpaca_client.client import get_trading_client
 from alpaca_client.options import get_option_chain
 from alpaca_client.stocks import (
@@ -15,16 +17,56 @@ from strategy.llm_ranker import rank_stocks
 from strategy.option_ranker import rank_option_pool
 from strategy.portfolio import build_portfolio, print_portfolio_plan
 from risk.risk import assess_portfolio, print_risk_report
+from execution.alpaca_broker import AlpacaBroker
 from execution.confirmation import parse_execution_args
+from execution.position_manager import (
+    entry_window_status,
+    manage_open_positions,
+    verify_fills,
+)
 from execution.stage import run_execution_stage
 from execution.trade_factory import build_trade_candidates
+from strategy.earnings import filter_earnings_risk
+from strategy.exits import in_flatten_window, market_now
 from strategy.universe import UNIVERSE
 from config import (
     STOCK_SCANNER_TOP_N,
     LLM_STOCK_TOP_K,
     MAX_OPTIONS_PER_STOCK,
+    MAX_DTE,
+    MAX_POSITIONS,
+    NO_TRADE_MINUTES_AFTER_OPEN,
+    NO_TRADE_MINUTES_BEFORE_CLOSE,
     OPTION_LLM_TOP_K,
 )
+from strategy import state as position_state
+
+# Give marketable limits a moment to fill before deciding they have not.
+FILL_CHECK_DELAY_SECONDS = 20
+
+
+def _record_submitted_entries(execution_report) -> None:
+    """Write local state for every submitted entry.
+
+    Recorded optimistically at submission and corrected (or removed) by
+    verify_fills, so a crash between the two leaves a record we can reconcile
+    against the broker rather than an untracked position.
+    """
+    state = position_state.load_state()
+    for result in getattr(execution_report, "results", []):
+        intent = getattr(result, "intent", None)
+        if intent is None or not getattr(result, "order_id", None):
+            continue
+        position_state.record_entry(
+            state,
+            option_symbol=intent.option_symbol,
+            stock_symbol=intent.stock_symbol,
+            direction=intent.direction,
+            entry_price=float(getattr(result, "limit_price", None) or intent.reference_entry_price),
+            contracts=int(getattr(result, "submitted_qty", 0) or intent.contracts),
+            trade_score=float(intent.trade_score),
+        )
+    position_state.save_state(state)
 
 
 def main() -> None:
@@ -40,6 +82,46 @@ def main() -> None:
     print(f"Buying power:   ${float(account.buying_power):,.2f}")
     print(f"Options level:  {account.options_trading_level} (approved: {account.options_approved_level})")
 
+    # ------------------------------------------------------------------
+    # PHASE 1 - manage what we already hold.
+    #
+    # Exits run before entries: they free risk budget, and a position the exit
+    # engine wants gone should not compete for capital with a new idea in the
+    # same cycle.
+    # ------------------------------------------------------------------
+    broker = AlpacaBroker()
+    position_report = manage_open_positions(
+        broker,
+        dry_run=not args.confirm_paper_trades,
+    )
+
+    open_slots = MAX_POSITIONS - position_report.held_count
+    print(
+        f"\nOpen positions: {position_report.open_count} "
+        f"(closing {len(position_report.closed)}) | free slots: {max(0, open_slots)}"
+    )
+
+    if in_flatten_window():
+        print("Flatten window is active. No new positions will be opened.")
+        return
+
+    window_open, window_reason = entry_window_status(broker)
+    if not window_open:
+        print(f"Entry stage skipped: {window_reason}")
+        return
+
+    if open_slots <= 0:
+        print("All position slots are full. No new entries this cycle.")
+        return
+
+    held_underlyings = {
+        p.stock_symbol for p in position_report.positions
+        if not p.decision.should_close
+    }
+
+    # ------------------------------------------------------------------
+    # PHASE 2 - find new candidates.
+    # ------------------------------------------------------------------
     print(f"\nScanning {len(UNIVERSE)}-stock universe...")
     top_candidates = print_top_scanned_stocks(top_n=STOCK_SCANNER_TOP_N)
     if not top_candidates:
@@ -49,6 +131,28 @@ def main() -> None:
     research_reports = research_stocks(top_candidates)
     print_research_reports(research_reports)
     research = research_text_by_symbol(research_reports)
+
+    # Earnings veto BEFORE the ranker. A model asked to weigh a catalyst will
+    # sometimes weigh a binary event positively; deterministic code cannot.
+    # Vetoing here also means no tokens are spent ranking untradeable names.
+    safe_symbols, earnings_vetoed = filter_earnings_risk(
+        [stock.symbol for stock in top_candidates],
+        research,
+        as_of=market_now().date(),
+        horizon_days=MAX_DTE,
+    )
+    if earnings_vetoed:
+        print("\n" + "=" * 120)
+        print(" EARNINGS VETO")
+        print("=" * 120)
+        for symbol, risk in earnings_vetoed.items():
+            print(f"  {symbol:<6} [{risk.confidence}] {risk.reason}")
+        print("=" * 120)
+
+    top_candidates = [s for s in top_candidates if s.symbol in set(safe_symbols)]
+    if not top_candidates:
+        print("Every scanner candidate carries earnings risk. Refusing to trade.")
+        return
 
     ranked_symbols = rank_stocks(
         stocks=top_candidates,
@@ -68,6 +172,11 @@ def main() -> None:
             f"#{llm_rank:<2} {symbol:<6} Scanner=#{scanner_rank:<3} "
             f"ScannerScore={stock.score:>5.1f}"
         )
+
+    ranked_candidates = [s for s in ranked_candidates if s.symbol not in held_underlyings]
+    if not ranked_candidates:
+        print("Every ranked candidate is already held. No new entries.")
+        return
 
     selected_stocks = ranked_candidates[:LLM_STOCK_TOP_K]
     print("\nLLM-RANKED STOCKS")
@@ -145,9 +254,16 @@ def main() -> None:
         option_rank_by_symbol=option_rank_by_symbol,
     )
 
+    # ------------------------------------------------------------------
+    # PHASE 3 - size, risk-check and execute.
+    #
+    # Size against the slots actually free, not the global cap: positions we
+    # already hold are consuming both risk budget and position count.
+    # ------------------------------------------------------------------
     positions = build_portfolio(
         trades=trade_candidates,
         account_equity=account_equity,
+        max_positions=open_slots,
     )
     print_portfolio_plan(positions, account_equity)
 
@@ -163,11 +279,29 @@ def main() -> None:
         print("Execution skipped: emergency risk stop is active.")
         return
 
-    run_execution_stage(
+    execution_report = run_execution_stage(
         risk_report.approved_positions,
         confirmed=args.confirm_paper_trades,
         expected_account_id=str(account.id),
     )
+
+    # ------------------------------------------------------------------
+    # PHASE 4 - confirm what actually filled.
+    #
+    # A submitted order is not a position. Without this the agent believes it
+    # holds contracts it never got, and a stale resting limit can fill later
+    # against a quote the model already rejected.
+    # ------------------------------------------------------------------
+    if args.confirm_paper_trades and execution_report is not None:
+        _record_submitted_entries(execution_report)
+        print("\n" + "=" * 78)
+        print(" FILL VERIFICATION")
+        print("=" * 78)
+        time.sleep(FILL_CHECK_DELAY_SECONDS)
+        outcomes = verify_fills(broker, execution_report)
+        filled = sum(1 for _, status, _ in outcomes if status == "FILLED")
+        print(f" {filled} of {len(outcomes)} order(s) filled.")
+        print("=" * 78)
 
 
 if __name__ == "__main__":

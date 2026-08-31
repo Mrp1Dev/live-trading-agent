@@ -313,11 +313,16 @@ def rank_option_pool(
 
     top_k = min(top_k, len(options))
 
-    shuffled_options = list(options)
-    random.SystemRandom().shuffle(shuffled_options)
+    # The pool is shuffled so the model cannot infer importance from presentation
+    # order. CRITICAL: the OPTxxx identifiers are assigned over this shuffled
+    # list, so the response MUST be decoded against the same list. Decoding
+    # against `options` silently maps every identifier to the wrong contract and
+    # turns this whole stage into a random permutation.
+    presented_options = list(options)
+    random.SystemRandom().shuffle(presented_options)
 
     prompt = build_option_pool_prompt(
-        options=shuffled_options,
+        options=presented_options,
         stocks=stocks,
         directions=directions,
         research=research,
@@ -406,13 +411,14 @@ def rank_option_pool(
 
     validated_ids = _validate_top_k_ranking(
         ranked_ids=ranked_ids,
-        options=options,
+        options=presented_options,
         top_k=top_k,
     )
 
+    # Decoded against the SAME list the identifiers were minted from.
     option_by_id = {
         f"OPT{index:03d}": option
-        for index, option in enumerate(options, start=1)
+        for index, option in enumerate(presented_options, start=1)
     }
 
     return [

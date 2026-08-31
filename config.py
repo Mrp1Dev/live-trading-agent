@@ -39,8 +39,45 @@ MIN_OPTION_ABS_DELTA = 0.15
 MAX_OPTION_ABS_DELTA = 0.90
 MIN_OPTION_PREMIUM = 0.25
 
-# For this hackathon, avoid contracts that expire on or before
-# the last official portfolio valuation date.
+# Avoid contracts that expire on or before the official valuation.
 #
-# Official EOD valuation is September 3, 2026.
-LATEST_FORBIDDEN_EXPIRATION = date(2026, 9, 3)
+# Submissions close 4 Sep 2026, 8:30 PM IST, which is ~11:00 AM ET on the 4th.
+# A contract expiring ON the 4th is a near-zero-DTE coin flip at the exact moment
+# judges snapshot the account, so the 4th is forbidden too - not just the 3rd.
+LATEST_FORBIDDEN_EXPIRATION = date(2026, 9, 4)
+
+# ============================================================
+# EXITS
+#
+# Breakeven win rate = |stop| / (avg_win + |stop|). A flat +60% target against a
+# -55% stop needs a 47.8% win rate, which short-dated directional options do not
+# achieve. So the fixed target sits far out and rarely fires; the TRAILING stop
+# is the real profit taker.
+# ============================================================
+
+TAKE_PROFIT_PCT = 1.20        # +120%: deliberately far out
+STOP_LOSS_PCT = -0.55         # -55%
+TRAIL_ARM_PCT = 0.30          # trailing engages once the position has run +30%
+TRAIL_GIVEBACK_PCT = 0.35     # then give back at most 35% of the peak
+MAX_HOLD_DAYS = 2.5           # time stop; tracks PLANNED_HOLD_DAYS in the selector
+MIN_EXIT_DTE = 1              # force out at 1 DTE rather than hold into expiry
+
+# Hard flatten before the valuation snapshot.
+FLATTEN_DATE = date(2026, 9, 4)
+FLATTEN_AFTER_HOUR_ET = 9
+FLATTEN_AFTER_MINUTE_ET = 45
+
+STATE_FILE = "state/positions.json"
+
+# ============================================================
+# EXECUTION WINDOWS
+# ============================================================
+
+# Spreads are widest at the open and into the close, which is exactly when a
+# marketable limit costs the most. Do not open new risk in those windows.
+NO_TRADE_MINUTES_AFTER_OPEN = 10
+NO_TRADE_MINUTES_BEFORE_CLOSE = 10
+
+# A resting entry limit that has not filled is stale information; cancel it
+# rather than let it fill against a quote we would no longer accept.
+ENTRY_ORDER_TIMEOUT_SECONDS = 180
