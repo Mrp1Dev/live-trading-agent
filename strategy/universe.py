@@ -1,19 +1,7 @@
 BENCHMARK_SYMBOL = "SPY"
 
-# 200 liquid U.S. equities selected for a short-horizon,
-# options-oriented opportunity scanner.
-#
-# Design goals:
-# - broad sector coverage
-# - large/mid-cap liquidity
-# - active options markets
-# - exposure to high-beta / high-volatility names
-# - exposure to earnings / macro / thematic catalysts
-# - avoid excessive dependence on mega-cap technology
-#
-# The scanner remains responsible for deciding which names are
-# actually attractive on a given day.
-
+# Hackathon universe: 200 liquid U.S. equities extended with ultra-liquid 
+# high-beta growth, leveraged ETFs, volatility proxies, and SPCX.
 UNIVERSE = [
     # ============================================================
     # INFORMATION TECHNOLOGY / SOFTWARE / SEMICONDUCTORS
@@ -307,4 +295,90 @@ UNIVERSE = [
     "MDB",
     "RIVN",
     "LCID",
+
+    # ============================================================
+    # HACKATHON VOLATILITY & GAMMA EXPANSION (ADDITIONS)
+    # ============================================================
+    # Leveraged / Broad Benchmark ETFs
+    "QQQ",
+    "IWM",
+    "TQQQ",
+    "SQQQ",
+    "SOXL",
+    "SOXS",
+    "SMH",
+    "XBI",
+    "KRE",
+    "XLE",
+    "XLF",
+    "GLD",
+    "SLV",
+    "TLT",
+    "BITO",
+    "SPCX",  # SPAC & Special Situations ETF
+
+    # High-Beta Tech & AI Ecosystem
+    "SMCI",
+    "ARM",
+    "TSM",
+    "PATH",
+    "IOT",
+    "U",
+    "AI",
+
+    # Crypto Proxies & High-Beta Fintech
+    "MARA",
+    "RIOT",
+    "CLSK",
+    "CORZ",
+    "CIFR",
+    "SQ",
+    "AFRM",
+    "UPST",
+    "SOFI",
+    "NU",
+
+    # Consumer / Retail / Space / High-Beta Growth
+    "DKNG",
+    "PENN",
+    "RDDT",
+    "MELI",
+    "SE",
+    "BABA",
+    "PDD",
+    "JD",
+    "CELH",
+    "MNST",
+    "ASTS",
+    "JOBY",
+
+    # Biotech & Health Volatility
+    "NVO",
+    "CRSP",
+    "EXAS",
+    "BNTX",
+    "SMMT",
+    "IONS",
+    "CYTK",
+
+    # Energy, Uranium & Power Growth
+    "ALB",
+    "SQM",
+    "CCJ",
+    "UUUU",
+    "CEG",
+    "VST",
+
+    # Real Estate & High Short Interest / Squeeze Favorites
+    "OPEN",
+    "Z",
+    "RDFN",
+    "GME",
+    "AMC",
+    "CHPT",
+    "RUN",
+    "ENPH",
+    "SEDG",
+    "FSLR",
+    "PLUG",
 ]

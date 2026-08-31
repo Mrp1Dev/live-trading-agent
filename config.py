@@ -84,4 +84,4 @@ ENTRY_ORDER_TIMEOUT_SECONDS = 180
 
 # Loop Cadence
 EXIT_INTERVAL_SECONDS = 300           # 5 minutes (marks and manages open positions)
-ENTRY_INTERVAL_MINUTES = 30           # 30 minutes (was 120 min)
+ENTRY_INTERVAL_MINUTES = 15          # 30 minutes (was 120 min)

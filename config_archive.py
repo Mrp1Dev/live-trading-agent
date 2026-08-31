@@ -110,5 +110,5 @@ EXPANDED_CONFIG = {
     "NO_TRADE_MINUTES_BEFORE_CLOSE": 10,
     "ENTRY_ORDER_TIMEOUT_SECONDS": 180,
     "EXIT_INTERVAL_SECONDS": 300,        # 5 minutes
-    "ENTRY_INTERVAL_MINUTES": 30,        # 30 minutes (was 120 min)
+    "ENTRY_INTERVAL_MINUTES": 15,        # 30 minutes (was 120 min)
 }
