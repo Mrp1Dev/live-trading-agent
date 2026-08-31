@@ -20,8 +20,10 @@ from risk.risk import assess_portfolio, print_risk_report
 from execution.alpaca_broker import AlpacaBroker
 from execution.confirmation import parse_execution_args
 from execution.position_manager import (
+    cancel_stale_orders,
     entry_window_status,
     manage_open_positions,
+    seconds_until_close,
     verify_fills,
 )
 from execution.stage import run_execution_stage
@@ -43,6 +45,25 @@ from strategy import state as position_state
 
 # Give marketable limits a moment to fill before deciding they have not.
 FILL_CHECK_DELAY_SECONDS = 20
+
+# ---------------------------------------------------------------------------
+# Loop cadence
+# ---------------------------------------------------------------------------
+
+# Exits are cheap (no LLM, ~2 API calls) and this is where P&L is decided, so
+# they run often. Short-dated contracts move fast enough that a long gap between
+# marks is a real cost.
+EXIT_INTERVAL_SECONDS = 300           # 5 minutes
+
+# Entries are expensive (research + two model calls) and, crucially, the scanner
+# reads COMPLETED daily bars - its ranking cannot change during a session. Running
+# the entry pipeline more often just re-ranks identical inputs. It is retried
+# sooner only when an exit frees a slot, which is genuinely new information.
+ENTRY_INTERVAL_MINUTES = 120          # 2 hours
+
+# Transient API errors are expected; a persistent failure is not. Stop rather
+# than hammer the API, and say clearly that positions were left open.
+MAX_CONSECUTIVE_ERRORS = 5
 
 
 def _record_submitted_entries(execution_report) -> None:
@@ -69,59 +90,21 @@ def _record_submitted_entries(execution_report) -> None:
     position_state.save_state(state)
 
 
-def main() -> None:
-    args = parse_execution_args()
 
-    trading_client = get_trading_client()
-    account = trading_client.get_account()
-    account_equity = float(account.equity)
+def run_entry_cycle(
+    broker,
+    *,
+    account_id: str,
+    account_equity: float,
+    open_slots: int,
+    held_underlyings: set,
+    confirmed: bool,
+) -> bool:
+    """Scan -> research -> rank -> select -> size -> risk -> execute.
 
-    print("=== Connected to Alpaca (Paper Trading) ===")
-    print(f"Account ID:     {account.id}")
-    print(f"Equity:         ${account_equity:,.2f}")
-    print(f"Buying power:   ${float(account.buying_power):,.2f}")
-    print(f"Options level:  {account.options_trading_level} (approved: {account.options_approved_level})")
-
-    # ------------------------------------------------------------------
-    # PHASE 1 - manage what we already hold.
-    #
-    # Exits run before entries: they free risk budget, and a position the exit
-    # engine wants gone should not compete for capital with a new idea in the
-    # same cycle.
-    # ------------------------------------------------------------------
-    broker = AlpacaBroker()
-    position_report = manage_open_positions(
-        broker,
-        dry_run=not args.confirm_paper_trades,
-    )
-
-    open_slots = MAX_POSITIONS - position_report.held_count
-    print(
-        f"\nOpen positions: {position_report.open_count} "
-        f"(closing {len(position_report.closed)}) | free slots: {max(0, open_slots)}"
-    )
-
-    if in_flatten_window():
-        print("Flatten window is active. No new positions will be opened.")
-        return
-
-    window_open, window_reason = entry_window_status(broker)
-    if not window_open:
-        print(f"Entry stage skipped: {window_reason}")
-        return
-
-    if open_slots <= 0:
-        print("All position slots are full. No new entries this cycle.")
-        return
-
-    held_underlyings = {
-        p.stock_symbol for p in position_report.positions
-        if not p.decision.should_close
-    }
-
-    # ------------------------------------------------------------------
-    # PHASE 2 - find new candidates.
-    # ------------------------------------------------------------------
+    Every bail-out path returns early and says why. A cycle that opens nothing is
+    a normal outcome, not a failure.
+    """
     print(f"\nScanning {len(UNIVERSE)}-stock universe...")
     top_candidates = print_top_scanned_stocks(top_n=STOCK_SCANNER_TOP_N)
     if not top_candidates:
@@ -281,8 +264,8 @@ def main() -> None:
 
     execution_report = run_execution_stage(
         risk_report.approved_positions,
-        confirmed=args.confirm_paper_trades,
-        expected_account_id=str(account.id),
+        confirmed=confirmed,
+        expected_account_id=account_id,
     )
 
     # ------------------------------------------------------------------
@@ -292,7 +275,7 @@ def main() -> None:
     # holds contracts it never got, and a stale resting limit can fill later
     # against a quote the model already rejected.
     # ------------------------------------------------------------------
-    if args.confirm_paper_trades and execution_report is not None:
+    if confirmed and execution_report is not None:
         _record_submitted_entries(execution_report)
         print("\n" + "=" * 78)
         print(" FILL VERIFICATION")
@@ -302,6 +285,187 @@ def main() -> None:
         filled = sum(1 for _, status, _ in outcomes if status == "FILLED")
         print(f" {filled} of {len(outcomes)} order(s) filled.")
         print("=" * 78)
+
+
+
+    return True
+
+
+def run_exit_cycle(broker, *, confirmed: bool):
+    """Cancel stale entry orders, then mark and manage every open position."""
+    cancel_stale_orders(broker, dry_run=not confirmed)
+    return manage_open_positions(broker, dry_run=not confirmed)
+
+
+def _heartbeat(message: str) -> None:
+    print(f"[{market_now().strftime('%H:%M:%S ET')}] {message}", flush=True)
+
+
+def run_loop(args) -> None:
+    """Run the agent across a single trading session.
+
+    Two cadences, deliberately different:
+
+      * EXITS every EXIT_INTERVAL_SECONDS. Deterministic, no LLM, ~2 API calls.
+        This is where P&L is actually made or lost, and short-dated contracts
+        move fast enough that a long gap is a real cost.
+
+      * ENTRIES at most every ENTRY_INTERVAL_MINUTES, and only when a slot is
+        free. The scanner reads COMPLETED daily bars, so its ranking cannot
+        change during a session - re-running it more often re-ranks identical
+        inputs and burns model budget for nothing. Entries are retried sooner
+        when an exit frees a slot, because that is genuinely new information.
+
+    No exception from a single cycle is allowed to end the session.
+    """
+    trading_client = get_trading_client()
+    account = trading_client.get_account()
+    account_id = str(account.id)
+
+    print("=== Connected to Alpaca (Paper Trading) ===")
+    print(f"Account ID:     {account_id}")
+    print(f"Equity:         ${float(account.equity):,.2f}")
+    print(f"Buying power:   ${float(account.buying_power):,.2f}")
+    print(f"Options level:  {account.options_trading_level} (approved: {account.options_approved_level})")
+    mode = "LIVE PAPER EXECUTION" if args.confirm_paper_trades else "DRY RUN (no orders will be sent)"
+    print(f"Mode:           {mode}")
+    print(f"Cadence:        exits every {EXIT_INTERVAL_SECONDS // 60} min | "
+          f"entries at most every {ENTRY_INTERVAL_MINUTES} min")
+    print("Press Ctrl+C to stop. Positions are LEFT OPEN on stop.")
+
+    broker = AlpacaBroker()
+    last_entry_at = None
+    previous_slots = None
+    consecutive_errors = 0
+
+    while True:
+        try:
+            now = market_now()
+
+            if in_flatten_window(now):
+                _heartbeat("Flatten window reached - closing everything and stopping.")
+                run_exit_cycle(broker, confirmed=args.confirm_paper_trades)
+                _heartbeat("Flatten complete. Session over.")
+                return
+
+            remaining = seconds_until_close(broker)
+            if remaining is not None and remaining <= 0:
+                _heartbeat("Market is closed. Session over.")
+                return
+
+            # ---- exits: every cycle, unconditionally ----
+            position_report = run_exit_cycle(broker, confirmed=args.confirm_paper_trades)
+            equity = float(broker.get_account().equity)
+            open_slots = max(0, MAX_POSITIONS - position_report.held_count)
+
+            _heartbeat(
+                f"equity ${equity:,.2f} | held {position_report.held_count} "
+                f"| closed {len(position_report.closed)} | free slots {open_slots}"
+            )
+
+            # ---- entries: scheduled, and only when there is room ----
+            slots_freed = previous_slots is not None and open_slots > previous_slots
+            minutes_since_entry = (
+                None if last_entry_at is None
+                else (now - last_entry_at).total_seconds() / 60.0
+            )
+            due = (
+                last_entry_at is None
+                or slots_freed
+                or (minutes_since_entry is not None and minutes_since_entry >= ENTRY_INTERVAL_MINUTES)
+            )
+            window_open, window_reason = entry_window_status(broker, now)
+
+            if open_slots <= 0:
+                pass
+            elif not window_open:
+                _heartbeat(f"entries held: {window_reason}")
+            elif not due:
+                pass
+            else:
+                held_underlyings = {
+                    p.stock_symbol for p in position_report.positions
+                    if not p.decision.should_close
+                }
+                _heartbeat(f"running entry cycle ({open_slots} slot(s) free)")
+                try:
+                    run_entry_cycle(
+                        broker,
+                        account_id=account_id,
+                        account_equity=equity,
+                        open_slots=open_slots,
+                        held_underlyings=held_underlyings,
+                        confirmed=args.confirm_paper_trades,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"Entry cycle failed ({type(exc).__name__}: {exc}). "
+                          "Exits continue on schedule.")
+                last_entry_at = now
+
+            previous_slots = open_slots
+            consecutive_errors = 0
+
+        except KeyboardInterrupt:
+            print("\nInterrupted. Open positions are LEFT OPEN and unmanaged - "
+                  "re-run to resume management, or flatten from the dashboard.")
+            return
+        except Exception as exc:  # noqa: BLE001
+            consecutive_errors += 1
+            print(f"Cycle error #{consecutive_errors} ({type(exc).__name__}: {exc})")
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                print(f"Aborting after {MAX_CONSECUTIVE_ERRORS} consecutive failures. "
+                      "Positions are left open - check the dashboard.")
+                return
+
+        try:
+            time.sleep(EXIT_INTERVAL_SECONDS)
+        except KeyboardInterrupt:
+            print("\nInterrupted between cycles. Open positions are LEFT OPEN.")
+            return
+
+
+def run_single_cycle(args) -> None:
+    """One exit pass plus, if a slot is free, one entry pass. Then stop."""
+    trading_client = get_trading_client()
+    account = trading_client.get_account()
+    broker = AlpacaBroker()
+
+    position_report = run_exit_cycle(broker, confirmed=args.confirm_paper_trades)
+    open_slots = max(0, MAX_POSITIONS - position_report.held_count)
+    print(f"\nOpen positions: {position_report.open_count} "
+          f"(closing {len(position_report.closed)}) | free slots: {open_slots}")
+
+    if in_flatten_window():
+        print("Flatten window is active. No new positions will be opened.")
+        return
+    if open_slots <= 0:
+        print("All position slots are full. No new entries this cycle.")
+        return
+
+    window_open, reason = entry_window_status(broker)
+    if not window_open:
+        print(f"Entry stage skipped: {reason}")
+        return
+
+    run_entry_cycle(
+        broker,
+        account_id=str(account.id),
+        account_equity=float(account.equity),
+        open_slots=open_slots,
+        held_underlyings={
+            p.stock_symbol for p in position_report.positions
+            if not p.decision.should_close
+        },
+        confirmed=args.confirm_paper_trades,
+    )
+
+
+def main() -> None:
+    args = parse_execution_args()
+    if getattr(args, "once", False):
+        run_single_cycle(args)
+    else:
+        run_loop(args)
 
 
 if __name__ == "__main__":

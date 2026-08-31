@@ -230,6 +230,92 @@ def manage_open_positions(
     )
 
 
+def cancel_stale_orders(
+    broker: Any,
+    *,
+    now: Optional[datetime] = None,
+    max_age_seconds: int | None = None,
+    dry_run: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Cancel resting orders that have outlived the quote they were priced against.
+
+    A limit sitting on the book is stale information: it was priced against a
+    chain that has since moved, so letting it fill means filling at a price the
+    model never approved. Run this at the top of every cycle.
+
+    Exit orders are NEVER cancelled - getting out is the half of the round trip
+    you cannot afford to miss, so a resting sell is left to work.
+    """
+    from config import ENTRY_ORDER_TIMEOUT_SECONDS
+
+    timeout = ENTRY_ORDER_TIMEOUT_SECONDS if max_age_seconds is None else max_age_seconds
+    reference = market_now(now)
+    cancelled: list[str] = []
+
+    try:
+        open_orders = broker.get_open_orders()
+    except BrokerError as exc:
+        if verbose:
+            print(f"  Could not list open orders: {exc}")
+        return cancelled
+
+    for order in open_orders:
+        order_id = str(getattr(order, "id", "") or "")
+        symbol = str(getattr(order, "symbol", "") or "")
+        side = str(getattr(order, "side", "")).lower()
+        client_id = str(getattr(order, "client_order_id", "") or "")
+
+        # Never pull a working exit.
+        if "sell" in side or client_id.startswith("exit-"):
+            continue
+
+        submitted = getattr(order, "submitted_at", None) or getattr(order, "created_at", None)
+        age = None
+        if submitted is not None:
+            if submitted.tzinfo is None:
+                submitted = submitted.replace(tzinfo=reference.tzinfo)
+            age = (reference - submitted).total_seconds()
+
+        if age is not None and age < timeout:
+            continue
+
+        if dry_run:
+            cancelled.append(symbol)
+            if verbose:
+                print(f"  [dry-run] would cancel stale entry order {symbol} (age {age or 0:.0f}s)")
+            continue
+
+        try:
+            broker.cancel_order(order_id)
+            cancelled.append(symbol)
+            if verbose:
+                print(f"  Cancelled stale entry order {symbol} (age {age or 0:.0f}s)")
+        except BrokerError as exc:
+            if verbose:
+                print(f"  Could not cancel stale order {symbol}: {exc}")
+
+    return cancelled
+
+
+def seconds_until_close(broker: Any, now: Optional[datetime] = None) -> Optional[float]:
+    """Seconds until the session close, or None if it cannot be determined."""
+    reference = market_now(now)
+    try:
+        clock = broker.trading_client.get_clock()
+    except Exception:  # noqa: BLE001
+        return None
+
+    next_close = getattr(clock, "next_close", None)
+    if next_close is None:
+        return None
+    if next_close.tzinfo is None:
+        next_close = next_close.replace(tzinfo=reference.tzinfo)
+    if not getattr(clock, "is_open", False):
+        return 0.0
+    return max(0.0, (next_close - reference).total_seconds())
+
+
 def entry_window_status(broker: Any, now: Optional[datetime] = None) -> tuple[bool, str]:
     """Whether it is safe to OPEN new risk right now.
 

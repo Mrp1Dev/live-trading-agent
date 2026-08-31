@@ -14,6 +14,11 @@ def parse_execution_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Authorize submission of risk-approved orders to the configured Alpaca PAPER account.",
     )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single exit+entry cycle and stop, instead of looping for the session.",
+    )
     return parser.parse_args(argv)
 
 
