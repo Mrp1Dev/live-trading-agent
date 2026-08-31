@@ -385,6 +385,7 @@ def compress_news(
                 ],
                 "temperature": temperature,
                 "max_tokens": max_tokens,
+                "chat_template_kwargs": {"thinking": False},
             },
             timeout=timeout,
         )

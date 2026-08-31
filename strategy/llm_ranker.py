@@ -15,7 +15,7 @@ load_dotenv()
 
 FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
 DEFAULT_TEMPERATURE = 0.0
-DEFAULT_MAX_TOKENS = 256
+DEFAULT_MAX_TOKENS = 128
 
 
 SYSTEM_PROMPT = """
@@ -269,6 +269,9 @@ def rank_stocks(
                 ],
                 "temperature": temperature,
                 "max_tokens": max_tokens,
+                "chat_template_kwargs": {
+                    "thinking": False,
+                },
             },
             timeout=60,
         )
@@ -291,7 +294,11 @@ def rank_stocks(
             f"Unexpected Featherless response format: {payload!r}"
         ) from exc
     if not content:
-        raise LLMRankerError("Featherless returned an empty ranking response.")
+        raise LLMRankerError(
+            "Featherless returned empty message.content. "
+            f"finish_reason={choices[0].get('finish_reason')!r}, "
+            f"response={payload!r}"
+        )
 
     if debug:
         print("\n" + "=" * 120)

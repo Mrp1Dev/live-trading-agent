@@ -315,6 +315,11 @@ if __name__ == "__main__":
 =====
 from datetime import date
 # ============================================================
+# SCANNER / RESEARCH / LLM
+# ============================================================
+STOCK_SCANNER_TOP_N = 15
+LLM_STOCK_TOP_K = 5
+# ============================================================
 # PORTFOLIO / RISK
 # ============================================================
 MAX_TOTAL_RISK_PCT = 0.12
@@ -951,6 +956,551 @@ def analyze_trade(candidate, stock):
         invalidation=invalidation,
     )
 =====
+# FILE: strategy/llm_ranker.py
+=====
+from __future__ import annotations
+import json
+import os
+import re
+from random import SystemRandom
+from typing import Mapping, Sequence
+from dotenv import load_dotenv
+import requests
+from strategy.scanner import ScannedStock
+load_dotenv()
+FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
+DEFAULT_TEMPERATURE = 0.0
+DEFAULT_MAX_TOKENS = 128
+SYSTEM_PROMPT = """
+You are the ranking component of an autonomous short-horizon options trading system.
+Your job is to RANK candidate UNDERLYINGS relative to one another for the next few
+trading days. You are not choosing an option contract, sizing a position, or deciding
+whether to execute a trade.
+Use two evidence sources:
+1. Quantitative scanner data.
+2. A research dossier containing recent market/news/contextual information.
+Important principles:
+- Rank candidates comparatively, not independently.
+- Do not simply reproduce the scanner ranking.
+- Treat the scanner score as a useful prior, not as the answer.
+- Favor opportunities with a plausible, timely catalyst and a credible chance of a
+  meaningful move during the short evaluation window.
+- Consider momentum, volume, realized volatility, relative strength, technical trend,
+  catalyst quality/timing, contradictory evidence, and thesis uncertainty together.
+- High volatility alone is not sufficient.
+- Strong past performance alone is not sufficient.
+- Penalize stale, vague, already-digested, poorly timed, or weakly supported narratives.
+- Do not invent facts. If important information is missing, treat that as uncertainty.
+- This is an ORDINAL task. Do not assign scores, probabilities, confidence values, or
+  explanations in the final answer.
+Return ONLY a JSON array containing every candidate symbol exactly once, ordered from
+MOST attractive to LEAST attractive.
+Example:
+["CRM", "MSTR", "NVDA", "AMD"]
+""".strip()
+class LLMRankerError(RuntimeError):
+    """Raised when the Featherless ranking request or response is invalid."""
+def _get_api_key() -> str:
+    api_key = os.getenv("FEATHERLESS_API_KEY")
+    if not api_key:
+        raise LLMRankerError(
+            "Missing FEATHERLESS_API_KEY. Add it to .env or the environment."
+        )
+    return api_key
+def _get_model(model: str | None) -> str:
+    selected_model = model or os.getenv("FEATHERLESS_MODEL")
+    if not selected_model:
+        raise LLMRankerError(
+            "No Featherless model selected. Pass model=... to rank_stocks() "
+            "or set FEATHERLESS_MODEL in .env."
+        )
+    return selected_model
+def _pct(value: float) -> str:
+    return f"{value:.2%}"
+def _format_scanner_row(stock: ScannedStock) -> str:
+    """Format the complete scanner information compactly for the LLM."""
+    rank = stock.rank if stock.rank is not None else "-"
+    return (
+        f"Rank #{rank} | Symbol: {stock.symbol} | Price: ${stock.price:.2f} | "
+        f"1D: {_pct(stock.return_1d)} | 5D: {_pct(stock.return_5d)} | "
+        f"20D: {_pct(stock.return_20d)} | Vol/Avg: {stock.volume_ratio:.2f}x | "
+        f"SMA20 dist: {_pct(stock.distance_sma20)} | "
+        f"SMA50 dist: {_pct(stock.distance_sma50)} | "
+        f"Realized vol: {_pct(stock.realized_volatility)} | "
+        f"RS vs SPY: {_pct(stock.relative_strength_spy)} | "
+        f"Momentum score: {stock.momentum_score:.1f} | "
+        f"Volume score: {stock.volume_score:.1f} | "
+        f"Volatility score: {stock.volatility_score:.1f} | "
+        f"RS score: {stock.relative_strength_score:.1f} | "
+        f"Trend score: {stock.trend_score:.1f} | "
+        f"Scanner score: {stock.score:.1f}"
+    )
+def build_ranker_prompt(
+    stocks: Sequence[ScannedStock],
+    research: Mapping[str, str],
+) -> str:
+    """Build the comparative ranking prompt sent to the model."""
+    if not stocks:
+        raise ValueError("stocks must contain at least one candidate")
+    symbols = [stock.symbol.upper() for stock in stocks]
+    duplicate_symbols = len(symbols) != len(set(symbols))
+    if duplicate_symbols:
+        raise ValueError("stocks contains duplicate symbols")
+    sections: list[str] = [
+        "RANK THESE CANDIDATES FOR A SHORT-HORIZON OPTIONS OPPORTUNITY.",
+        "",
+        "Candidate presentation order may be randomized; do not infer importance from presentation order.",
+        "The scanner rank is included as data, but you should independently compare the evidence.",
+        "",
+    ]
+    for index, stock in enumerate(stocks, start=1):
+        symbol = stock.symbol.upper()
+        research_text = research.get(symbol, "")
+        if not research_text:
+            research_text = "NO RESEARCH DOSSIER AVAILABLE. Treat missing research as uncertainty."
+        sections.append(f"=== CANDIDATE {index}: {symbol} ===")
+        sections.append("SCANNER DATA:")
+        sections.append(_format_scanner_row(stock))
+        sections.append("RESEARCH DOSSIER:")
+        sections.append(research_text.strip())
+        sections.append("")
+    sections.extend(
+        [
+            "FINAL OUTPUT REQUIREMENTS:",
+            "Return ONLY a JSON array of symbols.",
+            f"The array must contain exactly these symbols: {', '.join(symbols)}",
+            "Each symbol must appear exactly once.",
+            "Order from strongest short-horizon opportunity to weakest.",
+        ]
+    )
+    return "\n".join(sections)
+def _extract_json_array(content: str) -> list[str]:
+    """Parse a model response containing a JSON array of symbols."""
+    text = content.strip()
+    # First, try the entire response as JSON.
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return [str(item).strip().upper() for item in parsed]
+        if isinstance(parsed, dict):
+            for key in ("ranked_symbols", "ranking", "symbols"):
+                value = parsed.get(key)
+                if isinstance(value, list):
+                    return [str(item).strip().upper() for item in value]
+    except json.JSONDecodeError:
+        pass
+    # Fallback: extract the first JSON-looking array from surrounding text.
+    match = re.search(r"\[[\s\S]*?\]", text)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, list):
+                return [str(item).strip().upper() for item in parsed]
+        except json.JSONDecodeError:
+            pass
+    raise LLMRankerError(
+        "Featherless returned an invalid ranking response. "
+        f"Raw response: {content!r}"
+    )
+def _validate_ranking(ranking: Sequence[str], expected_symbols: Sequence[str]) -> list[str]:
+    """Ensure the model returned a complete permutation of the candidates."""
+    expected = [symbol.upper() for symbol in expected_symbols]
+    normalized = [symbol.strip().upper() for symbol in ranking]
+    if len(normalized) != len(expected):
+        raise LLMRankerError(
+            f"Ranking contains {len(normalized)} symbols; expected {len(expected)}."
+        )
+    if len(set(normalized)) != len(normalized):
+        raise LLMRankerError("Ranking contains duplicate symbols.")
+    if set(normalized) != set(expected):
+        missing = sorted(set(expected) - set(normalized))
+        unexpected = sorted(set(normalized) - set(expected))
+        raise LLMRankerError(
+            "Ranking does not match candidate universe. "
+            f"Missing={missing}, unexpected={unexpected}."
+        )
+    return normalized
+def rank_stocks(
+    stocks: Sequence[ScannedStock],
+    research: Mapping[str, str],
+    *,
+    model: str | None = None,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    debug: bool = False,
+) -> list[str]:
+    """
+    Rank scanned stocks using a Featherless chat-completion model.
+    Parameters
+    ----------
+    stocks:
+        ScannedStock objects produced by the quantitative scanner.
+    research:
+        Mapping of ticker -> research-agent text for each candidate.
+    model:
+        Featherless model ID. If omitted, FEATHERLESS_MODEL is read from .env.
+    temperature:
+        Sampling temperature. Defaults to 0 for reproducible ranking behavior.
+    max_tokens:
+        Small output budget because the desired output is only an ordered symbol list.
+    debug:
+        If True, print ranker prompt input and raw LLM response.
+    Returns
+    -------
+    list[str]
+        Symbols ordered from strongest to weakest short-horizon opportunity.
+    """
+    if not stocks:
+        return []
+    selected_model = _get_model(model)
+    expected_symbols = [stock.symbol.upper() for stock in stocks]
+    # Randomize presentation order so the model does not simply inherit the
+    # scanner table order. The original scanner rank remains visible as a feature.
+    prompt_stocks = list(stocks)
+    SystemRandom().shuffle(prompt_stocks)
+    prompt = build_ranker_prompt(prompt_stocks, research)
+    if debug:
+        print("\n" + "=" * 120)
+        print(" LLM RANKER INPUT")
+        print("=" * 120)
+        print(prompt)
+        print("=" * 120)
+    try:
+        response = requests.post(
+            f"{FEATHERLESS_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {_get_api_key()}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "alpaca-agent",
+                "X-Title": "Alpaca Options Trading Agent",
+            },
+            json={
+                "model": selected_model,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "chat_template_kwargs": {
+                    "thinking": False,
+                },
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        raise LLMRankerError(
+            f"Featherless ranking request failed: {exc}"
+        ) from exc
+    except ValueError as exc:
+        raise LLMRankerError(
+            "Featherless returned a non-JSON response."
+        ) from exc
+    try:
+        choices = payload["choices"]
+        content = choices[0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise LLMRankerError(
+            f"Unexpected Featherless response format: {payload!r}"
+        ) from exc
+    if not content:
+        raise LLMRankerError(
+            "Featherless returned empty message.content. "
+            f"finish_reason={choices[0].get('finish_reason')!r}, "
+            f"response={payload!r}"
+        )
+    if debug:
+        print("\n" + "=" * 120)
+        print(" RAW LLM RANKER RESPONSE")
+        print("=" * 120)
+        print(content)
+        print("=" * 120)
+    ranking = _extract_json_array(content)
+    return _validate_ranking(ranking, expected_symbols)
+# Clear alias for use from orchestration code.
+rank_candidates = rank_stocks
+=====
+# FILE: strategy/option_ranker.py
+=====
+from __future__ import annotations
+import json
+import os
+import random
+from dataclasses import dataclass
+from typing import Mapping, Sequence
+import requests
+from dotenv import load_dotenv
+from strategy.option_selector import OptionCandidate
+from strategy.scanner import ScannedStock
+load_dotenv()
+FEATHERLESS_URL = "https://api.featherless.ai/v1/chat/completions"
+DEFAULT_MODEL_ENV = "FEATHERLESS_MODEL"
+DEFAULT_MAX_TOKENS = 192
+DEFAULT_TEMPERATURE = 0.0
+class OptionRankerError(RuntimeError):
+    """Raised when the option-ranking request or response is invalid."""
+@dataclass(frozen=True)
+class OptionRankingContext:
+    """Compact stock-level context passed into the option ranker."""
+    stock_symbol: str
+    stock_rank: int | None
+    stock_score: float
+    direction: str
+    research_text: str = ""
+def _get_api_key() -> str:
+    api_key = os.getenv("FEATHERLESS_API_KEY")
+    if not api_key:
+        raise OptionRankerError(
+            "Missing FEATHERLESS_API_KEY in environment variables."
+        )
+    return api_key
+def _get_model(model: str | None) -> str:
+    selected = model or os.getenv(DEFAULT_MODEL_ENV)
+    if not selected:
+        raise OptionRankerError(
+            f"No Featherless model configured. Set {DEFAULT_MODEL_ENV} "
+            "or pass model explicitly."
+        )
+    return selected
+def _fmt(value: float | None, digits: int = 3) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value:.{digits}f}"
+def _fmt_pct(value: float | None, digits: int = 1) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value:.{digits}%}"
+def _build_option_block(option: OptionCandidate, rank_id: str) -> str:
+    return (
+        f"{rank_id}\n"
+        f"symbol={option.symbol}\n"
+        f"expiration={option.expiration.isoformat()} | DTE={option.dte}\n"
+        f"type={option.option_type} | strike=${option.strike:.2f} | "
+        f"moneyness={_fmt_pct(option.moneyness_pct)}\n"
+        f"bid=${option.bid:.2f} | ask=${option.ask:.2f} | mid=${option.mid:.2f} | "
+        f"spread={_fmt_pct(option.spread_pct)}\n"
+        f"IV={_fmt_pct(option.iv)} | delta={_fmt(option.delta)} | "
+        f"gamma={_fmt(option.gamma)} | theta={_fmt(option.theta)} | vega={_fmt(option.vega)}\n"
+        f"selector_score={option.score:.1f}"
+    )
+def build_option_ranker_prompt(
+    stock: ScannedStock,
+    options: Sequence[OptionCandidate],
+    direction: str,
+    research_text: str = "",
+) -> str:
+    """Build a compact comparative-ranking prompt."""
+    direction = direction.upper()
+    if direction not in {"BULLISH", "BEARISH"}:
+        raise ValueError("direction must be BULLISH or BEARISH")
+    if not options:
+        raise ValueError("options must not be empty")
+    research = research_text.strip() or "None provided."
+    stock_rank = stock.rank if stock.rank is not None else "N/A"
+    option_blocks: list[str] = []
+    for idx, option in enumerate(options, start=1):
+        option_blocks.append(_build_option_block(option, f"OPTION {idx}"))
+    return f"""Rank the following option contracts by attractiveness as an expression of the supplied short-horizon stock thesis.
+The goal is comparative ranking, not absolute scoring. Return ONLY a JSON array of option symbols, strongest to weakest.
+Consider:
+- fit with the stock direction and thesis
+- DTE relative to the short evaluation window
+- strike / moneyness relative to the likely move
+- premium paid versus responsiveness
+- bid/ask spread and liquidity
+- implied volatility
+- delta, gamma, theta, and vega
+- whether the contract gives an efficient expression of the thesis
+Do not invent facts. Do not assign numeric scores. Do not recommend anything outside the supplied options.
+The stock research is context, not truth; judge the contracts on their actual option data.
+STOCK CONTEXT
+Symbol: {stock.symbol}
+Scanner rank: {stock_rank}
+Scanner score: {stock.score:.1f}
+Direction: {direction}
+Price: ${stock.price:.2f}
+1D: {stock.return_1d:+.2%} | 5D: {stock.return_5d:+.2%} | 20D: {stock.return_20d:+.2%}
+Realized vol: {_fmt_pct(stock.realized_volatility)} | RS vs SPY: {_fmt_pct(stock.relative_strength_spy)}
+SMA20 distance: {_fmt_pct(stock.distance_sma20)} | SMA50 distance: {_fmt_pct(stock.distance_sma50)}
+RECENT STOCK RESEARCH
+{research}
+AVAILABLE OPTIONS
+{chr(10).join(option_blocks)}
+FINAL OUTPUT REQUIREMENTS:
+Return ONLY a JSON array.
+Include every supplied option symbol exactly once.
+Order from strongest option expression to weakest.
+"""
+def _extract_json_array(content: str) -> list[str]:
+    text = content.strip()
+    if not text:
+        raise OptionRankerError("Featherless returned an empty option ranking response.")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("[")
+        end = text.rfind("]")
+        if start == -1 or end <= start:
+            raise OptionRankerError(
+                f"Could not parse JSON array from model response: {text!r}"
+            )
+        try:
+            parsed = json.loads(text[start : end + 1])
+        except json.JSONDecodeError as exc:
+            raise OptionRankerError(
+                f"Could not parse JSON array from model response: {text!r}"
+            ) from exc
+    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+        raise OptionRankerError("Model response must be a JSON array of option symbols.")
+    return [item.strip() for item in parsed]
+def _validate_ranking(
+    ranked_symbols: Sequence[str],
+    options: Sequence[OptionCandidate],
+) -> list[str]:
+    expected = [option.symbol for option in options]
+    expected_set = set(expected)
+    actual = list(ranked_symbols)
+    if len(actual) != len(expected):
+        raise OptionRankerError(
+            f"Option ranking length mismatch: expected {len(expected)}, got {len(actual)}."
+        )
+    if len(set(actual)) != len(actual):
+        raise OptionRankerError("Option ranking contains duplicate symbols.")
+    if set(actual) != expected_set:
+        missing = sorted(expected_set - set(actual))
+        unexpected = sorted(set(actual) - expected_set)
+        raise OptionRankerError(
+            f"Invalid option ranking. Missing={missing}, unexpected={unexpected}."
+        )
+    return actual
+def rank_options(
+    stock: ScannedStock,
+    options: Sequence[OptionCandidate],
+    direction: str | None = None,
+    research_text: str = "",
+    *,
+    research: str | None = None,
+    model: str | None = None,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    timeout: float = 45.0,
+    debug: bool = False,
+) -> list[str]:
+    """Rank option candidates for one underlying and return option symbols."""
+    if not options:
+        return []
+    resolved_direction = direction
+    if resolved_direction is None:
+        if options and getattr(options[0], "option_type", None):
+            resolved_direction = "BULLISH" if options[0].option_type.lower() == "call" else "BEARISH"
+        else:
+            resolved_direction = "BULLISH"
+    resolved_research = research if research is not None else research_text
+    # Defensive copy + shuffle to reduce position/order anchoring.
+    shuffled_options = list(options)
+    random.SystemRandom().shuffle(shuffled_options)
+    prompt = build_option_ranker_prompt(
+        stock=stock,
+        options=shuffled_options,
+        direction=resolved_direction,
+        research_text=resolved_research,
+    )
+    if debug:
+        print("\n" + "=" * 120)
+        print(f" OPTION LLM RANKER INPUT — {stock.symbol}")
+        print("=" * 120)
+        print(prompt)
+        print("=" * 120)
+    payload = {
+        "model": _get_model(model),
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are an options contract ranking assistant. "
+                    "Compare only the supplied contracts and return the required JSON array."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "chat_template_kwargs": {
+            "thinking": False,
+        },
+    }
+    try:
+        response = requests.post(
+            FEATHERLESS_URL,
+            headers={
+                "Authorization": f"Bearer {_get_api_key()}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        raise OptionRankerError(
+            f"Featherless option-ranking request failed: {exc}"
+        ) from exc
+    if response.status_code >= 400:
+        raise OptionRankerError(
+            f"Featherless option-ranking request failed with HTTP "
+            f"{response.status_code}: {response.text}"
+        )
+    try:
+        response_payload = response.json()
+    except ValueError as exc:
+        raise OptionRankerError(
+            f"Featherless returned non-JSON response: {response.text!r}"
+        ) from exc
+    choices = response_payload.get("choices") or []
+    if not choices:
+        raise OptionRankerError(
+            f"Featherless returned no choices. response={response_payload!r}"
+        )
+    content = (choices[0].get("message") or {}).get("content") or ""
+    if debug:
+        print("\n" + "=" * 120)
+        print(f" RAW OPTION LLM RESPONSE — {stock.symbol}")
+        print("=" * 120)
+        print(content)
+        print("=" * 120)
+    if not content:
+        raise OptionRankerError(
+            "Featherless returned empty message.content for option ranking. "
+            f"finish_reason={choices[0].get('finish_reason')!r}; "
+            f"response={response_payload!r}"
+        )
+    ranked = _extract_json_array(content)
+    return _validate_ranking(ranked, options)
+def top_ranked_options(
+    stock: ScannedStock,
+    options: Sequence[OptionCandidate],
+    direction: str,
+    research_text: str = "",
+    *,
+    top_k: int = 2,
+    **kwargs,
+) -> list[OptionCandidate]:
+    """Rank options and return the top K actual OptionCandidate objects."""
+    if top_k <= 0:
+        return []
+    ranked_symbols = rank_options(
+        stock=stock,
+        options=options,
+        direction=direction,
+        research_text=research_text,
+        **kwargs,
+    )
+    by_symbol: Mapping[str, OptionCandidate] = {
+        option.symbol: option for option in options
+    }
+    return [by_symbol[symbol] for symbol in ranked_symbols[:top_k]]
+rank_option_candidates = rank_options
+=====
 # FILE: strategy/option_selector.py
 =====
 from __future__ import annotations
@@ -1541,6 +2091,481 @@ def print_portfolio_plan(
     )
     print("=" * 130)
 =====
+# FILE: strategy/research_agent.py
+=====
+from __future__ import annotations
+import json
+import os
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Mapping, Sequence
+import requests
+from dotenv import load_dotenv
+from strategy.scanner import ScannedStock
+load_dotenv()
+ALPACA_NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
+FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
+DEFAULT_LOOKBACK_DAYS = 5
+DEFAULT_MAX_ARTICLES = 3
+DEFAULT_MAX_ARTICLE_SUMMARY_CHARS = 350
+DEFAULT_MAX_WORKERS = 8
+DEFAULT_TEMPERATURE = 0.0
+DEFAULT_MAX_TOKENS = 160
+DEFAULT_TIMEOUT_SECONDS = 30
+SYSTEM_PROMPT = """
+You are a market-news compression agent for an autonomous short-horizon options system.
+Your job is NOT to rank the stock, score it, recommend a trade, or predict a return.
+Compress the recent news into only the information that could matter over the next few
+trading sessions.
+The quantitative setup has already been computed deterministically. Translate it into
+short qualitative descriptors when useful, but do not repeat the raw numbers.
+Use only the supplied evidence. Do not invent catalysts, risks, dates, or facts.
+If there is no meaningful recent news, say so.
+Return ONLY JSON with exactly these keys:
+{
+  "news": "one concise sentence, maximum 40 words",
+  "catalyst": "one concise near-term catalyst, or null",
+  "risk": "one concise news-related risk/contradiction, or null",
+  "timing": "IMMEDIATE | NEAR_TERM | UNKNOWN | NONE"
+}
+IMMEDIATE means likely relevant within 1-2 trading days.
+NEAR_TERM means relevant within the short evaluation window but not clearly immediate.
+UNKNOWN means potentially relevant but timing is unclear.
+NONE means there is no meaningful recent catalyst.
+""".strip()
+@dataclass(frozen=True)
+class NewsArticle:
+    symbol: str
+    headline: str
+    summary: str
+    source: str
+    published_at: str
+    url: str | None = None
+@dataclass(frozen=True)
+class ResearchReport:
+    symbol: str
+    quantitative_summary: str
+    news: str
+    catalyst: str | None
+    risk: str | None
+    timing: str
+    article_count: int
+    articles: tuple[NewsArticle, ...] = ()
+    def to_text(self) -> str:
+        parts = [self.symbol, f"Quant: {self.quantitative_summary}"]
+        parts.append(f"News: {self.news}")
+        if self.catalyst:
+            parts.append(f"Catalyst: {self.catalyst}")
+        if self.risk:
+            parts.append(f"Risk: {self.risk}")
+        parts.append(f"Timing: {self.timing}")
+        return "\n".join(parts)
+class ResearchAgentError(RuntimeError):
+    """Raised when research retrieval or compression fails."""
+def _get_alpaca_credentials() -> tuple[str, str]:
+    api_key = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
+    secret_key = os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
+    if not api_key or not secret_key:
+        raise ResearchAgentError(
+            "Missing Alpaca API credentials. Set ALPACA_API_KEY and ALPACA_SECRET_KEY "
+            "(or APCA_API_KEY_ID and APCA_API_SECRET_KEY) in .env."
+        )
+    return api_key, secret_key
+def _get_research_model(model: str | None) -> str:
+    selected = model or os.getenv("FEATHERLESS_RESEARCH_MODEL")
+    if not selected:
+        raise ResearchAgentError(
+            "No research model selected. Pass model=... to research_stock(s) "
+            "or set FEATHERLESS_RESEARCH_MODEL in .env."
+        )
+    return selected
+def _clean_text(value: Any, max_chars: int | None = None) -> str:
+    if value is None:
+        return ""
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    if max_chars is not None and len(text) > max_chars:
+        text = text[: max_chars - 1].rstrip() + "…"
+    return text
+def _qualitative_quant_summary(stock: ScannedStock) -> str:
+    """Turn scanner values into compact semantic labels without an LLM call."""
+    labels: list[str] = []
+    # Momentum
+    if stock.return_20d >= 0.20 or stock.momentum_score >= 90:
+        labels.append("exceptionally strong momentum")
+    elif stock.return_20d >= 0.08 or stock.momentum_score >= 70:
+        labels.append("strong momentum")
+    elif stock.return_20d <= -0.20 or stock.momentum_score <= 10:
+        labels.append("exceptionally weak momentum")
+    elif stock.return_20d <= -0.08 or stock.momentum_score <= 30:
+        labels.append("weak momentum")
+    # Volume
+    if stock.volume_ratio >= 2.0 or stock.volume_score >= 90:
+        labels.append("unusually high volume")
+    elif stock.volume_ratio >= 1.25 or stock.volume_score >= 70:
+        labels.append("elevated volume")
+    # Volatility
+    if stock.realized_volatility >= 0.70 or stock.volatility_score >= 90:
+        labels.append("very high volatility")
+    elif stock.realized_volatility >= 0.45 or stock.volatility_score >= 70:
+        labels.append("elevated volatility")
+    # Relative strength
+    if stock.relative_strength_spy >= 0.15 or stock.relative_strength_score >= 90:
+        labels.append("exceptional relative strength")
+    elif stock.relative_strength_spy >= 0.05 or stock.relative_strength_score >= 70:
+        labels.append("strong relative strength")
+    elif stock.relative_strength_spy <= -0.15 or stock.relative_strength_score <= 10:
+        labels.append("exceptionally weak relative strength")
+    elif stock.relative_strength_spy <= -0.05 or stock.relative_strength_score <= 30:
+        labels.append("weak relative strength")
+    # Trend / extension
+    max_distance = max(abs(stock.distance_sma20), abs(stock.distance_sma50))
+    if max_distance >= 0.15:
+        labels.append("materially extended from trend")
+    elif max_distance >= 0.08:
+        labels.append("noticeably extended from trend")
+    if not labels:
+        return "mixed or moderate quantitative setup"
+    return ", ".join(labels)
+def _parse_article(raw: Mapping[str, Any], symbol: str) -> NewsArticle:
+    return NewsArticle(
+        symbol=symbol,
+        headline=_clean_text(raw.get("headline") or raw.get("title")),
+        summary=_clean_text(
+            raw.get("summary") or raw.get("content"),
+            DEFAULT_MAX_ARTICLE_SUMMARY_CHARS,
+        ),
+        source=_clean_text(raw.get("source") or raw.get("author") or "Unknown source", 80),
+        published_at=_clean_text(raw.get("created_at") or raw.get("updated_at") or "Unknown time", 40),
+        url=raw.get("url"),
+    )
+def _article_dedupe_key(article: NewsArticle) -> str:
+    title = re.sub(r"[^a-z0-9 ]+", "", article.headline.lower())
+    title = re.sub(r"\s+", " ", title).strip()
+    return title
+def _dedupe_articles(articles: Sequence[NewsArticle]) -> list[NewsArticle]:
+    seen: set[str] = set()
+    result: list[NewsArticle] = []
+    for article in articles:
+        key = _article_dedupe_key(article)
+        if not key:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(article)
+    return result
+def fetch_stock_news(
+    symbol: str,
+    *,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    max_articles: int = DEFAULT_MAX_ARTICLES,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+) -> list[NewsArticle]:
+    """Fetch recent Alpaca news for one stock, newest first."""
+    if lookback_days <= 0:
+        raise ValueError("lookback_days must be positive")
+    if max_articles <= 0:
+        return []
+    api_key, secret_key = _get_alpaca_credentials()
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=lookback_days)
+    params = {
+        "symbols": symbol.upper(),
+        "start": start.isoformat().replace("+00:00", "Z"),
+        "end": end.isoformat().replace("+00:00", "Z"),
+        "sort": "desc",
+        # Small on purpose: research is a compression step.
+        "limit": max_articles,
+        "include_content": "false",
+        "exclude_contentless": "true",
+    }
+    response = requests.get(
+        ALPACA_NEWS_URL,
+        headers={
+            "APCA-API-KEY-ID": api_key,
+            "APCA-API-SECRET-KEY": secret_key,
+        },
+        params=params,
+        timeout=timeout,
+    )
+    try:
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        raise ResearchAgentError(
+            f"Alpaca news request failed for {symbol}: {exc}"
+        ) from exc
+    except ValueError as exc:
+        raise ResearchAgentError(
+            f"Alpaca returned invalid news JSON for {symbol}."
+        ) from exc
+    raw_articles = payload.get("news", [])
+    if not isinstance(raw_articles, list):
+        raise ResearchAgentError(
+            f"Unexpected Alpaca news response for {symbol}."
+        )
+    parsed = [_parse_article(item, symbol.upper()) for item in raw_articles]
+    return _dedupe_articles(parsed)[:max_articles]
+def _format_news_for_llm(articles: Sequence[NewsArticle]) -> str:
+    if not articles:
+        return "NO MATERIAL RECENT NEWS FOUND."
+    lines: list[str] = []
+    for index, article in enumerate(articles, start=1):
+        headline = article.headline or "(no headline)"
+        summary = article.summary or "(no provider summary available)"
+        lines.extend(
+            [
+                f"ARTICLE {index}: {article.source} | {article.published_at}",
+                f"Headline: {headline}",
+                f"Summary: {summary}",
+            ]
+        )
+    return "\n".join(lines)
+def build_research_prompt(
+    stock: ScannedStock,
+    articles: Sequence[NewsArticle],
+) -> str:
+    """Build a compact stock-specific prompt for the cheap research model."""
+    return "\n".join(
+        [
+            "STOCK:",
+            stock.symbol.upper(),
+            "",
+            "QUANTITATIVE SETUP (already computed; do not repeat raw numbers):",
+            _qualitative_quant_summary(stock),
+            "",
+            "RECENT ALPACA NEWS:",
+            _format_news_for_llm(articles),
+            "",
+            "TASK:",
+            "Compress only the news/context that could matter over the next few trading sessions.",
+            "Do not score, rank, recommend a trade, or invent information.",
+        ]
+    )
+def _extract_json_object(content: str) -> dict[str, Any]:
+    text = content.strip()
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    raise ResearchAgentError(
+        f"Featherless returned invalid research JSON: {content!r}"
+    )
+def _normalize_field(value: Any, max_words: int | None = None) -> str | None:
+    if value is None:
+        return None
+    text = _clean_text(value)
+    if not text or text.lower() in {"null", "none", "n/a"}:
+        return None
+    if max_words is not None:
+        words = text.split()
+        text = " ".join(words[:max_words])
+    return text or None
+def compress_news(
+    stock: ScannedStock,
+    articles: Sequence[NewsArticle],
+    *,
+    model: str | None = None,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+) -> ResearchReport:
+    """Compress one stock's recent news into a small structured report."""
+    selected_model = _get_research_model(model)
+    # If there is no news, avoid spending an LLM call just to say so.
+    if not articles:
+        return ResearchReport(
+            symbol=stock.symbol.upper(),
+            quantitative_summary=_qualitative_quant_summary(stock),
+            news="No material recent news found.",
+            catalyst=None,
+            risk=None,
+            timing="NONE",
+            article_count=0,
+            articles=tuple(articles),
+        )
+    prompt = build_research_prompt(stock, articles)
+    api_key = os.getenv("FEATHERLESS_API_KEY")
+    if not api_key:
+        raise ResearchAgentError(
+            "Missing FEATHERLESS_API_KEY. Add it to .env or the environment."
+        )
+    try:
+        response = requests.post(
+            f"{FEATHERLESS_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "alpaca-agent",
+                "X-Title": "Alpaca Options Trading Agent - Research",
+            },
+            json={
+                "model": selected_model,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "chat_template_kwargs": {"thinking": False},
+            },
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        raise ResearchAgentError(
+            f"Featherless research request failed for {stock.symbol}: {exc}"
+        ) from exc
+    except ValueError as exc:
+        raise ResearchAgentError(
+            f"Featherless returned non-JSON response for {stock.symbol}."
+        ) from exc
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ResearchAgentError(
+            f"Unexpected Featherless response format for {stock.symbol}: {payload!r}"
+        ) from exc
+    if not content:
+        raise ResearchAgentError(
+            f"Featherless returned an empty research response for {stock.symbol}."
+        )
+    result = _extract_json_object(content)
+    timing = _normalize_field(result.get("timing")) or "UNKNOWN"
+    timing = timing.upper()
+    if timing not in {"IMMEDIATE", "NEAR_TERM", "UNKNOWN", "NONE"}:
+        timing = "UNKNOWN"
+    return ResearchReport(
+        symbol=stock.symbol.upper(),
+        quantitative_summary=_qualitative_quant_summary(stock),
+        news=_normalize_field(result.get("news"), max_words=40)
+        or "No material recent news summary was produced.",
+        catalyst=_normalize_field(result.get("catalyst"), max_words=22),
+        risk=_normalize_field(result.get("risk"), max_words=22),
+        timing=timing,
+        article_count=len(articles),
+        articles=tuple(articles),
+    )
+def research_stock(
+    stock: ScannedStock,
+    *,
+    model: str | None = None,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    max_articles: int = DEFAULT_MAX_ARTICLES,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> ResearchReport:
+    """Fetch Alpaca news and produce a compact research report for one stock."""
+    articles = fetch_stock_news(
+        stock.symbol,
+        lookback_days=lookback_days,
+        max_articles=max_articles,
+    )
+    return compress_news(
+        stock,
+        articles,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+def research_stocks(
+    stocks: Sequence[ScannedStock],
+    *,
+    model: str | None = None,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    max_articles: int = DEFAULT_MAX_ARTICLES,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> dict[str, ResearchReport]:
+    """
+    Research multiple scanner candidates concurrently.
+    Failures for individual symbols are converted to compact fallback reports so one
+    bad news/model response does not kill the whole scanner -> research -> ranker path.
+    """
+    if not stocks:
+        return {}
+    if max_workers <= 0:
+        raise ValueError("max_workers must be positive")
+    reports: dict[str, ResearchReport] = {}
+    def _run(stock: ScannedStock) -> ResearchReport:
+        try:
+            return research_stock(
+                stock,
+                model=model,
+                lookback_days=lookback_days,
+                max_articles=max_articles,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except ResearchAgentError as exc:
+            return ResearchReport(
+                symbol=stock.symbol.upper(),
+                quantitative_summary=_qualitative_quant_summary(stock),
+                news=f"Research unavailable: {str(exc)[:120]}",
+                catalyst=None,
+                risk="Recent news could not be evaluated.",
+                timing="UNKNOWN",
+                article_count=0,
+                articles=(),
+            )
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(stocks))) as executor:
+        futures = {executor.submit(_run, stock): stock.symbol.upper() for stock in stocks}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            report = future.result()
+            reports[symbol] = report
+    # Preserve scanner order for deterministic downstream prompt construction.
+    return {stock.symbol.upper(): reports[stock.symbol.upper()] for stock in stocks}
+def print_research_reports(
+    reports: Sequence[ResearchReport] | Mapping[str, ResearchReport],
+) -> None:
+    report_items = reports.values() if isinstance(reports, Mapping) else reports
+    print("\n" + "=" * 120)
+    print(" RESEARCH REPORTS")
+    print("=" * 120)
+    for report in report_items:
+        print(f"\n[{report.symbol}]")
+        print(f"Articles:  {report.article_count}")
+        print(f"Quant:     {report.quantitative_summary}")
+        print(f"News:      {report.news}")
+        print(f"Catalyst:  {report.catalyst or 'None'}")
+        print(f"Risk:      {report.risk or 'None'}")
+        print(f"Timing:    {report.timing}")
+        if report.articles:
+            print("Source articles:")
+            for article in report.articles:
+                print(
+                    f"  - {article.source} | "
+                    f"{article.published_at} | "
+                    f"{article.headline}"
+                )
+def research_text_by_symbol(
+    reports: Mapping[str, ResearchReport],
+) -> dict[str, str]:
+    """Convert reports into the mapping expected by strategy.llm_ranker.rank_stocks()."""
+    return {
+        symbol.upper(): report.to_text()
+        for symbol, report in reports.items()
+    }
+if __name__ == "__main__":
+    raise SystemExit(
+        "research_agent.py is a library module; call research_stock(s) from the orchestration layer."
+    )
+=====
 # FILE: strategy/scanner.py
 =====
 from dataclasses import dataclass
@@ -2029,6 +3054,14 @@ from strategy.trade_scorer import score_trade, ScoredTrade, validate_trade
 from strategy.portfolio import build_portfolio, print_portfolio_plan
 from risk.risk import assess_portfolio, print_risk_report
 from strategy.direction import TradeDirection, determine_direction
+from strategy.research_agent import (
+    research_stocks,
+    research_text_by_symbol,
+    print_research_reports,
+)
+from strategy.llm_ranker import rank_stocks
+from strategy.option_ranker import rank_options
+from config import STOCK_SCANNER_TOP_N, LLM_STOCK_TOP_K
 def main() -> None:
     trading_client = get_trading_client()
     account = trading_client.get_account()
@@ -2039,15 +3072,56 @@ def main() -> None:
     print(f"Options level:  {account.options_trading_level} (approved: {account.options_approved_level})")
     # 1. Scan 50-stock universe and display top 15 ranked candidates
     print("\nScanning 50-stock universe...")
-    top_candidates = print_top_scanned_stocks(top_n=15)
-    # 2. Inspect directional option candidates for the top stocks
+    top_candidates = print_top_scanned_stocks(
+        top_n=STOCK_SCANNER_TOP_N
+    )
     if top_candidates:
-        latest_prices = get_latest_underlying_prices(
-            [stock.symbol for stock in top_candidates]
+        # Research all scanner-selected stocks.
+        research_reports = research_stocks(top_candidates)
+        print_research_reports(research_reports)
+        research = research_text_by_symbol(research_reports)
+        # LLM ranks stocks comparatively.
+        ranked_symbols = rank_stocks(
+            stocks=top_candidates,
+            research=research,
+            debug=True,
         )
-        print("\nAnalyzing option opportunities across top 15 stocks...")
+        # Restore ScannedStock objects in LLM order.
+        stocks_by_symbol = {
+            stock.symbol: stock
+            for stock in top_candidates
+        }
+        ranked_candidates = [
+            stocks_by_symbol[symbol]
+            for symbol in ranked_symbols
+        ]
+        print("\n" + "=" * 120)
+        print(" LLM STOCK RANKING")
+        print("=" * 120)
+        for llm_rank, symbol in enumerate(ranked_symbols, start=1):
+            stock = stocks_by_symbol[symbol]
+            scanner_rank = stock.rank if stock.rank is not None else "-"
+            print(
+                f"#{llm_rank:<2} "
+                f"{symbol:<6} "
+                f"Scanner=#{scanner_rank:<3} "
+                f"ScannerScore={stock.score:>5.1f}"
+            )
+        # Only send LLM top-K into option selection.
+        selected_stocks = ranked_candidates[:LLM_STOCK_TOP_K]
+        print("\nLLM-RANKED STOCKS")
+        for rank, stock in enumerate(selected_stocks, start=1):
+            print(
+                f"#{rank:<2} {stock.symbol:<6} "
+                f"Scanner=#{stock.rank:<2} "
+                f"ScannerScore={stock.score:.1f}"
+            )
+        latest_prices = get_latest_underlying_prices(
+            [stock.symbol for stock in selected_stocks]
+        )
+        print("\nAnalyzing option opportunities across LLM top-K...")
         all_trade_candidates = []
-        for stock in top_candidates:
+        for stock in selected_stocks:
             underlying_price = latest_prices.get(stock.symbol)
             if underlying_price is None:
                 print(
@@ -2071,7 +3145,20 @@ def main() -> None:
                 underlying_price=underlying_price,
                 direction=direction.value.lower(),
             )
-            for option in options[:5]:
+            ranked_option_symbols = rank_options(
+                stock=stock,
+                options=options,
+                research=research.get(stock.symbol, ""),
+            )
+            options_by_symbol = {
+                option.symbol: option
+                for option in options
+            }
+            selected_options = [
+                options_by_symbol[symbol]
+                for symbol in ranked_option_symbols[:2]
+            ]
+            for option in selected_options:
                 decision = analyze_trade(option, stock)
                 if decision.decision == "WATCH":
                     continue

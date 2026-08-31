@@ -1,15 +1,11 @@
 from alpaca_client.client import get_trading_client
-from alpaca_client.options import print_best_candidates, inspect_options, get_option_chain
+from alpaca_client.options import get_option_chain
 from alpaca_client.stocks import (
     print_top_scanned_stocks,
     get_latest_underlying_prices,
 )
 
 from strategy.option_selector import select_directional_options
-from strategy.llm import analyze_trade
-from strategy.trade_scorer import score_trade, ScoredTrade, validate_trade
-from strategy.portfolio import build_portfolio, print_portfolio_plan
-from risk.risk import assess_portfolio, print_risk_report
 from strategy.direction import TradeDirection, determine_direction
 from strategy.research_agent import (
     research_stocks,
@@ -17,6 +13,7 @@ from strategy.research_agent import (
     print_research_reports,
 )
 from strategy.llm_ranker import rank_stocks
+from strategy.option_ranker import rank_option_pool
 from config import STOCK_SCANNER_TOP_N, LLM_STOCK_TOP_K
 
 def main() -> None:
@@ -88,101 +85,80 @@ def main() -> None:
             [stock.symbol for stock in selected_stocks]
         )
 
-        print("\nAnalyzing option opportunities across LLM top-K...")
-        all_trade_candidates = []
+        all_options = []
+        stocks_by_symbol = {}
+        directions_by_symbol = {}
 
         for stock in selected_stocks:
             underlying_price = latest_prices.get(stock.symbol)
-            if underlying_price is None:
-                print(
-                    f"Skipping {stock.symbol}: "
-                    "no fresh underlying price available."
-                )
-                continue
 
-            if underlying_price <= 0:
-                print(
-                    f"Skipping {stock.symbol}: "
-                    f"invalid underlying price {underlying_price}."
-                )
+            if underlying_price is None or underlying_price <= 0:
+                print(f"Skipping {stock.symbol}: no valid live price.")
                 continue
-
-            # Get option chain
-            chain = get_option_chain(stock.symbol)
 
             direction = determine_direction(stock)
 
             if direction == TradeDirection.NEUTRAL:
                 continue
 
+            chain = get_option_chain(stock.symbol)
+
             options = select_directional_options(
                 chain=chain,
                 underlying_price=underlying_price,
                 direction=direction.value.lower(),
             )
-            for option in options[:5]:
-                decision = analyze_trade(option, stock)
 
-                if decision.decision == "WATCH":
-                    continue
+            if not options:
+                continue
 
-                scored_trade = score_trade(
-                    stock=stock,
-                    option=option,
-                    decision=decision,
-                    underlying_price=underlying_price,
-                )
+            stocks_by_symbol[stock.symbol] = stock
+            directions_by_symbol[stock.symbol] = direction.value
+            all_options.extend(options)
 
-                is_valid, reason = validate_trade(scored_trade)
+        if not all_options:
+            print("No option candidates survived deterministic filtering.")
+            return
 
-                if not is_valid:
-                    print(
-                        f"Skipping {scored_trade.option_symbol}: {reason}"
-                    )
-                    continue
+        ranked_option_symbols = rank_option_pool(
+            options=all_options,
+            stocks=stocks_by_symbol,
+            directions=directions_by_symbol,
+            research=research,
+            debug=True,
+        )
 
-                all_trade_candidates.append(scored_trade)
-    
+        TOP_OPTIONS = 5
+
+        ranked_option_symbols = ranked_option_symbols[:TOP_OPTIONS]
+
+        options_by_symbol = {
+            option.symbol: option
+            for option in all_options
+        }
+
+        selected_options = [
+            options_by_symbol[symbol]
+            for symbol in ranked_option_symbols
+        ]
+
         print("\n" + "=" * 120)
-        print(" TOP TRADE CANDIDATES")
+        print(" TOP RANKED OPTIONS (GLOBAL)")
         print("=" * 120)
 
-        all_trade_candidates.sort(
-            key=lambda x: x.trade_score,
-            reverse=True,
-        )
-
-        for i, trade in enumerate(all_trade_candidates[:20], start=1):
+        for rank, option in enumerate(selected_options, start=1):
             print(
-                f"#{i:<3} "
-                f"{trade.stock_symbol:<6} "
-                f"{trade.direction:<8} "
-                f"TradeScore={trade.trade_score:>5.1f} "
-                f"StockScore={trade.stock_score:>5.1f} "
-                f"OptScore={trade.option_score:>5.1f} "
-                f"LLM={trade.llm_confidence:.2f} "
-                f"Option={trade.option_symbol}"
+                f"#{rank:<2} "
+                f"{option.symbol:<24} "
+                f"Type={option.option_type.upper():<4} "
+                f"Strike=${option.strike:<7.2f} "
+                f"DTE={option.dte:<3} "
+                f"Mid=${option.mid:<6.2f} "
+                f"Spread={option.spread_pct:<6.1%} "
+                f"Delta={option.delta if option.delta is not None else 0.0:+.3f} "
+                f"Score={option.score:>5.1f}"
             )
 
-        portfolio = build_portfolio(
-            trades=all_trade_candidates,
-            account_equity=float(account.equity),
-        )
-
-        print_portfolio_plan(
-            positions=portfolio,
-            account_equity=float(account.equity),
-        )
-
-        risk_report = assess_portfolio(
-            positions=portfolio,
-            account_equity=float(account.equity),
-        )
-
-        print_risk_report(
-            report=risk_report,
-            account_equity=float(account.equity),
-        )
 
 if __name__ == "__main__":
     main()
