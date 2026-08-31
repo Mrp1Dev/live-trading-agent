@@ -8,6 +8,7 @@ from typing import Mapping, Sequence
 import requests
 from dotenv import load_dotenv
 
+from config import OPTION_LLM_TOP_K
 from strategy.option_selector import OptionCandidate
 from strategy.scanner import ScannedStock
 
@@ -15,7 +16,7 @@ load_dotenv()
 
 FEATHERLESS_URL = "https://api.featherless.ai/v1/chat/completions"
 DEFAULT_MODEL_ENV = "FEATHERLESS_MODEL"
-DEFAULT_MAX_TOKENS = 320
+DEFAULT_MAX_TOKENS = 96
 DEFAULT_TEMPERATURE = 0.0
 
 
@@ -54,15 +55,28 @@ def _fmt_pct(value: float | None, digits: int = 1) -> str:
     return f"{value:.{digits}%}"
 
 
-def _build_option_block(option: OptionCandidate, stock_symbol: str) -> str:
+def _build_option_block(
+    option_id: str,
+    option: OptionCandidate,
+    stock_symbol: str,
+) -> str:
     return (
-        f"{option.symbol} | stock={stock_symbol} | "
-        f"{option.option_type} | exp={option.expiration.isoformat()} | DTE={option.dte} | "
-        f"strike=${option.strike:.2f} | mny={_fmt_pct(option.moneyness_pct)} | "
-        f"ask=${option.ask:.2f} | spread={_fmt_pct(option.spread_pct)} | "
-        f"IV={_fmt_pct(option.iv)} | delta={_fmt(option.delta)} | "
-        f"gamma={_fmt(option.gamma)} | theta={_fmt(option.theta)} | "
-        f"vega={_fmt(option.vega)} | selector={option.score:.1f}"
+        f"{option_id} | "
+        f"symbol={option.symbol} | "
+        f"stock={stock_symbol} | "
+        f"{option.option_type} | "
+        f"exp={option.expiration.isoformat()} | "
+        f"DTE={option.dte} | "
+        f"strike=${option.strike:.2f} | "
+        f"mny={_fmt_pct(option.moneyness_pct)} | "
+        f"ask=${option.ask:.2f} | "
+        f"spread={_fmt_pct(option.spread_pct)} | "
+        f"IV={_fmt_pct(option.iv)} | "
+        f"delta={_fmt(option.delta)} | "
+        f"gamma={_fmt(option.gamma)} | "
+        f"theta={_fmt(option.theta)} | "
+        f"vega={_fmt(option.vega)} | "
+        f"selector={option.score:.1f}"
     )
 
 
@@ -103,15 +117,25 @@ def build_option_pool_prompt(
     stocks: Mapping[str, ScannedStock],
     directions: Mapping[str, str],
     research: Mapping[str, str] | None = None,
+    top_k: int = OPTION_LLM_TOP_K,
 ) -> str:
-    """Build one compact prompt for a cross-underlying option pool."""
+    """Build one compact prompt for a cross-underlying top-K option ranking."""
     if not options:
         raise ValueError("options must not be empty")
 
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+
+    top_k = min(top_k, len(options))
     research = research or {}
-    stock_by_symbol = {symbol.upper(): stock for symbol, stock in stocks.items()}
+
+    stock_by_symbol = {
+        symbol.upper(): stock
+        for symbol, stock in stocks.items()
+    }
 
     option_symbols = [option.symbol for option in options]
+
     if len(option_symbols) != len(set(option_symbols)):
         raise ValueError("options contains duplicate symbols")
 
@@ -125,6 +149,7 @@ def build_option_pool_prompt(
         for symbol in underlyings
         if symbol not in stock_by_symbol
     )
+
     if missing_context:
         raise ValueError(
             "Missing stock context for: " + ", ".join(missing_context)
@@ -141,19 +166,29 @@ def build_option_pool_prompt(
 
     option_blocks = [
         _build_option_block(
+            option_id=f"OPT{index:03d}",
             option=option,
-            stock_symbol=_underlying_for_option(option, stock_by_symbol),
+            stock_symbol=_underlying_for_option(
+                option,
+                stock_by_symbol,
+            ),
         )
-        for option in options
+        for index, option in enumerate(options, start=1)
     ]
 
     return f"""Rank the supplied option contracts GLOBALLY by attractiveness for the short-horizon options strategy.
 
-You are comparing contracts across DIFFERENT underlyings. Do not rank options separately by stock.
+You are comparing contracts across DIFFERENT underlyings.
+Do not rank options separately by stock.
+
+Each option has a temporary identifier such as OPT001, OPT002, etc.
+
+Use ONLY those temporary identifiers in your final answer.
+Do NOT return the full option symbols.
+
 The deterministic option selector has already removed invalid/unusable contracts.
 
-Return ONLY a JSON array containing every supplied option symbol exactly once, strongest to weakest.
-Do not assign scores, probabilities, explanations, or new contracts.
+Return ONLY the TOP {top_k} option identifiers, strongest to weakest.
 
 Judge each contract using:
 - fit with its underlying's direction and thesis
@@ -175,7 +210,11 @@ AVAILABLE OPTION POOL
 
 FINAL OUTPUT REQUIREMENTS:
 Return ONLY a JSON array.
-Include every supplied option symbol exactly once.
+Return exactly {top_k} identifiers.
+Use identifiers like OPT001, OPT002, OPT003.
+Do not return option symbols.
+Do not repeat identifiers.
+Every identifier must come from the supplied option pool.
 Order from strongest overall opportunity to weakest overall opportunity.
 """
 
@@ -207,25 +246,42 @@ def _extract_json_array(content: str) -> list[str]:
     return [item.strip() for item in parsed]
 
 
-def _validate_ranking(
-    ranked_symbols: Sequence[str],
+def _validate_top_k_ranking(
+    ranked_ids: Sequence[str],
     options: Sequence[OptionCandidate],
+    top_k: int,
 ) -> list[str]:
-    expected = [option.symbol for option in options]
-    expected_set = set(expected)
-    actual = list(ranked_symbols)
+    expected_count = min(top_k, len(options))
 
-    if len(actual) != len(expected):
+    actual = [
+        item.strip().upper()
+        for item in ranked_ids
+    ]
+
+    if len(actual) != expected_count:
         raise OptionRankerError(
-            f"Option ranking length mismatch: expected {len(expected)}, got {len(actual)}."
+            f"Option ranking returned {len(actual)} identifiers; "
+            f"expected {expected_count}."
         )
+
     if len(set(actual)) != len(actual):
-        raise OptionRankerError("Option ranking contains duplicate symbols.")
-    if set(actual) != expected_set:
-        missing = sorted(expected_set - set(actual))
-        unexpected = sorted(set(actual) - expected_set)
         raise OptionRankerError(
-            f"Invalid option ranking. Missing={missing}, unexpected={unexpected}."
+            "Option ranking contains duplicate identifiers."
+        )
+
+    expected_ids = {
+        f"OPT{index:03d}"
+        for index in range(1, len(options) + 1)
+    }
+
+    unexpected = sorted(
+        set(actual) - expected_ids
+    )
+
+    if unexpected:
+        raise OptionRankerError(
+            "Option ranking contains unknown identifiers: "
+            + ", ".join(unexpected)
         )
 
     return actual
@@ -237,6 +293,7 @@ def rank_option_pool(
     directions: Mapping[str, str],
     research: Mapping[str, str] | None = None,
     *,
+    top_k: int = OPTION_LLM_TOP_K,
     model: str | None = None,
     temperature: float = DEFAULT_TEMPERATURE,
     max_tokens: int = DEFAULT_MAX_TOKENS,
@@ -251,6 +308,11 @@ def rank_option_pool(
     if not options:
         return []
 
+    if top_k <= 0:
+        return []
+
+    top_k = min(top_k, len(options))
+
     shuffled_options = list(options)
     random.SystemRandom().shuffle(shuffled_options)
 
@@ -259,6 +321,7 @@ def rank_option_pool(
         stocks=stocks,
         directions=directions,
         research=research,
+        top_k=top_k,
     )
 
     if debug:
@@ -274,8 +337,11 @@ def rank_option_pool(
             {
                 "role": "system",
                 "content": (
-                    "You rank a pool of options globally. "
-                    "Return only the required JSON array."
+                    f"You rank a pool of options globally. "
+                    f"Return ONLY a JSON array containing the top {top_k} "
+                    f"temporary option identifiers such as OPT001 and OPT042. "
+                    f"Never return full option symbols. "
+                    f"Never return more than {top_k} identifiers."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -336,8 +402,23 @@ def rank_option_pool(
             f"response={response_payload!r}"
         )
 
-    ranked = _extract_json_array(content)
-    return _validate_ranking(ranked, options)
+    ranked_ids = _extract_json_array(content)
+
+    validated_ids = _validate_top_k_ranking(
+        ranked_ids=ranked_ids,
+        options=options,
+        top_k=top_k,
+    )
+
+    option_by_id = {
+        f"OPT{index:03d}": option
+        for index, option in enumerate(options, start=1)
+    }
+
+    return [
+        option_by_id[option_id].symbol
+        for option_id in validated_ids
+    ]
 
 
 def top_ranked_options(

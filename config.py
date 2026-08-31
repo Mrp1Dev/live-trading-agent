@@ -1,11 +1,13 @@
 from datetime import date
 
 # ============================================================
-# SCANNER / RESEARCH / LLM
+# SCANNER / RESEARCH / LLM FUNNEL
 # ============================================================
 
-STOCK_SCANNER_TOP_N = 15
-LLM_STOCK_TOP_K = 5
+STOCK_SCANNER_TOP_N = 20
+LLM_STOCK_TOP_K = 8
+MAX_OPTIONS_PER_STOCK = 6
+OPTION_LLM_TOP_K = 8
 
 # ============================================================
 # PORTFOLIO / RISK
@@ -16,7 +18,7 @@ MAX_SINGLE_TRADE_RISK_PCT = 0.025
 MAX_UNDERLYING_RISK_PCT = 0.03
 MAX_DIRECTION_RISK_PCT = 0.075
 
-MAX_POSITIONS = 6
+MAX_POSITIONS = 5
 MIN_TRADE_SCORE = 70.0
 
 # Greeks are warnings for now, not hard portfolio vetoes.

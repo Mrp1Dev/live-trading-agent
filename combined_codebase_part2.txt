@@ -1,0 +1,1854 @@
+=====
+# FILE: strategy/portfolio.py
+=====
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import List
+@dataclass
+class PortfolioPosition:
+    trade: object
+    contracts: int
+    max_loss: float
+    premium_deployed: float
+    risk_weight: float
+from config import (
+    MAX_TOTAL_RISK_PCT,
+    MAX_SINGLE_TRADE_RISK_PCT,
+    MAX_UNDERLYING_RISK_PCT,
+    MAX_POSITIONS,
+    MIN_TRADE_SCORE,
+)
+def _estimated_entry_price(trade) -> float:
+    """
+    Estimate the executable entry price for sizing.
+    Current strategy only supports buying single-leg options,
+    so the conservative reference price is the ask.
+    Midpoint remains a useful informational/reference value,
+    but should not be used to size a live position.
+    """
+    if trade.option_ask > 0:
+        return trade.option_ask
+    return trade.option_mid
+def _per_contract_risk(trade) -> float:
+    """
+    Current system assumes long single-leg options.
+    For a long option:
+        max loss = premium paid × 100
+    Position sizing uses the estimated executable entry price,
+    not the midpoint.
+    """
+    entry_price = _estimated_entry_price(trade)
+    if entry_price <= 0:
+        return 0.0
+    return entry_price * 100.0
+def _trade_weight(trade) -> float:
+    """
+    Convert trade quality into an allocation weight.
+    Higher-scoring trades receive disproportionately more
+    risk budget, rather than everything being allocated equally.
+    """
+    # Start with score above our minimum acceptable threshold.
+    excess_score = max(
+        0.0,
+        trade.trade_score - MIN_TRADE_SCORE,
+    )
+    if excess_score <= 0:
+        return 0.0
+    # Square the advantage so materially better trades receive
+    # noticeably more capital.
+    return excess_score ** 2
+def select_best_trade_per_stock(
+    trades: List[object],
+) -> List[object]:
+    """
+    Only keep the best complete trade for each underlying.
+    This prevents the portfolio from accidentally holding:
+        MSTR 130C
+        MSTR 128C
+        MSTR 129C
+        ...
+    and treating them as independent opportunities.
+    """
+    best_by_symbol = {}
+    for trade in trades:
+        existing = best_by_symbol.get(trade.stock_symbol)
+        if (
+            existing is None
+            or trade.trade_score > existing.trade_score
+        ):
+            best_by_symbol[trade.stock_symbol] = trade
+    return sorted(
+        best_by_symbol.values(),
+        key=lambda t: t.trade_score,
+        reverse=True,
+    )
+def build_portfolio(
+    trades: List[object],
+    account_equity: float,
+    total_risk_pct: float = MAX_TOTAL_RISK_PCT,
+    max_trade_risk_pct: float = MAX_SINGLE_TRADE_RISK_PCT,
+    max_underlying_risk_pct: float = MAX_UNDERLYING_RISK_PCT,
+    max_positions: int = MAX_POSITIONS,
+    min_trade_score: float = MIN_TRADE_SCORE,
+) -> List[PortfolioPosition]:
+    """
+    Convert ranked trades into a proposed portfolio.
+    Current instrument assumption:
+        long calls / long puts.
+    The portfolio is allocated by MAXIMUM LOSS, not buying power.
+    Example:
+        $100,000 account
+        total_risk = 12%
+        => max planned loss = $12,000
+    This is a proposed portfolio. The risk engine gets the
+    final veto before anything can be executed.
+    """
+    if account_equity <= 0:
+        raise ValueError("account_equity must be positive")
+    if total_risk_pct <= 0:
+        raise ValueError("total_risk_pct must be positive")
+    if max_trade_risk_pct <= 0:
+        raise ValueError("max_trade_risk_pct must be positive")
+    if max_underlying_risk_pct <= 0:
+        raise ValueError(
+            "max_underlying_risk_pct must be positive"
+        )
+    max_total_risk = account_equity * total_risk_pct
+    max_trade_risk = account_equity * max_trade_risk_pct
+    # ---------------------------------------------------------
+    # 1. Remove weak trades.
+    # ---------------------------------------------------------
+    eligible = [
+        trade
+        for trade in trades
+        if trade.trade_score >= min_trade_score
+    ]
+    # ---------------------------------------------------------
+    # 2. One trade per underlying.
+    # ---------------------------------------------------------
+    eligible = select_best_trade_per_stock(eligible)
+    # ---------------------------------------------------------
+    # 3. Keep only best N underlyings.
+    # ---------------------------------------------------------
+    eligible = eligible[:max_positions]
+    if not eligible:
+        return []
+    # ---------------------------------------------------------
+    # 4. Calculate relative weights.
+    # ---------------------------------------------------------
+    weighted_trades = []
+    for trade in eligible:
+        weight = _trade_weight(trade)
+        if weight <= 0:
+            continue
+        per_contract_risk = _per_contract_risk(trade)
+        if per_contract_risk <= 0:
+            continue
+        weighted_trades.append(
+            (trade, weight, per_contract_risk)
+        )
+    if not weighted_trades:
+        return []
+    weight_sum = sum(
+        weight
+        for _, weight, _ in weighted_trades
+    )
+    # ---------------------------------------------------------
+    # 5. Convert risk budget into contracts.
+    # ---------------------------------------------------------
+    positions: List[PortfolioPosition] = []
+    for trade, weight, per_contract_risk in weighted_trades:
+        normalized_weight = weight / weight_sum
+        desired_risk = (
+            max_total_risk
+            * normalized_weight
+        )
+        # Hard single-trade cap.
+        allocated_risk = min(
+            desired_risk,
+            max_trade_risk,
+        )
+        contracts = int(
+            allocated_risk // per_contract_risk
+        )
+        if contracts <= 0:
+            continue
+        max_loss = contracts * per_contract_risk
+        positions.append(
+            PortfolioPosition(
+                trade=trade,
+                contracts=contracts,
+                max_loss=max_loss,
+                premium_deployed=max_loss,
+                risk_weight=normalized_weight,
+            )
+        )
+    # ---------------------------------------------------------
+    # 6. Ensure we never exceed total risk because of rounding.
+    # ---------------------------------------------------------
+    positions.sort(
+        key=lambda p: p.trade.trade_score,
+        reverse=True,
+    )
+    final_positions: List[PortfolioPosition] = []
+    running_risk = 0.0
+    for position in positions:
+        remaining_risk = max_total_risk - running_risk
+        if remaining_risk <= 0:
+            break
+        if position.max_loss <= remaining_risk:
+            final_positions.append(position)
+            running_risk += position.max_loss
+            continue
+        per_contract_risk = (
+            position.max_loss / position.contracts
+        )
+        allowed_contracts = int(
+            remaining_risk // per_contract_risk
+        )
+        if allowed_contracts <= 0:
+            continue
+        adjusted_loss = (
+            allowed_contracts
+            * per_contract_risk
+        )
+        final_positions.append(
+            PortfolioPosition(
+                trade=position.trade,
+                contracts=allowed_contracts,
+                max_loss=adjusted_loss,
+                premium_deployed=adjusted_loss,
+                risk_weight=position.risk_weight,
+            )
+        )
+        running_risk += adjusted_loss
+    return final_positions
+def print_portfolio_plan(
+    positions: List[PortfolioPosition],
+    account_equity: float,
+) -> None:
+    print("\n" + "=" * 130)
+    print(" PORTFOLIO PLAN")
+    print("=" * 130)
+    if not positions:
+        print("No trades passed portfolio construction.")
+        print("=" * 130)
+        return
+    print(
+        f"{'Rank':<5}"
+        f"{'Ticker':<8}"
+        f"{'Direction':<10}"
+        f"{'Contracts':>10}"
+        f"{'Premium':>13}"
+        f"{'Max Loss':>13}"
+        f"{'TradeScore':>12}"
+        f"  {'Option':<24}"
+    )
+    print("-" * 130)
+    total_premium = 0.0
+    total_risk = 0.0
+    for rank, position in enumerate(positions, start=1):
+        trade = position.trade
+        print(
+            f"{rank:<5}"
+            f"{trade.stock_symbol:<8}"
+            f"{trade.direction:<10}"
+            f"{position.contracts:>10}"
+            f"${position.premium_deployed:>12,.2f}"
+            f"${position.max_loss:>12,.2f}"
+            f"{trade.trade_score:>12.1f}"
+            f"  {trade.option_symbol:<24}"
+        )
+        total_premium += position.premium_deployed
+        total_risk += position.max_loss
+    print("-" * 130)
+    print(
+        f"Total premium deployed: ${total_premium:,.2f}"
+    )
+    print(
+        f"Total planned max loss: ${total_risk:,.2f} "
+        f"({total_risk / account_equity:.2%})"
+    )
+    print(
+        f"Account equity:          ${account_equity:,.2f}"
+    )
+    print(
+        f"Remaining capital:       "
+        f"${account_equity - total_premium:,.2f}"
+    )
+    print("=" * 130)
+=====
+# FILE: strategy/research_agent.py
+=====
+from __future__ import annotations
+import json
+import os
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Mapping, Sequence
+import requests
+from dotenv import load_dotenv
+from strategy.scanner import ScannedStock
+load_dotenv()
+ALPACA_NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
+FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
+DEFAULT_LOOKBACK_DAYS = 5
+DEFAULT_MAX_ARTICLES = 3
+DEFAULT_MAX_ARTICLE_SUMMARY_CHARS = 350
+DEFAULT_MAX_WORKERS = 8
+DEFAULT_TEMPERATURE = 0.0
+DEFAULT_MAX_TOKENS = 160
+DEFAULT_TIMEOUT_SECONDS = 30
+SYSTEM_PROMPT = """
+You are a market-news compression agent for an autonomous short-horizon options system.
+Your job is NOT to rank the stock, score it, recommend a trade, or predict a return.
+Compress the recent news into only the information that could matter over the next few
+trading sessions.
+The quantitative setup has already been computed deterministically. Translate it into
+short qualitative descriptors when useful, but do not repeat the raw numbers.
+Use only the supplied evidence. Do not invent catalysts, risks, dates, or facts.
+If there is no meaningful recent news, say so.
+Return ONLY JSON with exactly these keys:
+{
+  "news": "one concise sentence, maximum 40 words",
+  "catalyst": "one concise near-term catalyst, or null",
+  "risk": "one concise news-related risk/contradiction, or null",
+  "timing": "IMMEDIATE | NEAR_TERM | UNKNOWN | NONE"
+}
+IMMEDIATE means likely relevant within 1-2 trading days.
+NEAR_TERM means relevant within the short evaluation window but not clearly immediate.
+UNKNOWN means potentially relevant but timing is unclear.
+NONE means there is no meaningful recent catalyst.
+""".strip()
+@dataclass(frozen=True)
+class NewsArticle:
+    symbol: str
+    headline: str
+    summary: str
+    source: str
+    published_at: str
+    url: str | None = None
+@dataclass(frozen=True)
+class ResearchReport:
+    symbol: str
+    quantitative_summary: str
+    news: str
+    catalyst: str | None
+    risk: str | None
+    timing: str
+    article_count: int
+    articles: tuple[NewsArticle, ...] = ()
+    def to_text(self) -> str:
+        parts = [self.symbol, f"Quant: {self.quantitative_summary}"]
+        parts.append(f"News: {self.news}")
+        if self.catalyst:
+            parts.append(f"Catalyst: {self.catalyst}")
+        if self.risk:
+            parts.append(f"Risk: {self.risk}")
+        parts.append(f"Timing: {self.timing}")
+        return "\n".join(parts)
+class ResearchAgentError(RuntimeError):
+    """Raised when research retrieval or compression fails."""
+def _get_alpaca_credentials() -> tuple[str, str]:
+    api_key = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
+    secret_key = os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
+    if not api_key or not secret_key:
+        raise ResearchAgentError(
+            "Missing Alpaca API credentials. Set ALPACA_API_KEY and ALPACA_SECRET_KEY "
+            "(or APCA_API_KEY_ID and APCA_API_SECRET_KEY) in .env."
+        )
+    return api_key, secret_key
+def _get_research_model(model: str | None) -> str:
+    selected = model or os.getenv("FEATHERLESS_RESEARCH_MODEL")
+    if not selected:
+        raise ResearchAgentError(
+            "No research model selected. Pass model=... to research_stock(s) "
+            "or set FEATHERLESS_RESEARCH_MODEL in .env."
+        )
+    return selected
+def _clean_text(value: Any, max_chars: int | None = None) -> str:
+    if value is None:
+        return ""
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    if max_chars is not None and len(text) > max_chars:
+        text = text[: max_chars - 1].rstrip() + "…"
+    return text
+def _qualitative_quant_summary(stock: ScannedStock) -> str:
+    """Turn scanner values into compact semantic labels without an LLM call."""
+    labels: list[str] = []
+    # Momentum
+    if stock.return_20d >= 0.20 or stock.momentum_score >= 90:
+        labels.append("exceptionally strong momentum")
+    elif stock.return_20d >= 0.08 or stock.momentum_score >= 70:
+        labels.append("strong momentum")
+    elif stock.return_20d <= -0.20 or stock.momentum_score <= 10:
+        labels.append("exceptionally weak momentum")
+    elif stock.return_20d <= -0.08 or stock.momentum_score <= 30:
+        labels.append("weak momentum")
+    # Volume
+    if stock.volume_ratio >= 2.0 or stock.volume_score >= 90:
+        labels.append("unusually high volume")
+    elif stock.volume_ratio >= 1.25 or stock.volume_score >= 70:
+        labels.append("elevated volume")
+    # Volatility
+    if stock.realized_volatility >= 0.70 or stock.volatility_score >= 90:
+        labels.append("very high volatility")
+    elif stock.realized_volatility >= 0.45 or stock.volatility_score >= 70:
+        labels.append("elevated volatility")
+    # Relative strength
+    if stock.relative_strength_spy >= 0.15 or stock.relative_strength_score >= 90:
+        labels.append("exceptional relative strength")
+    elif stock.relative_strength_spy >= 0.05 or stock.relative_strength_score >= 70:
+        labels.append("strong relative strength")
+    elif stock.relative_strength_spy <= -0.15 or stock.relative_strength_score <= 10:
+        labels.append("exceptionally weak relative strength")
+    elif stock.relative_strength_spy <= -0.05 or stock.relative_strength_score <= 30:
+        labels.append("weak relative strength")
+    # Trend / extension
+    max_distance = max(abs(stock.distance_sma20), abs(stock.distance_sma50))
+    if max_distance >= 0.15:
+        labels.append("materially extended from trend")
+    elif max_distance >= 0.08:
+        labels.append("noticeably extended from trend")
+    if not labels:
+        return "mixed or moderate quantitative setup"
+    return ", ".join(labels)
+def _parse_article(raw: Mapping[str, Any], symbol: str) -> NewsArticle:
+    return NewsArticle(
+        symbol=symbol,
+        headline=_clean_text(raw.get("headline") or raw.get("title")),
+        summary=_clean_text(
+            raw.get("summary") or raw.get("content"),
+            DEFAULT_MAX_ARTICLE_SUMMARY_CHARS,
+        ),
+        source=_clean_text(raw.get("source") or raw.get("author") or "Unknown source", 80),
+        published_at=_clean_text(raw.get("created_at") or raw.get("updated_at") or "Unknown time", 40),
+        url=raw.get("url"),
+    )
+def _article_dedupe_key(article: NewsArticle) -> str:
+    title = re.sub(r"[^a-z0-9 ]+", "", article.headline.lower())
+    title = re.sub(r"\s+", " ", title).strip()
+    return title
+def _dedupe_articles(articles: Sequence[NewsArticle]) -> list[NewsArticle]:
+    seen: set[str] = set()
+    result: list[NewsArticle] = []
+    for article in articles:
+        key = _article_dedupe_key(article)
+        if not key:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(article)
+    return result
+def fetch_stock_news(
+    symbol: str,
+    *,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    max_articles: int = DEFAULT_MAX_ARTICLES,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+) -> list[NewsArticle]:
+    """Fetch recent Alpaca news for one stock, newest first."""
+    if lookback_days <= 0:
+        raise ValueError("lookback_days must be positive")
+    if max_articles <= 0:
+        return []
+    api_key, secret_key = _get_alpaca_credentials()
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=lookback_days)
+    params = {
+        "symbols": symbol.upper(),
+        "start": start.isoformat().replace("+00:00", "Z"),
+        "end": end.isoformat().replace("+00:00", "Z"),
+        "sort": "desc",
+        # Small on purpose: research is a compression step.
+        "limit": max_articles,
+        "include_content": "false",
+        "exclude_contentless": "true",
+    }
+    response = requests.get(
+        ALPACA_NEWS_URL,
+        headers={
+            "APCA-API-KEY-ID": api_key,
+            "APCA-API-SECRET-KEY": secret_key,
+        },
+        params=params,
+        timeout=timeout,
+    )
+    try:
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        raise ResearchAgentError(
+            f"Alpaca news request failed for {symbol}: {exc}"
+        ) from exc
+    except ValueError as exc:
+        raise ResearchAgentError(
+            f"Alpaca returned invalid news JSON for {symbol}."
+        ) from exc
+    raw_articles = payload.get("news", [])
+    if not isinstance(raw_articles, list):
+        raise ResearchAgentError(
+            f"Unexpected Alpaca news response for {symbol}."
+        )
+    parsed = [_parse_article(item, symbol.upper()) for item in raw_articles]
+    return _dedupe_articles(parsed)[:max_articles]
+def _format_news_for_llm(articles: Sequence[NewsArticle]) -> str:
+    if not articles:
+        return "NO MATERIAL RECENT NEWS FOUND."
+    lines: list[str] = []
+    for index, article in enumerate(articles, start=1):
+        headline = article.headline or "(no headline)"
+        summary = article.summary or "(no provider summary available)"
+        lines.extend(
+            [
+                f"ARTICLE {index}: {article.source} | {article.published_at}",
+                f"Headline: {headline}",
+                f"Summary: {summary}",
+            ]
+        )
+    return "\n".join(lines)
+def build_research_prompt(
+    stock: ScannedStock,
+    articles: Sequence[NewsArticle],
+) -> str:
+    """Build a compact stock-specific prompt for the cheap research model."""
+    return "\n".join(
+        [
+            "STOCK:",
+            stock.symbol.upper(),
+            "",
+            "QUANTITATIVE SETUP (already computed; do not repeat raw numbers):",
+            _qualitative_quant_summary(stock),
+            "",
+            "RECENT ALPACA NEWS:",
+            _format_news_for_llm(articles),
+            "",
+            "TASK:",
+            "Compress only the news/context that could matter over the next few trading sessions.",
+            "Do not score, rank, recommend a trade, or invent information.",
+        ]
+    )
+def _extract_json_object(content: str) -> dict[str, Any]:
+    text = content.strip()
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    raise ResearchAgentError(
+        f"Featherless returned invalid research JSON: {content!r}"
+    )
+def _normalize_field(value: Any, max_words: int | None = None) -> str | None:
+    if value is None:
+        return None
+    text = _clean_text(value)
+    if not text or text.lower() in {"null", "none", "n/a"}:
+        return None
+    if max_words is not None:
+        words = text.split()
+        text = " ".join(words[:max_words])
+    return text or None
+def compress_news(
+    stock: ScannedStock,
+    articles: Sequence[NewsArticle],
+    *,
+    model: str | None = None,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+) -> ResearchReport:
+    """Compress one stock's recent news into a small structured report."""
+    selected_model = _get_research_model(model)
+    # If there is no news, avoid spending an LLM call just to say so.
+    if not articles:
+        return ResearchReport(
+            symbol=stock.symbol.upper(),
+            quantitative_summary=_qualitative_quant_summary(stock),
+            news="No material recent news found.",
+            catalyst=None,
+            risk=None,
+            timing="NONE",
+            article_count=0,
+            articles=tuple(articles),
+        )
+    prompt = build_research_prompt(stock, articles)
+    api_key = os.getenv("FEATHERLESS_API_KEY")
+    if not api_key:
+        raise ResearchAgentError(
+            "Missing FEATHERLESS_API_KEY. Add it to .env or the environment."
+        )
+    try:
+        response = requests.post(
+            f"{FEATHERLESS_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "alpaca-agent",
+                "X-Title": "Alpaca Options Trading Agent - Research",
+            },
+            json={
+                "model": selected_model,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "chat_template_kwargs": {"thinking": False},
+            },
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        raise ResearchAgentError(
+            f"Featherless research request failed for {stock.symbol}: {exc}"
+        ) from exc
+    except ValueError as exc:
+        raise ResearchAgentError(
+            f"Featherless returned non-JSON response for {stock.symbol}."
+        ) from exc
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ResearchAgentError(
+            f"Unexpected Featherless response format for {stock.symbol}: {payload!r}"
+        ) from exc
+    if not content:
+        raise ResearchAgentError(
+            f"Featherless returned an empty research response for {stock.symbol}."
+        )
+    result = _extract_json_object(content)
+    timing = _normalize_field(result.get("timing")) or "UNKNOWN"
+    timing = timing.upper()
+    if timing not in {"IMMEDIATE", "NEAR_TERM", "UNKNOWN", "NONE"}:
+        timing = "UNKNOWN"
+    return ResearchReport(
+        symbol=stock.symbol.upper(),
+        quantitative_summary=_qualitative_quant_summary(stock),
+        news=_normalize_field(result.get("news"), max_words=40)
+        or "No material recent news summary was produced.",
+        catalyst=_normalize_field(result.get("catalyst"), max_words=22),
+        risk=_normalize_field(result.get("risk"), max_words=22),
+        timing=timing,
+        article_count=len(articles),
+        articles=tuple(articles),
+    )
+def research_stock(
+    stock: ScannedStock,
+    *,
+    model: str | None = None,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    max_articles: int = DEFAULT_MAX_ARTICLES,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> ResearchReport:
+    """Fetch Alpaca news and produce a compact research report for one stock."""
+    articles = fetch_stock_news(
+        stock.symbol,
+        lookback_days=lookback_days,
+        max_articles=max_articles,
+    )
+    return compress_news(
+        stock,
+        articles,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+def research_stocks(
+    stocks: Sequence[ScannedStock],
+    *,
+    model: str | None = None,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    max_articles: int = DEFAULT_MAX_ARTICLES,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> dict[str, ResearchReport]:
+    """
+    Research multiple scanner candidates concurrently.
+    Failures for individual symbols are converted to compact fallback reports so one
+    bad news/model response does not kill the whole scanner -> research -> ranker path.
+    """
+    if not stocks:
+        return {}
+    if max_workers <= 0:
+        raise ValueError("max_workers must be positive")
+    reports: dict[str, ResearchReport] = {}
+    def _run(stock: ScannedStock) -> ResearchReport:
+        try:
+            return research_stock(
+                stock,
+                model=model,
+                lookback_days=lookback_days,
+                max_articles=max_articles,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except ResearchAgentError as exc:
+            return ResearchReport(
+                symbol=stock.symbol.upper(),
+                quantitative_summary=_qualitative_quant_summary(stock),
+                news=f"Research unavailable: {str(exc)[:120]}",
+                catalyst=None,
+                risk="Recent news could not be evaluated.",
+                timing="UNKNOWN",
+                article_count=0,
+                articles=(),
+            )
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(stocks))) as executor:
+        futures = {executor.submit(_run, stock): stock.symbol.upper() for stock in stocks}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            report = future.result()
+            reports[symbol] = report
+    # Preserve scanner order for deterministic downstream prompt construction.
+    return {stock.symbol.upper(): reports[stock.symbol.upper()] for stock in stocks}
+def print_research_reports(
+    reports: Sequence[ResearchReport] | Mapping[str, ResearchReport],
+) -> None:
+    report_items = reports.values() if isinstance(reports, Mapping) else reports
+    print("\n" + "=" * 120)
+    print(" RESEARCH REPORTS")
+    print("=" * 120)
+    for report in report_items:
+        print(f"\n[{report.symbol}]")
+        print(f"Articles:  {report.article_count}")
+        print(f"Quant:     {report.quantitative_summary}")
+        print(f"News:      {report.news}")
+        print(f"Catalyst:  {report.catalyst or 'None'}")
+        print(f"Risk:      {report.risk or 'None'}")
+        print(f"Timing:    {report.timing}")
+        if report.articles:
+            print("Source articles:")
+            for article in report.articles:
+                print(
+                    f"  - {article.source} | "
+                    f"{article.published_at} | "
+                    f"{article.headline}"
+                )
+def research_text_by_symbol(
+    reports: Mapping[str, ResearchReport],
+) -> dict[str, str]:
+    """Convert reports into the mapping expected by strategy.llm_ranker.rank_stocks()."""
+    return {
+        symbol.upper(): report.to_text()
+        for symbol, report in reports.items()
+    }
+if __name__ == "__main__":
+    raise SystemExit(
+        "research_agent.py is a library module; call research_stock(s) from the orchestration layer."
+    )
+=====
+# FILE: strategy/scanner.py
+=====
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from typing import Dict, List, Optional
+import numpy as np
+import pandas as pd
+from strategy.universe import BENCHMARK_SYMBOL, UNIVERSE
+# ---------------------------------------------------------------------------
+# Market clock
+# ---------------------------------------------------------------------------
+# ZoneInfo needs the IANA database, which a bare Windows install does not ship.
+# Falling back to a fixed offset keeps the module importable; the exchange date
+# is what matters here and an hour of DST drift cannot change it.
+try:  # pragma: no cover - environment dependent
+    from zoneinfo import ZoneInfo
+    MARKET_TZ = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover - environment dependent
+    from datetime import timezone
+    MARKET_TZ = timezone(timedelta(hours=-4), name="America/New_York")
+# ---------------------------------------------------------------------------
+# Scoring configuration
+# ---------------------------------------------------------------------------
+# Composite weights. These sum to 1.0 and each component is on a 0-100 scale.
+WEIGHT_MOMENTUM = 0.30
+WEIGHT_VOLUME = 0.25
+WEIGHT_VOLATILITY = 0.20
+WEIGHT_RELATIVE_STRENGTH = 0.15
+WEIGHT_TREND = 0.10
+# Realized-volatility regime preference, annualized.
+#
+# The previous implementation scored volatility as an unsigned percentile, so the
+# single highest-volatility name in the universe scored 100. High realized vol
+# means high implied vol means expensive premium, and that premium was then
+# bought outright as a short-dated single leg: the selection criterion and the
+# instrument worked against each other.
+#
+# Volatility now expresses REGIME TRADEABILITY rather than "more is better":
+# a name too quiet to travel far enough to cover a breakeven scores badly, and so
+# does a name whose vol is so extreme that the premium is unaffordable and jump
+# risk dominates. Whether the premium is fairly priced is a different question,
+# and it is answered in one place only - the option selector's IV-vs-realized-vol
+# gate - so the two stages no longer fight over the same signal.
+VOL_BAND_LOW = 0.25       # below this, the name is too quiet to pay for premium
+VOL_BAND_HIGH = 0.55      # above this, premium gets expensive fast
+VOL_FLOOR = 0.10          # scores 0
+VOL_CEILING = 1.20        # scores 0
+MIN_BARS_REQUIRED = 21
+@dataclass
+class ScannedStock:
+    """Represents a scanned stock with raw technical metrics, component sub-scores,
+    and its composite score.
+    """
+    symbol: str
+    price: float
+    return_1d: float
+    return_5d: float
+    return_20d: float
+    volume: float
+    avg_volume_20d: float
+    volume_ratio: float
+    sma_20: float
+    sma_50: float
+    distance_sma20: float
+    distance_sma50: float
+    realized_volatility: float
+    relative_strength_spy: float
+    momentum_score: float
+    volume_score: float
+    volatility_score: float
+    relative_strength_score: float
+    trend_score: float
+    score: float
+    rank: Optional[int] = None
+# ---------------------------------------------------------------------------
+# Bar preparation
+# ---------------------------------------------------------------------------
+def _exchange_today(as_of: Optional[datetime] = None) -> date:
+    """Today's date on the exchange clock.
+    Never use the local system date. On a machine east of New York, the local
+    date rolls over hours before the exchange date does, which would classify the
+    most recent completed session as "today" and silently drop it.
+    """
+    if as_of is None:
+        return datetime.now(MARKET_TZ).date()
+    if as_of.tzinfo is None:
+        return as_of.date()
+    return as_of.astimezone(MARKET_TZ).date()
+def _completed_daily_bars(
+    df: pd.DataFrame,
+    as_of: Optional[datetime] = None,
+) -> pd.DataFrame:
+    """Return only completed daily bars, strictly before the exchange date.
+    `as_of` lets the scanner be replayed at a historical decision timestamp
+    instead of the wall clock, which is what makes a deterministic backtest
+    possible. Default behaviour is unchanged.
+    """
+    cutoff = _exchange_today(as_of)
+    sorted_df = df.sort_index()
+    index = sorted_df.index
+    # A tz-naive DatetimeIndex still HAS a `.tz` attribute (it is None), so
+    # testing with hasattr calls tz_convert on naive data and raises. Test the
+    # value, not the attribute's existence.
+    if getattr(index, "tz", None) is not None:
+        index_dates = index.tz_convert(MARKET_TZ).date
+    elif isinstance(index, pd.DatetimeIndex):
+        index_dates = index.date
+    else:
+        try:
+            index_dates = pd.to_datetime(index).date
+        except (TypeError, ValueError):
+            return sorted_df
+    return sorted_df.loc[index_dates < cutoff]
+def _clean_close_volume(sorted_df: pd.DataFrame) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    """Extract close/volume arrays, or None if the data cannot support metrics.
+    Missing or non-positive prices are treated as a data gap and reject the
+    symbol. They are deliberately NOT forward-filled or zero-filled: a fabricated
+    price produces a real-looking score, which is worse than no score at all.
+    """
+    if "close" not in sorted_df.columns or "volume" not in sorted_df.columns:
+        return None
+    closes = pd.to_numeric(sorted_df["close"], errors="coerce").to_numpy(dtype=float)
+    volumes = pd.to_numeric(sorted_df["volume"], errors="coerce").to_numpy(dtype=float)
+    if closes.size < MIN_BARS_REQUIRED:
+        return None
+    if not np.all(np.isfinite(closes)) or np.any(closes <= 0):
+        return None
+    if not np.all(np.isfinite(volumes)) or np.any(volumes < 0):
+        return None
+    return closes, volumes
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+def extract_stock_metrics(
+    symbol: str,
+    stock_df: pd.DataFrame,
+    spy_return_20d: float,
+    as_of: Optional[datetime] = None,
+) -> Optional[Dict]:
+    """Calculate raw technical metrics for a single stock from its daily bars.
+    Returns None when the bars cannot support a trustworthy metric set, so the
+    symbol is dropped rather than scored on defaults.
+    """
+    sorted_df = _completed_daily_bars(stock_df, as_of=as_of)
+    if len(sorted_df) < MIN_BARS_REQUIRED:
+        return None
+    cleaned = _clean_close_volume(sorted_df)
+    if cleaned is None:
+        return None
+    closes, volumes = cleaned
+    current_price = float(closes[-1])
+    # 1. Returns: 1-day, 5-day, 20-day
+    ret_1d = float((closes[-1] - closes[-2]) / closes[-2])
+    ret_5d = float((closes[-1] - closes[-6]) / closes[-6])
+    ret_20d = float((closes[-1] - closes[-21]) / closes[-21])
+    # 2. Volume / Average Volume (20-day historical average excluding current bar)
+    current_volume = float(volumes[-1])
+    avg_volume_20d = float(np.mean(volumes[-21:-1]))
+    if avg_volume_20d <= 0:
+        # No traded history to compare against; the ratio would be meaningless.
+        return None
+    volume_ratio = current_volume / avg_volume_20d
+    # 3. Distance from Moving Averages (20d & 50d)
+    sma_20 = float(np.mean(closes[-20:]))
+    dist_sma20 = (current_price - sma_20) / sma_20 if sma_20 > 0 else 0.0
+    if len(closes) >= 50:
+        sma_50 = float(np.mean(closes[-50:]))
+        dist_sma50 = (current_price - sma_50) / sma_50 if sma_50 > 0 else dist_sma20
+    else:
+        sma_50 = sma_20
+        dist_sma50 = dist_sma20
+    # 4. Realized Volatility (Annualized 20-day log return standard deviation)
+    log_returns = np.diff(np.log(closes[-21:]))
+    realized_vol = float(np.std(log_returns, ddof=1) * np.sqrt(252)) if log_returns.size > 1 else 0.0
+    # 5. Relative Strength vs SPY (20-day excess return over benchmark)
+    rs_spy = float(ret_20d - spy_return_20d)
+    # Raw factor indicators for ranking
+    raw_momentum = 0.20 * ret_1d + 0.30 * ret_5d + 0.50 * ret_20d
+    raw_volume = volume_ratio
+    raw_volatility = realized_vol
+    raw_relative_strength = rs_spy
+    raw_trend = 0.50 * dist_sma20 + 0.50 * dist_sma50
+    return {
+        "symbol": symbol,
+        "price": current_price,
+        "return_1d": ret_1d,
+        "return_5d": ret_5d,
+        "return_20d": ret_20d,
+        "volume": current_volume,
+        "avg_volume_20d": avg_volume_20d,
+        "volume_ratio": volume_ratio,
+        "sma_20": sma_20,
+        "sma_50": sma_50,
+        "distance_sma20": dist_sma20,
+        "distance_sma50": dist_sma50,
+        "realized_volatility": realized_vol,
+        "relative_strength_spy": rs_spy,
+        "raw_momentum": raw_momentum,
+        "raw_volume": raw_volume,
+        "raw_volatility": raw_volatility,
+        "raw_relative_strength": raw_relative_strength,
+        "raw_trend": raw_trend,
+    }
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+def _average_rank(values: np.ndarray) -> np.ndarray:
+    """Average-method ranks, identical to scipy.stats.rankdata(values).
+    Implemented locally so the scanner does not pull scipy in for one function.
+    Ties receive the mean of the ranks they span.
+    """
+    n = values.size
+    order = np.argsort(values, kind="mergesort")
+    ordered = values[order]
+    ranks = np.empty(n, dtype=float)
+    start = 0
+    while start < n:
+        stop = start
+        while stop + 1 < n and ordered[stop + 1] == ordered[start]:
+            stop += 1
+        ranks[order[start : stop + 1]] = (start + stop) / 2.0 + 1.0
+        start = stop + 1
+    return ranks
+def _percentile_scores(values: np.ndarray) -> np.ndarray:
+    """Map raw indicator values onto a 0-100 percentile scale."""
+    n = values.size
+    if n <= 1:
+        return np.full(n, 100.0)
+    return (_average_rank(values) - 1.0) / (n - 1.0) * 100.0
+def volatility_regime_score(realized_vol: float) -> float:
+    """Score a realized-volatility regime for tradeability, on 0-100.
+    Piecewise linear: full marks inside the band, tapering to zero at the floor
+    and the ceiling. This is an ABSOLUTE score, not a percentile, so it does not
+    depend on which other symbols happened to be scanned in the same batch -
+    the same stock on the same day always scores the same.
+    """
+    if not np.isfinite(realized_vol) or realized_vol <= VOL_FLOOR:
+        return 0.0
+    if realized_vol >= VOL_CEILING:
+        return 0.0
+    if VOL_BAND_LOW <= realized_vol <= VOL_BAND_HIGH:
+        return 100.0
+    if realized_vol < VOL_BAND_LOW:
+        return (realized_vol - VOL_FLOOR) / (VOL_BAND_LOW - VOL_FLOOR) * 100.0
+    return (VOL_CEILING - realized_vol) / (VOL_CEILING - VOL_BAND_HIGH) * 100.0
+def score_and_rank_stocks(metrics_list: List[Dict]) -> List[ScannedStock]:
+    """Normalize raw indicators into 0-100 scores and compute the weighted composite:
+        score = (
+            0.30 * momentum_score
+            + 0.25 * volume_score
+            + 0.20 * volatility_score
+            + 0.15 * relative_strength_score
+            + 0.10 * trend_score
+        )
+    Momentum, volume, relative strength and trend are cross-sectional percentiles
+    - they are comparative measures by nature. Volatility is scored absolutely
+    against a regime band (see volatility_regime_score).
+    """
+    n = len(metrics_list)
+    if n == 0:
+        return []
+    raw_momentum = np.array([m["raw_momentum"] for m in metrics_list], dtype=float)
+    raw_volume = np.array([m["raw_volume"] for m in metrics_list], dtype=float)
+    raw_relative_strength = np.array([m["raw_relative_strength"] for m in metrics_list], dtype=float)
+    raw_trend = np.array([m["raw_trend"] for m in metrics_list], dtype=float)
+    momentum_scores = _percentile_scores(raw_momentum)
+    volume_scores = _percentile_scores(raw_volume)
+    rs_scores = _percentile_scores(raw_relative_strength)
+    trend_scores = _percentile_scores(raw_trend)
+    scanned_stocks: List[ScannedStock] = []
+    for i, m in enumerate(metrics_list):
+        mom_score = float(momentum_scores[i])
+        vol_score = float(volume_scores[i])
+        vola_score = float(volatility_regime_score(m["raw_volatility"]))
+        rs_score = float(rs_scores[i])
+        tr_score = float(trend_scores[i])
+        composite_score = (
+            WEIGHT_MOMENTUM * mom_score
+            + WEIGHT_VOLUME * vol_score
+            + WEIGHT_VOLATILITY * vola_score
+            + WEIGHT_RELATIVE_STRENGTH * rs_score
+            + WEIGHT_TREND * tr_score
+        )
+        scanned_stocks.append(
+            ScannedStock(
+                symbol=m["symbol"],
+                price=m["price"],
+                return_1d=m["return_1d"],
+                return_5d=m["return_5d"],
+                return_20d=m["return_20d"],
+                volume=m["volume"],
+                avg_volume_20d=m["avg_volume_20d"],
+                volume_ratio=m["volume_ratio"],
+                sma_20=m["sma_20"],
+                sma_50=m["sma_50"],
+                distance_sma20=m["distance_sma20"],
+                distance_sma50=m["distance_sma50"],
+                realized_volatility=m["realized_volatility"],
+                relative_strength_spy=m["relative_strength_spy"],
+                momentum_score=mom_score,
+                volume_score=vol_score,
+                volatility_score=vola_score,
+                relative_strength_score=rs_score,
+                trend_score=tr_score,
+                score=composite_score,
+            )
+        )
+    # Sort descending by score, breaking ties on symbol so an identical universe
+    # always produces an identical ordering regardless of input order.
+    scanned_stocks.sort(key=lambda s: (-s.score, s.symbol))
+    for rank_idx, stock in enumerate(scanned_stocks, start=1):
+        stock.rank = rank_idx
+    return scanned_stocks
+# ---------------------------------------------------------------------------
+# Universe scan
+# ---------------------------------------------------------------------------
+def _available_symbols(bars_df: pd.DataFrame) -> set:
+    """Symbols that actually have rows in the frame.
+    `index.levels[0]` returns every category the index was BUILT with, including
+    symbols with no surviving rows, so membership tests against it report symbols
+    that are not really present. Use the realized values instead.
+    """
+    index = bars_df.index
+    if isinstance(index, pd.MultiIndex):
+        return set(index.get_level_values(0).unique())
+    return set()
+def _benchmark_return_20d(
+    bars_df: pd.DataFrame,
+    benchmark_symbol: str,
+    as_of: Optional[datetime] = None,
+) -> float:
+    """20-day benchmark return, or 0.0 when the benchmark is unavailable.
+    A missing benchmark makes relative strength collapse to plain return_20d,
+    which is a defensible fallback because the factor is only ever used as a
+    cross-sectional percentile: with no benchmark every symbol is offset by the
+    same constant, so the ranking is unchanged.
+    """
+    if benchmark_symbol not in _available_symbols(bars_df):
+        return 0.0
+    spy_df = _completed_daily_bars(bars_df.xs(benchmark_symbol, level=0), as_of=as_of)
+    if "close" not in spy_df.columns:
+        return 0.0
+    spy_closes = pd.to_numeric(spy_df["close"], errors="coerce").to_numpy(dtype=float)
+    spy_closes = spy_closes[np.isfinite(spy_closes)]
+    spy_closes = spy_closes[spy_closes > 0]
+    if spy_closes.size >= MIN_BARS_REQUIRED:
+        return float((spy_closes[-1] - spy_closes[-21]) / spy_closes[-21])
+    if spy_closes.size > 1:
+        return float((spy_closes[-1] - spy_closes[0]) / spy_closes[0])
+    return 0.0
+def scan_stock_bars(
+    bars_df: pd.DataFrame,
+    universe: Optional[List[str]] = None,
+    benchmark_symbol: str = BENCHMARK_SYMBOL,
+    top_n: int = 15,
+    as_of: Optional[datetime] = None,
+) -> List[ScannedStock]:
+    """Pure strategy scanner logic that processes a DataFrame of daily bars
+    and returns the top N ranked candidates. Makes no API calls.
+    """
+    target_universe = list(universe) if universe else list(UNIVERSE)
+    if bars_df is None or len(bars_df) == 0:
+        return []
+    # 1. Benchmark return for the relative-strength factor
+    spy_return_20d = _benchmark_return_20d(bars_df, benchmark_symbol, as_of=as_of)
+    # 2. Extract metrics for all available stocks in universe
+    metrics_list = []
+    available_symbols = _available_symbols(bars_df)
+    for symbol in target_universe:
+        if symbol not in available_symbols:
+            continue
+        sdf = bars_df.xs(symbol, level=0)
+        metrics = extract_stock_metrics(symbol, sdf, spy_return_20d, as_of=as_of)
+        if metrics is not None:
+            metrics_list.append(metrics)
+    # 3. Score and rank
+    ranked_stocks = score_and_rank_stocks(metrics_list)
+    return ranked_stocks[:top_n]
+def print_scan_results(stocks: List[ScannedStock], title: str = "Top Stock Scanner Picks") -> None:
+    """Display scan results in a clear terminal table."""
+    print(f"\n{'=' * 118}")
+    print(f" {title.upper()} (Top {len(stocks)})")
+    print(f"{'=' * 118}")
+    header = (
+        f"{'Rank':<5} {'Symbol':<7} {'Price':>8} {'1D Ret':>8} {'5D Ret':>8} {'20D Ret':>9} "
+        f"{'Vol/Avg':>8} {'SMA20%':>8} {'RealVol':>8} {'RS vs SPY':>10} {'Score':>7}"
+    )
+    print(header)
+    print(f"{'-' * 118}")
+    for stock in stocks:
+        rank_str = f"#{stock.rank}" if stock.rank is not None else "-"
+        print(
+            f"{rank_str:<5} "
+            f"{stock.symbol:<7} "
+            f"${stock.price:>7.2f} "
+            f"{stock.return_1d:>+7.2%} "
+            f"{stock.return_5d:>+7.2%} "
+            f"{stock.return_20d:>+8.2%} "
+            f"{stock.volume_ratio:>7.2f}x "
+            f"{stock.distance_sma20:>+7.1%} "
+            f"{stock.realized_volatility:>7.1%} "
+            f"{stock.relative_strength_spy:>+9.2%} "
+            f"{stock.score:>7.1f}"
+        )
+    print(f"{'=' * 118}\n")
+=====
+# FILE: strategy/universe.py
+=====
+BENCHMARK_SYMBOL = "SPY"
+# 50 liquid US equities with active options markets
+UNIVERSE = [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMZN",
+    "GOOGL",
+    "META",
+    "TSLA",
+    "NFLX",
+    "AMD",
+    "AVGO",
+    "QCOM",
+    "TXN",
+    "AMAT",
+    "MU",
+    "INTC",
+    "TSM",
+    "CRM",
+    "ORCL",
+    "ADBE",
+    "INTU",
+    "PLTR",
+    "NOW",
+    "IBM",
+    "PANW",
+    "CRWD",
+    "JPM",
+    "GS",
+    "BAC",
+    "MS",
+    "V",
+    "MA",
+    "LLY",
+    "UNH",
+    "JNJ",
+    "ABBV",
+    "MRK",
+    "XOM",
+    "CVX",
+    "COP",
+    "WMT",
+    "COST",
+    "TGT",
+    "HD",
+    "NKE",
+    "SBUX",
+    "COIN",
+    "MSTR",
+    "CAT",
+    "BA",
+    "UBER",
+]
+=====
+# FILE: risk/risk.py
+=====
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Dict, List
+from config import (
+    MAX_TOTAL_RISK_PCT,
+    MAX_SINGLE_TRADE_RISK_PCT,
+    MAX_UNDERLYING_RISK_PCT,
+    MAX_DIRECTION_RISK_PCT,
+    MAX_ABS_PORTFOLIO_DELTA,
+    MAX_ABS_PORTFOLIO_GAMMA,
+    MAX_ABS_PORTFOLIO_VEGA,
+    EMERGENCY_DRAWDOWN_PCT,
+)
+from strategy.portfolio import PortfolioPosition
+@dataclass
+class RiskAssessment:
+    approved: bool
+    adjusted_contracts: int
+    reason: str
+@dataclass
+class PortfolioRiskReport:
+    approved_positions: List[PortfolioPosition]
+    rejected_positions: List[PortfolioPosition]
+    total_max_loss: float
+    max_loss_pct: float
+    bullish_risk_pct: float
+    bearish_risk_pct: float
+    portfolio_delta: float
+    portfolio_gamma: float
+    portfolio_vega: float
+    portfolio_theta: float
+    emergency_stop: bool
+    warnings: List[str]
+def _per_contract_loss(position: PortfolioPosition) -> float:
+    if position.contracts <= 0:
+        return 0.0
+    return position.max_loss / position.contracts
+def assess_position(
+    position: PortfolioPosition,
+    account_equity: float,
+) -> RiskAssessment:
+    """
+    Validate and cap a single proposed position.
+    """
+    if account_equity <= 0:
+        return RiskAssessment(
+            approved=False,
+            adjusted_contracts=0,
+            reason="Invalid account equity.",
+        )
+    if position.contracts <= 0:
+        return RiskAssessment(
+            approved=False,
+            adjusted_contracts=0,
+            reason="Position has no contracts.",
+        )
+    per_contract_loss = _per_contract_loss(position)
+    if per_contract_loss <= 0:
+        return RiskAssessment(
+            approved=False,
+            adjusted_contracts=0,
+            reason="Invalid per-contract loss.",
+        )
+    max_allowed_loss = (
+        account_equity
+        * MAX_SINGLE_TRADE_RISK_PCT
+    )
+    allowed_contracts = int(
+        max_allowed_loss // per_contract_loss
+    )
+    if allowed_contracts <= 0:
+        return RiskAssessment(
+            approved=False,
+            adjusted_contracts=0,
+            reason="Single-trade risk limit exceeded.",
+        )
+    if allowed_contracts < position.contracts:
+        return RiskAssessment(
+            approved=True,
+            adjusted_contracts=allowed_contracts,
+            reason=(
+                f"Reduced from {position.contracts} "
+                f"to {allowed_contracts} contracts."
+            ),
+        )
+    return RiskAssessment(
+        approved=True,
+        adjusted_contracts=position.contracts,
+        reason="Passed position-level limits.",
+    )
+def _adjust_position(
+    position: PortfolioPosition,
+    contracts: int,
+) -> PortfolioPosition:
+    per_contract_loss = _per_contract_loss(position)
+    new_loss = contracts * per_contract_loss
+    return PortfolioPosition(
+        trade=position.trade,
+        contracts=contracts,
+        max_loss=new_loss,
+        premium_deployed=new_loss,
+        risk_weight=position.risk_weight,
+    )
+def _directional_risk(
+    positions: List[PortfolioPosition],
+) -> tuple[float, float]:
+    bullish = sum(
+        p.max_loss
+        for p in positions
+        if p.trade.direction == "BULLISH"
+    )
+    bearish = sum(
+        p.max_loss
+        for p in positions
+        if p.trade.direction == "BEARISH"
+    )
+    return bullish, bearish
+def _calculate_greeks(
+    positions: List[PortfolioPosition],
+) -> tuple[float, float, float, float]:
+    delta = 0.0
+    gamma = 0.0
+    vega = 0.0
+    theta = 0.0
+    for position in positions:
+        trade = position.trade
+        multiplier = position.contracts * 100
+        delta += (
+            (trade.option_delta or 0.0)
+            * multiplier
+        )
+        gamma += (
+            (trade.option_gamma or 0.0)
+            * multiplier
+        )
+        vega += (
+            (trade.option_vega or 0.0)
+            * multiplier
+        )
+        theta += (
+            (trade.option_theta or 0.0)
+            * multiplier
+        )
+    return delta, gamma, vega, theta
+def _enforce_directional_limits(
+    positions: List[PortfolioPosition],
+    max_direction_risk: float,
+) -> tuple[List[PortfolioPosition], List[PortfolioPosition], List[str]]:
+    """
+    Enforce hard directional risk limits.
+    Positions are considered independently for bullish and bearish
+    exposure. Within each direction, higher trade-score positions
+    receive priority.
+    The returned approved set is guaranteed not to exceed the
+    directional risk limit.
+    """
+    approved: List[PortfolioPosition] = []
+    rejected: List[PortfolioPosition] = []
+    warnings: List[str] = []
+    for direction in ("BULLISH", "BEARISH"):
+        direction_positions = [
+            position
+            for position in positions
+            if position.trade.direction == direction
+        ]
+        direction_positions.sort(
+            key=lambda position: position.trade.trade_score,
+            reverse=True,
+        )
+        running_risk = 0.0
+        for position in direction_positions:
+            proposed_risk = (
+                running_risk
+                + position.max_loss
+            )
+            if proposed_risk <= max_direction_risk:
+                approved.append(position)
+                running_risk = proposed_risk
+                continue
+            rejected.append(position)
+            warnings.append(
+                f"{position.trade.stock_symbol}: "
+                f"{direction.lower()} concentration limit "
+                "would be exceeded; position rejected."
+            )
+    return approved, rejected, warnings
+def assess_portfolio(
+    positions: List[PortfolioPosition],
+    account_equity: float,
+    current_equity: float | None = None,
+    peak_equity: float | None = None,
+) -> PortfolioRiskReport:
+    if account_equity <= 0:
+        raise ValueError(
+            "account_equity must be positive"
+        )
+    for position in positions:
+        if position.contracts <= 0:
+            raise ValueError(
+                f"Invalid portfolio position for "
+                f"{position.trade.stock_symbol}: "
+                "contracts must be positive."
+            )
+        if position.max_loss <= 0:
+            raise ValueError(
+                f"Invalid portfolio position for "
+                f"{position.trade.stock_symbol}: "
+                "max_loss must be positive."
+            )
+    warnings: List[str] = []
+    # ========================================================
+    # EMERGENCY ACCOUNT PROTECTION
+    # ========================================================
+    if (
+        current_equity is not None
+        and peak_equity is not None
+    ):
+        if peak_equity <= 0:
+            raise ValueError(
+                "peak_equity must be positive."
+            )
+        drawdown_pct = (
+            peak_equity - current_equity
+        ) / peak_equity
+        if drawdown_pct >= EMERGENCY_DRAWDOWN_PCT:
+            return PortfolioRiskReport(
+                approved_positions=[],
+                rejected_positions=positions,
+                total_max_loss=0.0,
+                max_loss_pct=0.0,
+                bullish_risk_pct=0.0,
+                bearish_risk_pct=0.0,
+                portfolio_delta=0.0,
+                portfolio_gamma=0.0,
+                portfolio_vega=0.0,
+                portfolio_theta=0.0,
+                emergency_stop=True,
+                warnings=[
+                    (
+                        f"Account drawdown is "
+                        f"{drawdown_pct:.2%} from peak equity "
+                        f"of ${peak_equity:,.2f}."
+                    )
+                ],
+            )
+    # ========================================================
+    # STEP 1 — POSITION-LEVEL LIMITS
+    # ========================================================
+    approved: List[PortfolioPosition] = []
+    rejected: List[PortfolioPosition] = []
+    for position in positions:
+        assessment = assess_position(
+            position,
+            account_equity,
+        )
+        if not assessment.approved:
+            rejected.append(position)
+            warnings.append(
+                f"{position.trade.stock_symbol}: "
+                f"{assessment.reason}"
+            )
+            continue
+        approved.append(
+            _adjust_position(
+                position,
+                assessment.adjusted_contracts,
+            )
+        )
+        if assessment.adjusted_contracts < position.contracts:
+            warnings.append(
+                f"{position.trade.stock_symbol}: "
+                f"{assessment.reason}"
+            )
+    # ========================================================
+    # STEP 2 — UNDERLYING CONCENTRATION
+    # ========================================================
+    max_underlying_risk = (
+        account_equity
+        * MAX_UNDERLYING_RISK_PCT
+    )
+    final_positions: List[PortfolioPosition] = []
+    for position in approved:
+        if position.max_loss <= max_underlying_risk:
+            final_positions.append(position)
+            continue
+        per_contract_loss = _per_contract_loss(
+            position
+        )
+        contracts = int(
+            max_underlying_risk
+            // per_contract_loss
+        )
+        if contracts <= 0:
+            rejected.append(position)
+            warnings.append(
+                f"{position.trade.stock_symbol}: "
+                "rejected by underlying-risk limit."
+            )
+            continue
+        adjusted = _adjust_position(
+            position,
+            contracts,
+        )
+        final_positions.append(adjusted)
+        warnings.append(
+            f"{position.trade.stock_symbol}: "
+            f"reduced to {contracts} contracts "
+            "by underlying-risk limit."
+        )
+    # ========================================================
+    # STEP 3 — TOTAL PORTFOLIO RISK
+    # ========================================================
+    max_total_risk = (
+        account_equity
+        * MAX_TOTAL_RISK_PCT
+    )
+    final_positions.sort(
+        key=lambda p: p.trade.trade_score,
+        reverse=True,
+    )
+    risk_limited: List[PortfolioPosition] = []
+    total_risk = 0.0
+    for position in final_positions:
+        remaining = (
+            max_total_risk
+            - total_risk
+        )
+        if remaining <= 0:
+            rejected.append(position)
+            continue
+        if position.max_loss <= remaining:
+            risk_limited.append(position)
+            total_risk += position.max_loss
+            continue
+        per_contract_loss = _per_contract_loss(
+            position
+        )
+        contracts = int(
+            remaining
+            // per_contract_loss
+        )
+        if contracts <= 0:
+            rejected.append(position)
+            continue
+        adjusted = _adjust_position(
+            position,
+            contracts,
+        )
+        risk_limited.append(adjusted)
+        total_risk += adjusted.max_loss
+        warnings.append(
+            f"{position.trade.stock_symbol}: "
+            "reduced by total portfolio risk limit."
+        )
+    # ========================================================
+    # STEP 4 — DIRECTIONAL CONCENTRATION
+    # ========================================================
+    max_direction_risk = (
+        account_equity
+        * MAX_DIRECTION_RISK_PCT
+    )
+    (
+        risk_limited,
+        directional_rejected,
+        directional_warnings,
+    ) = _enforce_directional_limits(
+        positions=risk_limited,
+        max_direction_risk=max_direction_risk,
+    )
+    rejected.extend(directional_rejected)
+    warnings.extend(directional_warnings)
+    # ========================================================
+    # STEP 5 — GREEKS
+    # ========================================================
+    delta, gamma, vega, theta = _calculate_greeks(
+        risk_limited
+    )
+    # Greeks are currently advisory rather than hard vetoes.
+    # The hard safety controls are defined-loss and concentration limits.
+    if abs(delta) > MAX_ABS_PORTFOLIO_DELTA:
+        warnings.append(
+            f"Portfolio delta above advisory threshold: {delta:.1f}"
+        )
+    if abs(gamma) > MAX_ABS_PORTFOLIO_GAMMA:
+        warnings.append(
+            f"Portfolio gamma above advisory threshold: {gamma:.1f}"
+        )
+    if abs(vega) > MAX_ABS_PORTFOLIO_VEGA:
+        warnings.append(
+            f"Portfolio vega above advisory threshold: {vega:.1f}"
+        )
+    # ========================================================
+    # FINAL METRICS
+    # ========================================================
+    total_risk = sum(
+        p.max_loss
+        for p in risk_limited
+    )
+    bullish, bearish = _directional_risk(
+        risk_limited
+    )
+    return PortfolioRiskReport(
+        approved_positions=risk_limited,
+        rejected_positions=rejected,
+        total_max_loss=total_risk,
+        max_loss_pct=(
+            total_risk
+            / account_equity
+        ),
+        bullish_risk_pct=(
+            bullish
+            / account_equity
+        ),
+        bearish_risk_pct=(
+            bearish
+            / account_equity
+        ),
+        portfolio_delta=delta,
+        portfolio_gamma=gamma,
+        portfolio_vega=vega,
+        portfolio_theta=theta,
+        emergency_stop=False,
+        warnings=warnings,
+    )
+def print_risk_report(
+    report: PortfolioRiskReport,
+    account_equity: float,
+) -> None:
+    print("\n" + "=" * 130)
+    print(" RISK ASSESSMENT")
+    print("=" * 130)
+    if report.emergency_stop:
+        print(
+            "🚨 EMERGENCY STOP — "
+            "NO NEW POSITIONS APPROVED"
+        )
+        for warning in report.warnings:
+            print(f"  ⚠ {warning}")
+        print("=" * 130)
+        return
+    print(
+        f"Total max loss:  "
+        f"${report.total_max_loss:,.2f} "
+        f"({report.max_loss_pct:.2%})"
+    )
+    print(
+        f"Bullish risk:    "
+        f"{report.bullish_risk_pct:.2%}"
+    )
+    print(
+        f"Bearish risk:    "
+        f"{report.bearish_risk_pct:.2%}"
+    )
+    print(
+        f"Portfolio Delta: "
+        f"{report.portfolio_delta:,.2f}"
+    )
+    print(
+        f"Portfolio Gamma: "
+        f"{report.portfolio_gamma:,.2f}"
+    )
+    print(
+        f"Portfolio Vega:  "
+        f"{report.portfolio_vega:,.2f}"
+    )
+    print(
+        f"Portfolio Theta: "
+        f"{report.portfolio_theta:,.2f}"
+    )
+    print("\nAPPROVED POSITIONS")
+    print("-" * 130)
+    for position in report.approved_positions:
+        trade = position.trade
+        print(
+            f"{trade.stock_symbol:<7} "
+            f"{trade.direction:<9} "
+            f"{position.contracts:>3} contracts  "
+            f"risk=${position.max_loss:>8,.2f}  "
+            f"score={trade.trade_score:>5.1f}  "
+            f"{trade.option_symbol}"
+        )
+    print("\nREJECTED POSITIONS")
+    print("-" * 130)
+    for position in report.rejected_positions:
+        trade = position.trade
+        print(
+            f"{trade.stock_symbol:<7} "
+            f"{trade.direction:<9} "
+            f"{position.contracts:>3} contracts  "
+            f"risk=${position.max_loss:>8,.2f}  "
+            f"score={trade.trade_score:>5.1f}  "
+            f"{trade.option_symbol}"
+        )
+    if report.warnings:
+        print("\nWARNINGS")
+        print("-" * 130)
+        for warning in report.warnings:
+            print(f"⚠ {warning}")
+    print("=" * 130)
+=====
+# FILE: main.py
+=====
+from alpaca_client.client import get_trading_client
+from alpaca_client.options import get_option_chain
+from alpaca_client.stocks import (
+    print_top_scanned_stocks,
+    get_latest_underlying_prices,
+)
+from strategy.option_selector import select_directional_options
+from strategy.direction import TradeDirection, determine_direction
+from strategy.research_agent import (
+    research_stocks,
+    research_text_by_symbol,
+    print_research_reports,
+)
+from strategy.llm_ranker import rank_stocks
+from strategy.option_ranker import rank_option_pool
+from config import STOCK_SCANNER_TOP_N, LLM_STOCK_TOP_K
+def main() -> None:
+    trading_client = get_trading_client()
+    account = trading_client.get_account()
+    print("=== Connected to Alpaca (Paper Trading) ===")
+    print(f"Account ID:     {account.id}")
+    print(f"Equity:         ${float(account.equity):,.2f}")
+    print(f"Buying power:   ${float(account.buying_power):,.2f}")
+    print(f"Options level:  {account.options_trading_level} (approved: {account.options_approved_level})")
+    # 1. Scan 50-stock universe and display top 15 ranked candidates
+    print("\nScanning 50-stock universe...")
+    top_candidates = print_top_scanned_stocks(
+        top_n=STOCK_SCANNER_TOP_N
+    )
+    if top_candidates:
+        # Research all scanner-selected stocks.
+        research_reports = research_stocks(top_candidates)
+        print_research_reports(research_reports)
+        research = research_text_by_symbol(research_reports)
+        # LLM ranks stocks comparatively.
+        ranked_symbols = rank_stocks(
+            stocks=top_candidates,
+            research=research,
+            debug=True,
+        )
+        # Restore ScannedStock objects in LLM order.
+        stocks_by_symbol = {
+            stock.symbol: stock
+            for stock in top_candidates
+        }
+        ranked_candidates = [
+            stocks_by_symbol[symbol]
+            for symbol in ranked_symbols
+        ]
+        print("\n" + "=" * 120)
+        print(" LLM STOCK RANKING")
+        print("=" * 120)
+        for llm_rank, symbol in enumerate(ranked_symbols, start=1):
+            stock = stocks_by_symbol[symbol]
+            scanner_rank = stock.rank if stock.rank is not None else "-"
+            print(
+                f"#{llm_rank:<2} "
+                f"{symbol:<6} "
+                f"Scanner=#{scanner_rank:<3} "
+                f"ScannerScore={stock.score:>5.1f}"
+            )
+        # Only send LLM top-K into option selection.
+        selected_stocks = ranked_candidates[:LLM_STOCK_TOP_K]
+        print("\nLLM-RANKED STOCKS")
+        for rank, stock in enumerate(selected_stocks, start=1):
+            print(
+                f"#{rank:<2} {stock.symbol:<6} "
+                f"Scanner=#{stock.rank:<2} "
+                f"ScannerScore={stock.score:.1f}"
+            )
+        latest_prices = get_latest_underlying_prices(
+            [stock.symbol for stock in selected_stocks]
+        )
+        all_options = []
+        stocks_by_symbol = {}
+        directions_by_symbol = {}
+        for stock in selected_stocks:
+            underlying_price = latest_prices.get(stock.symbol)
+            if underlying_price is None or underlying_price <= 0:
+                print(f"Skipping {stock.symbol}: no valid live price.")
+                continue
+            direction = determine_direction(stock)
+            if direction == TradeDirection.NEUTRAL:
+                continue
+            chain = get_option_chain(stock.symbol)
+            options = select_directional_options(
+                chain=chain,
+                underlying_price=underlying_price,
+                direction=direction.value.lower(),
+            )
+            if not options:
+                continue
+            stocks_by_symbol[stock.symbol] = stock
+            directions_by_symbol[stock.symbol] = direction.value
+            all_options.extend(options)
+        if not all_options:
+            print("No option candidates survived deterministic filtering.")
+            return
+        ranked_option_symbols = rank_option_pool(
+            options=all_options,
+            stocks=stocks_by_symbol,
+            directions=directions_by_symbol,
+            research=research,
+            debug=True,
+        )
+        TOP_OPTIONS = 5
+        ranked_option_symbols = ranked_option_symbols[:TOP_OPTIONS]
+        options_by_symbol = {
+            option.symbol: option
+            for option in all_options
+        }
+        selected_options = [
+            options_by_symbol[symbol]
+            for symbol in ranked_option_symbols
+        ]
+        print("\n" + "=" * 120)
+        print(" TOP RANKED OPTIONS (GLOBAL)")
+        print("=" * 120)
+        for rank, option in enumerate(selected_options, start=1):
+            print(
+                f"#{rank:<2} "
+                f"{option.symbol:<24} "
+                f"Type={option.option_type.upper():<4} "
+                f"Strike=${option.strike:<7.2f} "
+                f"DTE={option.dte:<3} "
+                f"Mid=${option.mid:<6.2f} "
+                f"Spread={option.spread_pct:<6.1%} "
+                f"Delta={option.delta if option.delta is not None else 0.0:+.3f} "
+                f"Score={option.score:>5.1f}"
+            )
+if __name__ == "__main__":
+    main()

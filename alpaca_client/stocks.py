@@ -12,6 +12,7 @@ from alpaca.data.requests import (
 from alpaca.data.timeframe import TimeFrame
 
 from .client import get_stock_data_client
+from config import STOCK_SCANNER_TOP_N
 from strategy.scanner import ScannedStock, print_scan_results, scan_stock_bars
 from strategy.universe import BENCHMARK_SYMBOL, UNIVERSE
 
@@ -148,7 +149,7 @@ def get_latest_stock_bars(
 
 def scan_stocks(
     universe: Optional[List[str]] = None,
-    top_n: int = 15,
+    top_n: int = STOCK_SCANNER_TOP_N,
     benchmark_symbol: str = BENCHMARK_SYMBOL,
 ) -> List[ScannedStock]:
     """Fetch historical daily bars from Alpaca and scan the universe for top candidates."""
@@ -166,7 +167,7 @@ def scan_stocks(
 
 def print_top_scanned_stocks(
     universe: Optional[List[str]] = None,
-    top_n: int = 15,
+    top_n: int = STOCK_SCANNER_TOP_N,
 ) -> List[ScannedStock]:
     """Scan the universe and print the formatted top picks table."""
     stocks = scan_stocks(universe=universe, top_n=top_n)
@@ -175,4 +176,4 @@ def print_top_scanned_stocks(
 
 
 if __name__ == "__main__":
-    print_top_scanned_stocks(top_n=15)
+    print_top_scanned_stocks(top_n=STOCK_SCANNER_TOP_N)
