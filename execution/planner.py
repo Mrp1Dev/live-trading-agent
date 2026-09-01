@@ -24,6 +24,16 @@ def build_execution_intents(positions, *, strategy_run_id: str | None = None, cr
         expiration = getattr(trade, "expiration", None)
         option_type = getattr(trade, "option_type", "")
         strike = float(getattr(trade, "strike", 0.0))
+        is_mleg = bool(getattr(trade, "is_mleg", False))
+        is_credit = bool(getattr(trade, "is_credit", False))
+        spread_type = str(getattr(trade, "spread_type", "single_leg"))
+        long_symbol = str(getattr(trade, "long_symbol", option_symbol))
+        short_symbol = getattr(trade, "short_symbol", None)
+        net_limit_price = float(getattr(trade, "net_limit_price", 0.0) or getattr(trade, "option_ask", 0.0))
+        legs = list(getattr(trade, "legs", []))
+
+        order_intent = OrderIntent.MLEG_OPEN if is_mleg else (OrderIntent.SELL_TO_OPEN if is_credit else OrderIntent.BUY_TO_OPEN)
+
         intents.append(
             ExecutionIntent(
                 intent_id=intent_id,
@@ -31,10 +41,10 @@ def build_execution_intents(positions, *, strategy_run_id: str | None = None, cr
                 stock_symbol=trade.stock_symbol,
                 option_symbol=option_symbol,
                 direction=trade.direction,
-                order_intent=OrderIntent.BUY_TO_OPEN,
+                order_intent=order_intent,
                 contracts=int(position.contracts),
                 authorized_max_loss=float(position.max_loss),
-                reference_entry_price=float(getattr(trade, "option_ask", position.max_loss / max(position.contracts * 100, 1))),
+                reference_entry_price=net_limit_price if net_limit_price > 0 else float(position.max_loss / max(position.contracts * 100, 1)),
                 created_at=created_at,
                 expiration=expiration,
                 option_type=option_type,
@@ -42,24 +52,54 @@ def build_execution_intents(positions, *, strategy_run_id: str | None = None, cr
                 trade_score=float(trade.trade_score),
                 stock_llm_rank=int(getattr(trade, "stock_llm_rank", 0)),
                 option_llm_rank=int(getattr(trade, "option_llm_rank", 0)),
+                is_mleg=is_mleg,
+                is_credit=is_credit,
+                spread_type=spread_type,
+                long_symbol=long_symbol,
+                short_symbol=short_symbol,
+                net_limit_price=net_limit_price,
+                legs=legs,
             )
         )
     return intents
 
 
 def build_order_instruction(intent: ExecutionIntent, *, live_ask: float, policy: ExecutionPolicy) -> OrderInstruction:
-    if live_ask <= 0:
-        raise ValueError("live_ask must be positive")
-    limit_price = round(live_ask * (1.0 + policy.limit_price_buffer_pct), 2)
+    if intent.is_mleg:
+        if intent.is_credit:
+            # For credit spreads, live_ask or reference_entry_price represents net credit.
+            # Buffer accepts slightly less credit to cross the spread and ensure marketable fill.
+            ref_credit = live_ask if live_ask > 0 else intent.reference_entry_price
+            credit_target = max(0.01, round(ref_credit * (1.0 - policy.limit_price_buffer_pct), 2))
+            # In Alpaca MLEG API, net credit limit_price is NEGATIVE
+            limit_price = -credit_target
+        else:
+            ref_debit = live_ask if live_ask > 0 else intent.reference_entry_price
+            # In Alpaca MLEG API, net debit limit_price is POSITIVE
+            limit_price = max(0.01, round(ref_debit * (1.0 + policy.limit_price_buffer_pct), 2))
+    elif intent.is_credit:
+        ref_price = live_ask if live_ask > 0 else intent.reference_entry_price
+        limit_price = max(0.01, round(ref_price * (1.0 - policy.limit_price_buffer_pct), 2))
+    else:
+        ref_price = live_ask if live_ask > 0 else intent.reference_entry_price
+        limit_price = max(0.01, round(ref_price * (1.0 + policy.limit_price_buffer_pct), 2))
+
     client_order_id = f"oa-{intent.strategy_run_id}-{intent.intent_id}"[:48]
+    order_class = "mleg" if intent.is_mleg else "simple"
+    side = "sell" if intent.is_credit else "buy"
+    position_intent = "sell_to_open" if intent.is_credit else "buy_to_open"
+
     return OrderInstruction(
         intent_id=intent.intent_id,
         option_symbol=intent.option_symbol,
-        side="buy",
-        position_intent="buy_to_open",
+        side=side,
+        position_intent=position_intent,
         qty=intent.contracts,
         order_type=policy.order_type,
         limit_price=limit_price,
         time_in_force=policy.time_in_force,
         client_order_id=client_order_id,
+        order_class=order_class,
+        legs=intent.legs,
     )
+

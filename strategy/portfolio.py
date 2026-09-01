@@ -23,37 +23,41 @@ from config import (
 
 
 def _estimated_entry_price(trade) -> float:
-    """
-    Estimate the executable entry price for sizing.
-
-    Current strategy only supports buying single-leg options,
-    so the conservative reference price is the ask.
-
-    Midpoint remains a useful informational/reference value,
-    but should not be used to size a live position.
-    """
-    if trade.option_ask > 0:
+    """Estimate the executable entry price or debit for sizing."""
+    if hasattr(trade, "net_debit") and trade.net_debit > 0:
+        return trade.net_debit
+    if hasattr(trade, "net_credit") and trade.net_credit > 0:
+        return trade.net_credit
+    if hasattr(trade, "option_ask") and trade.option_ask > 0:
         return trade.option_ask
-
-    return trade.option_mid
+    if hasattr(trade, "ask") and trade.ask > 0:
+        return trade.ask
+    if hasattr(trade, "option_mid") and trade.option_mid > 0:
+        return trade.option_mid
+    return getattr(trade, "mid", 1.0)
 
 
 def _per_contract_risk(trade) -> float:
-    """
-    Current system assumes long single-leg options.
+    """Calculate defined maximum loss per contract (in dollars).
 
-    For a long option:
-        max loss = premium paid × 100
-
-    Position sizing uses the estimated executable entry price,
-    not the midpoint.
+    - For Credit Spreads: Max loss = (Strike Width - Net Credit) × 100
+    - For Debit Spreads: Max loss = Net Debit × 100
+    - For Single Legs: Max loss = Premium Paid (Ask) × 100
     """
+    if getattr(trade, "is_credit", False):
+        max_loss = getattr(trade, "max_loss", 0.0)
+        if max_loss <= 0:
+            width = getattr(trade, "strike_width", 0.0)
+            credit = getattr(trade, "net_credit", 0.0)
+            max_loss = max(0.10, width - credit)
+        return max_loss * 100.0
+
+    if hasattr(trade, "max_loss") and trade.max_loss > 0:
+        return trade.max_loss * 100.0
 
     entry_price = _estimated_entry_price(trade)
-
     if entry_price <= 0:
-        return 0.0
-
+        return 10.0
     return entry_price * 100.0
 
 

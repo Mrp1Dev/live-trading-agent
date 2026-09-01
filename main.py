@@ -72,14 +72,20 @@ def _record_submitted_entries(execution_report) -> None:
         intent = getattr(result, "intent", None)
         if intent is None or not getattr(result, "order_id", None):
             continue
+        entry_price = abs(float(getattr(result, "limit_price", None) or intent.reference_entry_price))
         position_state.record_entry(
             state,
             option_symbol=intent.option_symbol,
             stock_symbol=intent.stock_symbol,
             direction=intent.direction,
-            entry_price=float(getattr(result, "limit_price", None) or intent.reference_entry_price),
+            entry_price=entry_price,
             contracts=int(getattr(result, "submitted_qty", 0) or intent.contracts),
             trade_score=float(intent.trade_score),
+            is_spread=getattr(intent, "is_mleg", False),
+            is_credit=getattr(intent, "is_credit", False),
+            spread_type=getattr(intent, "spread_type", "single_leg"),
+            long_symbol=getattr(intent, "long_symbol", ""),
+            short_symbol=getattr(intent, "short_symbol", "") or "",
         )
     position_state.save_state(state)
 

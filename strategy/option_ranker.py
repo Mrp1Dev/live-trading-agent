@@ -57,26 +57,33 @@ def _fmt_pct(value: float | None, digits: int = 1) -> str:
 
 def _build_option_block(
     option_id: str,
-    option: OptionCandidate,
+    option: Any,
     stock_symbol: str,
 ) -> str:
+    spread_type = getattr(option, "spread_type", getattr(option, "option_type", "option")).upper()
+    is_credit = getattr(option, "is_credit", False)
+    price_tag = f"credit=${getattr(option, 'net_credit', 0.0):.2f}" if is_credit else f"debit=${getattr(option, 'net_debit', option.ask):.2f}"
+    max_loss = getattr(option, "max_loss", option.ask)
+    max_profit = getattr(option, "max_profit", 0.0)
+    rr_str = f"R:R={getattr(option, 'reward_to_risk', 0.0):.1f}"
+    pop_str = f"PoP={_fmt_pct(getattr(option, 'probability_of_profit', None))}"
+    delta_str = f"delta={_fmt(option.delta)}" if option.delta is not None else "delta=N/A"
+    theta_str = f"theta={_fmt(option.theta)}" if option.theta is not None else "theta=N/A"
+
     return (
         f"{option_id} | "
         f"symbol={option.symbol} | "
         f"stock={stock_symbol} | "
-        f"{option.option_type} | "
-        f"exp={option.expiration.isoformat()} | "
+        f"type={spread_type} | "
         f"DTE={option.dte} | "
-        f"strike=${option.strike:.2f} | "
-        f"mny={_fmt_pct(option.moneyness_pct)} | "
-        f"ask=${option.ask:.2f} | "
-        f"spread={_fmt_pct(option.spread_pct)} | "
-        f"IV={_fmt_pct(option.iv)} | "
-        f"delta={_fmt(option.delta)} | "
-        f"gamma={_fmt(option.gamma)} | "
-        f"theta={_fmt(option.theta)} | "
-        f"vega={_fmt(option.vega)} | "
-        f"selector={option.score:.1f}"
+        f"{price_tag} | "
+        f"max_loss=${max_loss:.2f} | "
+        f"max_profit=${max_profit:.2f} | "
+        f"{rr_str} | "
+        f"{pop_str} | "
+        f"{delta_str} | "
+        f"{theta_str} | "
+        f"score={option.score:.1f}"
     )
 
 
@@ -98,28 +105,34 @@ def _build_stock_context(
 
 
 def _underlying_for_option(
-    option: OptionCandidate,
+    option: Any,
     stocks: Mapping[str, ScannedStock],
 ) -> str:
+    if hasattr(option, "underlying_symbol") and option.underlying_symbol:
+        sym = option.underlying_symbol.upper()
+        if sym in stocks:
+            return sym
     matches = [
         symbol.upper()
         for symbol in stocks
-        if option.symbol.startswith(symbol.upper())
+        if option.symbol.upper().startswith(symbol.upper()) or f"{symbol.upper()}_" in option.symbol.upper()
     ]
-    if not matches:
-        raise ValueError(f"Could not determine underlying for {option.symbol}")
-    # Longest match handles any potential overlapping roots safely.
-    return max(matches, key=len)
+    if matches:
+        return max(matches, key=len)
+    for symbol in stocks:
+        if symbol.upper() in option.symbol.upper():
+            return symbol.upper()
+    raise ValueError(f"Could not determine underlying for {option.symbol}")
 
 
 def build_option_pool_prompt(
-    options: Sequence[OptionCandidate],
+    options: Sequence[Any],
     stocks: Mapping[str, ScannedStock],
     directions: Mapping[str, str],
     research: Mapping[str, str] | None = None,
     top_k: int = OPTION_LLM_TOP_K,
 ) -> str:
-    """Build one compact prompt for a cross-underlying top-K option ranking."""
+    """Build one compact prompt for a cross-underlying top-K option/spread ranking."""
     if not options:
         raise ValueError("options must not be empty")
 
@@ -176,48 +189,34 @@ def build_option_pool_prompt(
         for index, option in enumerate(options, start=1)
     ]
 
-    return f"""Rank the supplied option contracts GLOBALLY by attractiveness for the short-horizon options strategy.
+    return f"""Rank the supplied option/spread structures GLOBALLY by attractiveness for a fast intraday options strategy (15-45 min turnover).
 
-You are comparing contracts across DIFFERENT underlyings.
-Do not rank options separately by stock.
+You are comparing trade structures (Vertical Credit Spreads, Vertical Debit Spreads, and Directional Longs) across DIFFERENT underlyings.
 
-Each option has a temporary identifier such as OPT001, OPT002, etc.
+Each option/spread structure has a temporary identifier such as OPT001, OPT002, etc.
+Use ONLY those temporary identifiers in your final answer. Do NOT return full symbols.
 
-Use ONLY those temporary identifiers in your final answer.
-Do NOT return the full option symbols.
+Return ONLY the TOP {top_k} identifiers, ordered from strongest overall setup to weakest.
 
-The deterministic option selector has already removed invalid/unusable contracts.
-
-Return ONLY the TOP {top_k} option identifiers, strongest to weakest.
-
-Judge each contract using:
-- fit with its underlying's direction and thesis
-- likely movement relative to strike and DTE
-- premium paid versus responsiveness
-- DTE and catalyst timing
-- bid/ask spread and liquidity
-- implied volatility
-- delta, gamma, theta, and vega
-- overall efficiency relative to ALL other contracts in the pool
-- selection diversity: select the best setup for each promising underlying to build a diverse candidate pool across different stocks
-
-Do not simply follow scanner rank or selector score.
+Judge each candidate using:
+- **Strategy & Regime Fit**: 
+    - Credit Spreads: High PoP (>75%), positive theta, great for support bounces or ranges.
+    - Debit Spreads: Low entry cost, high R:R, great for sharp momentum breaks.
+    - Directional Longs: High gamma, best when high-conviction breakout.
+- **Risk/Reward & PoP**: Balance between win probability and upside.
+- **DTE (0-2 DTE)**: Short-duration responsiveness and momentum alignment.
+- **Selection diversity**: Select the best setup for each promising underlying across different stocks.
 
 STOCK CONTEXTS
 {chr(10).join(stock_blocks)}
 
-AVAILABLE OPTION POOL
+AVAILABLE SPREAD & OPTION POOL
 {chr(10).join(option_blocks)}
 
 FINAL OUTPUT REQUIREMENTS:
-Return ONLY a JSON array.
-Return exactly {top_k} identifiers.
-Include at most 2 option identifiers from any single stock (include multiple different underlyings).
-Use identifiers like OPT001, OPT002, OPT003.
-Do not return option symbols.
-Do not repeat identifiers.
-Every identifier must come from the supplied option pool.
-Order from strongest overall opportunity to weakest overall opportunity.
+Return ONLY a JSON array of the top {top_k} identifiers.
+Example:
+["OPT001", "OPT004", "OPT002"]
 """
 
 

@@ -99,21 +99,98 @@ def manage_open_positions(
 
     option_positions = [p for p in raw_positions if _is_option_position(p)]
     open_symbols = [str(getattr(p, "symbol", "")) for p in option_positions]
+    pos_by_symbol = {str(getattr(p, "symbol", "")): p for p in option_positions}
 
     pruned = position_state.reconcile(state, open_symbols)
 
     managed: list[ManagedPosition] = []
     quote_gaps: list[str] = []
     adopted: list[str] = []
+    accounted_legs: set[str] = set()
 
+    # 1. Process tracked multi-leg spreads
+    for comp_sym, st in list(state.items()):
+        if not st.is_spread:
+            continue
+        long_p = pos_by_symbol.get(st.long_symbol)
+        short_p = pos_by_symbol.get(st.short_symbol)
+        if not long_p and not short_p:
+            continue
+
+        accounted_legs.add(st.long_symbol)
+        if st.short_symbol:
+            accounted_legs.add(st.short_symbol)
+
+        contracts = st.contracts
+        if long_p:
+            contracts = abs(int(_safe_float(getattr(long_p, "qty", contracts))))
+        elif short_p:
+            contracts = abs(int(_safe_float(getattr(short_p, "qty", contracts))))
+
+        bid = 0.0
+        ask = 0.0
+        try:
+            if hasattr(broker, "get_spread_quote") and st.short_symbol:
+                spread_quote = broker.get_spread_quote(st.long_symbol, st.short_symbol, is_credit=st.is_credit)
+                bid = _safe_float(getattr(spread_quote, "bid", 0.0))
+                ask = _safe_float(getattr(spread_quote, "ask", 0.0))
+            else:
+                q = broker.get_option_quote(st.long_symbol)
+                bid = _safe_float(getattr(q, "bid", 0.0))
+                ask = _safe_float(getattr(q, "ask", 0.0))
+        except (BrokerError, Exception) as exc:
+            quote_gaps.append(comp_sym)
+            if verbose:
+                print(f"  {comp_sym}: quote gap ({exc})")
+
+        entry_price = st.entry_price
+        if st.is_credit:
+            # bid is current credit to sell/open; ask is current cost to buy back/close
+            pnl_pct = realisable_pnl_pct(entry_price, ask, fallback_pnl_pct=None, is_credit=True)
+        else:
+            # bid is current executable sell price; ask is current buy price
+            pnl_pct = realisable_pnl_pct(entry_price, bid, fallback_pnl_pct=None, is_credit=False)
+
+        peak = st.peak_pnl_pct
+        if pnl_pct is not None:
+            peak = position_state.update_peak(state, comp_sym, pnl_pct)
+
+        dte = dte_from_occ_symbol(st.long_symbol, reference)
+        decision = evaluate_exit(
+            pnl_pct=pnl_pct if pnl_pct is not None else 0.0,
+            peak_pnl_pct=peak,
+            dte=dte if dte is not None else 99,
+            opened_at=st.opened_at,
+            now=reference,
+            is_credit=st.is_credit,
+            is_spread=True,
+        )
+
+        managed.append(
+            ManagedPosition(
+                option_symbol=comp_sym,
+                stock_symbol=st.stock_symbol or _underlying_of(st.long_symbol),
+                contracts=contracts,
+                entry_price=entry_price,
+                bid=bid,
+                ask=ask,
+                pnl_pct=pnl_pct,
+                peak_pnl_pct=peak,
+                dte=dte,
+                decision=decision,
+            )
+        )
+
+    # 2. Process single-leg positions (tracked or untracked)
     for position in option_positions:
         symbol = str(getattr(position, "symbol", ""))
-        if not symbol:
+        if not symbol or symbol in accounted_legs:
             continue
 
         contracts = abs(int(_safe_float(getattr(position, "qty", 0))))
         entry_price = _safe_float(getattr(position, "avg_entry_price", 0.0))
         broker_pnl_pct = _safe_float(getattr(position, "unrealized_plpc", 0.0))
+        is_short = int(_safe_float(getattr(position, "qty", 0))) < 0
 
         if symbol not in state:
             position_state.adopt_untracked(
@@ -126,7 +203,6 @@ def manage_open_positions(
             )
             adopted.append(symbol)
 
-        # A live BID is required: we sell into it, and the midpoint lies.
         bid = 0.0
         ask = 0.0
         try:
@@ -138,26 +214,28 @@ def manage_open_positions(
             if verbose:
                 print(f"  {symbol}: no live quote ({exc}); falling back to broker mark")
 
-        pnl_pct = realisable_pnl_pct(entry_price, bid, fallback_pnl_pct=broker_pnl_pct)
+        pnl_pct = realisable_pnl_pct(entry_price, ask if is_short else bid, fallback_pnl_pct=broker_pnl_pct, is_credit=is_short)
 
         peak = state[symbol].peak_pnl_pct
         if pnl_pct is not None:
             peak = position_state.update_peak(state, symbol, pnl_pct)
 
         dte = dte_from_occ_symbol(symbol, reference)
-
+        st = state[symbol]
         decision = evaluate_exit(
             pnl_pct=pnl_pct if pnl_pct is not None else 0.0,
             peak_pnl_pct=peak,
             dte=dte if dte is not None else 99,
-            opened_at=state[symbol].opened_at,
+            opened_at=st.opened_at,
             now=reference,
+            is_credit=is_short,
+            is_spread=False,
         )
 
         managed.append(
             ManagedPosition(
                 option_symbol=symbol,
-                stock_symbol=state[symbol].stock_symbol or _underlying_of(symbol),
+                stock_symbol=st.stock_symbol or _underlying_of(symbol),
                 contracts=contracts,
                 entry_price=entry_price,
                 bid=bid,
@@ -182,6 +260,7 @@ def manage_open_positions(
 
     for symbol, decision in closes:
         position = by_symbol[symbol]
+        st = state.get(symbol)
 
         if dry_run:
             closed.append((symbol, f"DRY_RUN {decision.reason}"))
@@ -190,30 +269,77 @@ def manage_open_positions(
             continue
 
         try:
-            if position.bid > 0:
-                # Marketable limit placed slightly through the bid. Exits are the
-                # half of the round trip you cannot afford to miss.
-                limit_price = max(0.01, round(position.bid * (1.0 - EXIT_LIMIT_TOLERANCE), 2))
-                broker.place_option_order(
-                    symbol=symbol,
+            both_legs_open = bool(st and st.is_spread and st.short_symbol and (st.long_symbol in pos_by_symbol) and (st.short_symbol in pos_by_symbol))
+            if both_legs_open and hasattr(broker, "place_mleg_order"):
+                # Multi-leg closing order
+                if st.is_credit:
+                    # Closing credit spread: buy back short, sell long (net debit paid -> positive limit price)
+                    close_legs = [
+                        {"symbol": st.short_symbol, "side": "buy", "ratio_qty": 1, "position_intent": "buy_to_close"},
+                        {"symbol": st.long_symbol, "side": "sell", "ratio_qty": 1, "position_intent": "sell_to_close"},
+                    ]
+                    limit_price = max(0.01, round(position.ask * (1.0 + EXIT_LIMIT_TOLERANCE), 2))
+                else:
+                    # Closing debit spread: sell long, buy back short (net credit received -> negative limit price)
+                    close_legs = [
+                        {"symbol": st.long_symbol, "side": "sell", "ratio_qty": 1, "position_intent": "sell_to_close"},
+                        {"symbol": st.short_symbol, "side": "buy", "ratio_qty": 1, "position_intent": "buy_to_close"},
+                    ]
+                    credit_to_receive = max(0.01, round(position.bid * (1.0 - EXIT_LIMIT_TOLERANCE), 2))
+                    limit_price = -credit_to_receive
+
+                broker.place_mleg_order(
                     qty=position.contracts,
-                    side="sell",
-                    position_intent="sell_to_close",
-                    order_type="limit",
-                    time_in_force="day",
+                    legs=close_legs,
                     limit_price=limit_price,
                     client_order_id=_exit_client_order_id(symbol, reference),
                 )
             else:
-                # No usable bid; fall back to the broker's own close endpoint
-                # rather than guessing a price.
-                broker.close_position(symbol, qty=position.contracts)
+                # Handle single-leg close or asymmetric orphaned spread leg
+                target_sym = symbol
+                if st and st.is_spread:
+                    if st.long_symbol in pos_by_symbol:
+                        target_sym = st.long_symbol
+                    elif st.short_symbol in pos_by_symbol:
+                        target_sym = st.short_symbol
+
+                raw_pos = pos_by_symbol.get(target_sym)
+                is_short = raw_pos is not None and int(_safe_float(getattr(raw_pos, "qty", 0))) < 0
+                if is_short:
+                    # Short single leg: buy to close
+                    limit_price = max(0.01, round(position.ask * (1.0 + EXIT_LIMIT_TOLERANCE), 2)) if position.ask > 0 else None
+                    broker.place_option_order(
+                        symbol=target_sym,
+                        qty=position.contracts,
+                        side="buy",
+                        position_intent="buy_to_close",
+                        order_type="limit" if limit_price else "market",
+                        time_in_force="day",
+                        limit_price=limit_price,
+                        client_order_id=_exit_client_order_id(target_sym, reference),
+                    )
+                elif position.bid > 0:
+                    # Marketable limit placed slightly through the bid.
+                    limit_price = max(0.01, round(position.bid * (1.0 - EXIT_LIMIT_TOLERANCE), 2))
+                    broker.place_option_order(
+                        symbol=target_sym,
+                        qty=position.contracts,
+                        side="sell",
+                        position_intent="sell_to_close",
+                        order_type="limit",
+                        time_in_force="day",
+                        limit_price=limit_price,
+                        client_order_id=_exit_client_order_id(target_sym, reference),
+                    )
+                else:
+                    # No usable bid; fall back to the broker's own close endpoint
+                    broker.close_position(target_sym, qty=position.contracts)
 
             position_state.forget(state, symbol)
             closed.append((symbol, decision.reason))
             if verbose:
                 print(f"  CLOSING {symbol} x{position.contracts} - {decision.reason}: {decision.detail}")
-        except (BrokerError, ValueError) as exc:
+        except (BrokerError, ValueError, Exception) as exc:
             failed.append((symbol, str(exc)))
             if verbose:
                 print(f"  FAILED to close {symbol}: {exc}")
@@ -398,7 +524,7 @@ def verify_fills(
 
         status = str(getattr(order, "status", "")).lower()
         filled_qty = int(_safe_float(getattr(order, "filled_qty", 0)))
-        fill_price = _safe_float(getattr(order, "filled_avg_price", 0.0))
+        fill_price = abs(_safe_float(getattr(order, "filled_avg_price", 0.0)))
 
         if filled_qty > 0:
             entry = state.get(symbol)

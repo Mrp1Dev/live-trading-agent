@@ -116,11 +116,11 @@ def test_dry_run_cancels_nothing():
 def test_entry_window_blocks_open_and_close():
     from execution.position_manager import entry_window_status
 
-    open_edge = NOW.replace(hour=9, minute=35)
+    open_edge = NOW.replace(hour=9, minute=32)
     broker = _Broker(clock=_Clock(timestamp=open_edge,
                                   next_close=NOW.replace(hour=16, minute=0)))
     ok, reason = entry_window_status(broker, open_edge)
-    check("entries blocked in the first 10 minutes", not ok, reason)
+    check("entries blocked in the first 5 minutes", not ok, reason)
 
     close_edge = NOW.replace(hour=15, minute=55)
     broker = _Broker(clock=_Clock(timestamp=close_edge,
@@ -187,26 +187,26 @@ def test_entry_cadence():
           _entry_due(None, NOW, 3, None, interval))
     check("no entry when every slot is full",
           not _entry_due(None, NOW, 0, None, interval))
-    check("no entry again 30 minutes later",
-          not _entry_due(NOW - timedelta(minutes=30), NOW, 3, 3, interval))
+    check("no entry again before interval elapses",
+          not _entry_due(NOW - timedelta(minutes=interval * 0.5), NOW, 3, 3, interval))
     check("entry again once the interval has elapsed",
           _entry_due(NOW - timedelta(minutes=interval + 1), NOW, 3, 3, interval))
     check("an exit that frees a slot triggers an entry immediately",
-          _entry_due(NOW - timedelta(minutes=5), NOW, 3, 2, interval),
+          _entry_due(NOW - timedelta(minutes=1), NOW, 3, 2, interval),
           "a freed slot is new information; the interval should not gate it")
 
 
 def test_loop_constants_are_sane():
     import main
-    check("exits run at least every 10 minutes",
+    check("exits run frequently",
           0 < main.EXIT_INTERVAL_SECONDS <= 600, str(main.EXIT_INTERVAL_SECONDS))
-    check("entries are rate-limited to at most a few per session",
-          main.ENTRY_INTERVAL_MINUTES >= 60, str(main.ENTRY_INTERVAL_MINUTES))
+    check("entries run on fast minute schedule",
+          1 <= main.ENTRY_INTERVAL_MINUTES <= 15, str(main.ENTRY_INTERVAL_MINUTES))
     check("the loop gives up after a bounded number of failures",
           2 <= main.MAX_CONSECUTIVE_ERRORS <= 10, str(main.MAX_CONSECUTIVE_ERRORS))
     sessions_per_day = (6.5 * 60) / (main.EXIT_INTERVAL_SECONDS / 60)
-    check("exit cadence gives ~78 marks per session",
-          70 <= sessions_per_day <= 90, f"{sessions_per_day:.0f}")
+    check("exit cadence gives rapid marks per session",
+          sessions_per_day >= 30, f"{sessions_per_day:.0f}")
 
 
 def test_cli_flags():

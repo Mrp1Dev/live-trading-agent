@@ -231,6 +231,112 @@ class AlpacaBroker:
                 raise
             raise BrokerError(f"Failed to submit option order: {exc}") from exc
 
+    def place_mleg_order(
+        self,
+        *,
+        qty: int,
+        legs: list[dict],
+        limit_price: float,
+        time_in_force: str = "day",
+        client_order_id: str,
+        order_type: str = "limit",
+    ) -> Any:
+        """Place a multi-leg option order (spread) via the Alpaca Trading API."""
+        self._verify_paper_environment()
+
+        try:
+            from alpaca.trading.requests import OptionLegRequest
+            from alpaca.trading.enums import OrderClass
+
+            tif_norm = time_in_force.strip().lower()
+            tif_map = {
+                "day": TimeInForce.DAY,
+                "gtc": TimeInForce.GTC,
+                "ioc": TimeInForce.IOC,
+                "fok": TimeInForce.FOK,
+                "opg": TimeInForce.OPG,
+                "cls": TimeInForce.CLS,
+            }
+            tif_enum = tif_map.get(tif_norm, TimeInForce.DAY)
+
+            intent_map = {
+                "buy_to_open": PositionIntent.BUY_TO_OPEN,
+                "buy_to_close": PositionIntent.BUY_TO_CLOSE,
+                "sell_to_open": PositionIntent.SELL_TO_OPEN,
+                "sell_to_close": PositionIntent.SELL_TO_CLOSE,
+            }
+
+            leg_requests = []
+            for leg in legs:
+                leg_side = OrderSide.BUY if str(leg.get("side", "buy")).lower() == "buy" else OrderSide.SELL
+                raw_intent = str(leg.get("position_intent", "buy_to_open")).lower()
+                leg_intent = intent_map.get(raw_intent, PositionIntent.BUY_TO_OPEN)
+                ratio_qty = int(leg.get("ratio_qty", 1))
+                leg_sym = str(leg["symbol"])
+                leg_requests.append(
+                    OptionLegRequest(
+                        symbol=leg_sym,
+                        ratio_qty=ratio_qty,
+                        side=leg_side,
+                        position_intent=leg_intent,
+                    )
+                )
+
+            order_req = LimitOrderRequest(
+                qty=float(qty),
+                order_class=OrderClass.MLEG,
+                time_in_force=tif_enum,
+                limit_price=round(float(limit_price), 2),
+                client_order_id=client_order_id,
+                legs=leg_requests,
+            )
+
+            return self.trading_client.submit_order(order_req)
+        except APIError as exc:
+            raise BrokerError(f"Alpaca API error placing MLEG order: {exc}") from exc
+        except Exception as exc:
+            if isinstance(exc, (BrokerError, SafetyViolation, ValueError)):
+                raise
+            raise BrokerError(f"Failed to submit MLEG order: {exc}") from exc
+
+    def get_spread_quote(self, long_symbol: str, short_symbol: str, is_credit: bool = False) -> LiveOptionQuote:
+        """Fetch quotes for both legs and return the net spread quote.
+
+        For Debit Spread:
+          - net_debit (ask) = long_ask - short_bid (executable buy price)
+          - net_bid (bid) = long_bid - short_ask (executable sell price)
+        For Credit Spread:
+          - net_credit (bid) = short_bid - long_ask (executable sell / open price)
+          - cost_to_close (ask) = short_ask - long_bid (executable buy / close price)
+        """
+        try:
+            long_q = self.get_option_quote(long_symbol)
+            short_q = self.get_option_quote(short_symbol)
+            if is_credit:
+                net_credit = short_q.bid - long_q.ask
+                cost_to_close = short_q.ask - long_q.bid
+                composite_sym = f"{short_symbol}/{long_symbol}"
+                return LiveOptionQuote(
+                    symbol=composite_sym,
+                    bid=round(net_credit, 2),
+                    ask=round(cost_to_close, 2),
+                    timestamp=long_q.timestamp or short_q.timestamp,
+                    source="alpaca-api-spread",
+                )
+            else:
+                net_ask = long_q.ask - short_q.bid
+                net_bid = long_q.bid - short_q.ask
+                composite_sym = f"{long_symbol}/{short_symbol}"
+                return LiveOptionQuote(
+                    symbol=composite_sym,
+                    bid=round(net_bid, 2),
+                    ask=round(net_ask, 2),
+                    timestamp=long_q.timestamp or short_q.timestamp,
+                    source="alpaca-api-spread",
+                )
+        except Exception as exc:
+            raise BrokerError(f"Failed to fetch spread quote for {long_symbol}/{short_symbol}: {exc}") from exc
+
     def cancel_order(self, order_id: str) -> Any:
         """Cancel an open order by ID."""
         try:

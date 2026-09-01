@@ -45,7 +45,7 @@ NOW = datetime(2026, 9, 1, 11, 0, tzinfo=MARKET_TZ)   # before the flatten windo
 def _exit(pnl, peak=0.0, dte=9, opened=None, now=NOW):
     return evaluate_exit(
         pnl_pct=pnl, peak_pnl_pct=peak, dte=dte,
-        opened_at=opened if opened is not None else (now - timedelta(hours=6)).isoformat(),
+        opened_at=opened if opened is not None else (now - timedelta(minutes=10)).isoformat(),
         now=now,
     )
 
@@ -57,7 +57,7 @@ def _exit(pnl, peak=0.0, dte=9, opened=None, now=NOW):
 def test_rule_precedence():
     # A position that is simultaneously stopped out AND expiring must report
     # EXPIRY, because that is the more urgent fact.
-    d = _exit(-0.80, dte=1)
+    d = _exit(-0.80, dte=-1)
     check("expiry outranks stop loss", d.reason == "EXPIRY", d.reason)
 
     # A faded winner must report TRAILING_STOP, not TAKE_PROFIT, even when it is
@@ -74,14 +74,16 @@ def test_rule_precedence():
 
 
 def test_trailing_stop_behaviour():
-    """Verified table: arm at +30%, give back at most 35% of peak."""
+    """Verified table: arms at TRAIL_ARM_PCT, gives back at most TRAIL_GIVEBACK_PCT of peak."""
+    arm = TRAIL_ARM_PCT
+    gb = TRAIL_GIVEBACK_PCT
     cases = [
-        (0.20, 0.20, False, "unarmed: rides to the stop"),
-        (0.30, 0.19, True, "armed at +30%, closes at +19.5%"),
-        (0.30, 0.21, False, "armed but still above the floor"),
-        (1.00, 0.64, True, "peak +100% closes at +65%"),
-        (2.00, 1.29, True, "peak +200% closes at +130%"),
-        (3.00, 1.94, True, "peak +300% closes at +195%"),
+        (arm * 0.5, arm * 0.5, False, "unarmed: rides to the stop"),
+        (0.30, 0.30 * (1.0 - gb) - 0.01, True, f"armed at +30%, closes below floor {0.30*(1.0-gb):.1%}"),
+        (0.30, 0.30 * (1.0 - gb) + 0.02, False, "armed but still above the floor"),
+        (1.00, 1.00 * (1.0 - gb) - 0.01, True, f"peak +100% closes below floor {1.00*(1.0-gb):.1%}"),
+        (2.00, 2.00 * (1.0 - gb) - 0.01, True, f"peak +200% closes below floor {2.00*(1.0-gb):.1%}"),
+        (3.00, 3.00 * (1.0 - gb) - 0.01, True, f"peak +300% closes below floor {3.00*(1.0-gb):.1%}"),
     ]
     for peak, pnl, should_close, label in cases:
         d = _exit(pnl, peak=peak)
@@ -97,17 +99,18 @@ def test_trailing_stop_behaviour():
 
 
 def test_unarmed_position_rides_to_the_stop():
-    d = _exit(-0.30, peak=0.20)
+    safe_pnl = STOP_LOSS_PCT / 2.0
+    d = _exit(safe_pnl, peak=0.10)
     check("a trade that never worked is handled by the stop, not the trail",
           d.reason == "HOLD", d.reason)
     check("...and does close once it hits the stop",
-          _exit(-0.56, peak=0.20).reason == "STOP_LOSS")
+          _exit(STOP_LOSS_PCT - 0.01, peak=0.10).reason == "STOP_LOSS")
 
 
 def test_time_stop():
-    old = (NOW - timedelta(days=MAX_HOLD_DAYS + 0.1)).isoformat()
-    check("time stop fires past MAX_HOLD_DAYS", _exit(0.05, opened=old).reason == "TIME_STOP")
-    fresh = (NOW - timedelta(days=1)).isoformat()
+    old = (NOW - timedelta(minutes=50)).isoformat()
+    check("time stop fires past MAX_HOLD_MINUTES", _exit(0.05, opened=old).reason == "TIME_STOP")
+    fresh = (NOW - timedelta(minutes=5)).isoformat()
     check("time stop does not fire early", _exit(0.05, opened=fresh).reason == "HOLD")
 
 

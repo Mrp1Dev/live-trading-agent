@@ -155,8 +155,13 @@ def execute_intents(
                 journal.record_result(result)
                 continue
 
-            live_quote = broker.get_option_quote(intent.option_symbol)
-            contract = broker.get_option_contract(intent.option_symbol)
+            if intent.is_mleg and hasattr(broker, "get_spread_quote") and intent.short_symbol:
+                live_quote = broker.get_spread_quote(intent.long_symbol, intent.short_symbol, is_credit=intent.is_credit)
+                contract = None
+            else:
+                live_quote = broker.get_option_quote(intent.option_symbol)
+                contract = broker.get_option_contract(intent.option_symbol)
+
             validation = validate_intent(
                 intent,
                 live_quote_raw=live_quote,
@@ -179,38 +184,31 @@ def execute_intents(
                 journal.record_result(result)
                 continue
 
-            instruction = build_order_instruction(intent, live_ask=validation.live_quote.ask, policy=policy)
-            # Recheck actual executable premium against authorized max loss with policy price move tolerance.
-            max_tolerated_risk = intent.authorized_max_loss * (1.0 + policy.max_reference_price_move_pct)
-            actual_authorized_risk = validation.live_quote.ask * 100.0 * intent.contracts
-            if actual_authorized_risk > max_tolerated_risk + 1e-9:
-                result = ExecutionResult(
-                    intent=intent,
-                    instruction=instruction,
-                    status=ExecutionStatus.REJECTED,
-                    approved=False,
-                    reason=(
-                        f"live ask implies ${actual_authorized_risk:,.2f} max loss, "
-                        f"above authorized ${intent.authorized_max_loss:,.2f} "
-                        f"(max allowed with {policy.max_reference_price_move_pct:.0%} price move buffer: ${max_tolerated_risk:,.2f})"
-                    ),
-                    requested_qty=intent.contracts,
-                    limit_price=instruction.limit_price,
-                )
-                report.results.append(result)
-                journal.record_result(result)
-                continue
-
-            raw_order = broker.place_option_order(
-                symbol=instruction.option_symbol,
-                qty=instruction.qty,
-                side=instruction.side,
-                position_intent=instruction.position_intent,
-                order_type=instruction.order_type,
-                time_in_force=instruction.time_in_force,
-                limit_price=instruction.limit_price,
-                client_order_id=instruction.client_order_id,
+            live_ref_price = (
+                validation.live_quote.bid if (intent.is_credit and validation.live_quote.bid > 0)
+                else (validation.live_quote.ask if validation.live_quote.ask > 0 else intent.reference_entry_price)
             )
+            instruction = build_order_instruction(intent, live_ask=live_ref_price, policy=policy)
+
+            if intent.is_mleg and hasattr(broker, "place_mleg_order"):
+                raw_order = broker.place_mleg_order(
+                    qty=instruction.qty,
+                    legs=instruction.legs,
+                    limit_price=instruction.limit_price,
+                    time_in_force=instruction.time_in_force,
+                    client_order_id=instruction.client_order_id,
+                )
+            else:
+                raw_order = broker.place_option_order(
+                    symbol=instruction.option_symbol,
+                    qty=instruction.qty,
+                    side=instruction.side,
+                    position_intent=instruction.position_intent,
+                    order_type=instruction.order_type,
+                    time_in_force=instruction.time_in_force,
+                    limit_price=instruction.limit_price,
+                    client_order_id=instruction.client_order_id,
+                )
             status, data = _extract_status(raw_order)
             order_id = _extract_order_id(data)
             status_enum = {

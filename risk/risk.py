@@ -170,25 +170,15 @@ def _calculate_greeks(
         trade = position.trade
         multiplier = position.contracts * 100
 
-        delta += (
-            (trade.option_delta or 0.0)
-            * multiplier
-        )
+        t_delta = getattr(trade, "option_delta", getattr(trade, "delta", 0.0)) or 0.0
+        t_gamma = getattr(trade, "option_gamma", getattr(trade, "gamma", 0.0)) or 0.0
+        t_vega = getattr(trade, "option_vega", getattr(trade, "vega", 0.0)) or 0.0
+        t_theta = getattr(trade, "option_theta", getattr(trade, "theta", 0.0)) or 0.0
 
-        gamma += (
-            (trade.option_gamma or 0.0)
-            * multiplier
-        )
-
-        vega += (
-            (trade.option_vega or 0.0)
-            * multiplier
-        )
-
-        theta += (
-            (trade.option_theta or 0.0)
-            * multiplier
-        )
+        delta += t_delta * multiplier
+        gamma += t_gamma * multiplier
+        vega += t_vega * multiplier
+        theta += t_theta * multiplier
 
     return delta, gamma, vega, theta
 

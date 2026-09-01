@@ -1,8 +1,26 @@
 BENCHMARK_SYMBOL = "SPY"
 
-# Hackathon universe: 200 liquid U.S. equities extended with ultra-liquid 
-# high-beta growth, leveraged ETFs, volatility proxies, and SPCX.
-UNIVERSE = [
+# Fast, ultra-liquid universe for 0-2 DTE trading with tight $0.01-$0.02 spreads
+FAST_UNIVERSE = [
+    "SPY",
+    "QQQ",
+    "IWM",
+    "NVDA",
+    "TSLA",
+    "AMD",
+    "AAPL",
+    "AMZN",
+    "META",
+    "MSFT",
+    "COIN",
+    "MSTR",
+]
+
+# Default active universe on branch 'short' is the ultra-liquid subset
+UNIVERSE = FAST_UNIVERSE
+
+# Extended hackathon universe for reference / full universe scanning if requested
+FULL_UNIVERSE = [
     # ============================================================
     # INFORMATION TECHNOLOGY / SOFTWARE / SEMICONDUCTORS
     # ============================================================

@@ -8,6 +8,8 @@ from typing import Any, Mapping
 
 class OrderIntent(str, Enum):
     BUY_TO_OPEN = "BUY_TO_OPEN"
+    SELL_TO_OPEN = "SELL_TO_OPEN"
+    MLEG_OPEN = "MLEG_OPEN"
 
 
 class ExecutionStatus(str, Enum):
@@ -44,6 +46,20 @@ class TradeCandidate:
     option_llm_rank: int
     dte: int
 
+    # Multi-leg and spread parameters
+    is_mleg: bool = False
+    is_credit: bool = False
+    spread_type: str = "single_leg"
+    long_symbol: str = ""
+    short_symbol: str | None = None
+    net_limit_price: float = 0.0
+    strike_width: float = 0.0
+    net_credit: float = 0.0
+    net_debit: float = 0.0
+    max_loss: float = 0.0
+    max_profit: float = 0.0
+    legs: list[dict] = field(default_factory=list)
+
     @classmethod
     def from_ranked_option(
         cls,
@@ -53,11 +69,38 @@ class TradeCandidate:
         stock_llm_rank: int,
         option_llm_rank: int,
     ) -> "TradeCandidate":
+        is_mleg = getattr(option, "is_mleg", False)
+        is_credit = getattr(option, "is_credit", False)
+        spread_type = getattr(option, "spread_type", "single_leg")
+        long_leg = getattr(option, "long_leg", None)
+        short_leg = getattr(option, "short_leg", None)
+        long_sym = long_leg.symbol if long_leg else option.symbol
+        short_sym = short_leg.symbol if short_leg else None
+
+        legs: list[dict] = []
+        if is_mleg and short_sym:
+            if is_credit:  # Credit spread: sell short_leg, buy long_leg
+                legs = [
+                    {"symbol": short_sym, "side": "sell", "ratio_qty": 1, "position_intent": "sell_to_open"},
+                    {"symbol": long_sym, "side": "buy", "ratio_qty": 1, "position_intent": "buy_to_open"},
+                ]
+            else:  # Debit spread: buy long_leg, sell short_leg
+                legs = [
+                    {"symbol": long_sym, "side": "buy", "ratio_qty": 1, "position_intent": "buy_to_open"},
+                    {"symbol": short_sym, "side": "sell", "ratio_qty": 1, "position_intent": "sell_to_open"},
+                ]
+        else:
+            legs = [
+                {"symbol": option.symbol, "side": "buy", "ratio_qty": 1, "position_intent": "buy_to_open"}
+            ]
+
+        net_price = getattr(option, "net_credit", 0.0) if is_credit else getattr(option, "net_debit", getattr(option, "ask", 0.0))
+
         return cls(
             stock_symbol=stock.symbol,
             direction=str(direction).upper(),
             option_symbol=option.symbol,
-            option_type=option.option_type,
+            option_type=getattr(option, "option_type", "spread"),
             expiration=option.expiration,
             strike=float(option.strike),
             option_bid=float(option.bid),
@@ -73,6 +116,18 @@ class TradeCandidate:
             stock_llm_rank=int(stock_llm_rank),
             option_llm_rank=int(option_llm_rank),
             dte=int(option.dte),
+            is_mleg=is_mleg,
+            is_credit=is_credit,
+            spread_type=spread_type,
+            long_symbol=long_sym,
+            short_symbol=short_sym,
+            net_limit_price=float(net_price),
+            strike_width=float(getattr(option, "strike_width", 0.0)),
+            net_credit=float(getattr(option, "net_credit", 0.0)),
+            net_debit=float(getattr(option, "net_debit", 0.0)),
+            max_loss=float(getattr(option, "max_loss", getattr(option, "ask", 0.0))),
+            max_profit=float(getattr(option, "max_profit", 0.0)),
+            legs=legs,
         )
 
 
@@ -94,6 +149,15 @@ class ExecutionIntent:
     trade_score: float
     stock_llm_rank: int
     option_llm_rank: int
+
+    # Multi-leg spread fields
+    is_mleg: bool = False
+    is_credit: bool = False
+    spread_type: str = "single_leg"
+    long_symbol: str = ""
+    short_symbol: str | None = None
+    net_limit_price: float = 0.0
+    legs: list[dict] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -125,6 +189,9 @@ class OrderInstruction:
     limit_price: float
     time_in_force: str
     client_order_id: str
+    order_class: str = "simple"
+    legs: list[dict] = field(default_factory=list)
+
 
 
 @dataclass(frozen=True)

@@ -26,13 +26,17 @@ from datetime import date, datetime, time, timedelta
 from typing import Optional
 
 from config import (
+    CREDIT_SPREAD_TAKE_PROFIT_PCT,
+    DAILY_FLATTEN_HOUR_ET,
+    DAILY_FLATTEN_MINUTE_ET,
+    DEBIT_SPREAD_TAKE_PROFIT_PCT,
     FLATTEN_AFTER_HOUR_ET,
     FLATTEN_AFTER_MINUTE_ET,
     FLATTEN_DATE,
-    MAX_HOLD_DAYS,
+    LONG_TAKE_PROFIT_PCT,
+    MAX_HOLD_MINUTES,
     MIN_EXIT_DTE,
     STOP_LOSS_PCT,
-    TAKE_PROFIT_PCT,
     TRAIL_ARM_PCT,
     TRAIL_GIVEBACK_PCT,
 )
@@ -75,13 +79,34 @@ def market_now(now: Optional[datetime] = None) -> datetime:
     return now.astimezone(MARKET_TZ)
 
 
-def days_held(opened_at: str | datetime | None, now: Optional[datetime] = None) -> float:
-    """Fractional days a position has been open.
+def minutes_held(opened_at: str | datetime | None, now: Optional[datetime] = None) -> float:
+    """Elapsed minutes a position has been open."""
+    if opened_at is None:
+        return 0.0
 
-    Returns 0.0 for a missing, unparseable or future timestamp rather than
-    raising. A position with no memory should be governed by the other rules,
-    not force-closed by a bad string.
-    """
+    if isinstance(opened_at, datetime):
+        opened = opened_at
+    else:
+        text = str(opened_at).strip()
+        if not text:
+            return 0.0
+        try:
+            opened = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return 0.0
+
+    reference = market_now(now)
+    if opened.tzinfo is None:
+        opened = opened.replace(tzinfo=reference.tzinfo)
+
+    elapsed = (reference - opened).total_seconds()
+    if elapsed <= 0:
+        return 0.0
+    return elapsed / 60.0
+
+
+def days_held(opened_at: str | datetime | None, now: Optional[datetime] = None) -> float:
+    """Fractional days a position has been open (based on elapsed seconds / 86400)."""
     if opened_at is None:
         return 0.0
 
@@ -106,15 +131,22 @@ def days_held(opened_at: str | datetime | None, now: Optional[datetime] = None) 
     return elapsed / 86400.0
 
 
+def in_daily_flatten_window(now: Optional[datetime] = None) -> bool:
+    """True once the daily 15:50 ET hard flatten deadline has passed."""
+    reference = market_now(now)
+    deadline = time(DAILY_FLATTEN_HOUR_ET, DAILY_FLATTEN_MINUTE_ET)
+    return reference.timetz().replace(tzinfo=None) >= deadline
+
+
 def in_flatten_window(now: Optional[datetime] = None) -> bool:
-    """True once the pre-valuation flatten deadline has passed."""
+    """True once the pre-valuation final flatten deadline or daily 15:50 ET deadline has passed."""
     reference = market_now(now)
     if reference.date() > FLATTEN_DATE:
         return True
-    if reference.date() < FLATTEN_DATE:
-        return False
-    deadline = time(FLATTEN_AFTER_HOUR_ET, FLATTEN_AFTER_MINUTE_ET)
-    return reference.timetz().replace(tzinfo=None) >= deadline
+    if reference.date() == FLATTEN_DATE:
+        deadline = time(FLATTEN_AFTER_HOUR_ET, FLATTEN_AFTER_MINUTE_ET)
+        return reference.timetz().replace(tzinfo=None) >= deadline
+    return in_daily_flatten_window(now)
 
 
 def update_peak(previous_peak_pct: float, current_pnl_pct: float) -> float:
@@ -129,33 +161,45 @@ def evaluate_exit(
     dte: int,
     opened_at: str | datetime | None,
     now: Optional[datetime] = None,
+    is_credit: bool = False,
+    is_spread: bool = False,
 ) -> ExitDecision:
-    """Decide whether an open long option position should be closed.
+    """Decide whether an open position should be closed.
 
-    `pnl_pct` must be measured against the BID (what you can actually sell at),
-    not a midpoint mark. On a wide market that difference is a winner versus a
-    scratch.
+    For Credit Spreads:
+      - pnl_pct = % of credit captured (+50% is target)
+    For Debit Spreads / Longs:
+      - pnl_pct = % ROI on net debit paid (+35% target)
     """
 
-    # 1. Flatten window - nothing outranks being flat for the valuation.
+    # 1. Pre-valuation or daily EOD flatten window
     if in_flatten_window(now):
         return ExitDecision(
             should_close=True,
             reason="FLATTEN_WINDOW",
             urgency=URGENCY_IMMEDIATE,
-            detail="pre-valuation flatten deadline reached",
+            detail="daily or pre-valuation flatten deadline reached (15:50 ET)",
         )
 
-    # 2. Expiry. Do not carry a long option into its final session.
-    if dte is not None and dte <= MIN_EXIT_DTE:
-        return ExitDecision(
-            should_close=True,
-            reason="EXPIRY",
-            urgency=URGENCY_IMMEDIATE,
-            detail=f"DTE {dte} <= {MIN_EXIT_DTE}",
-        )
+    # 2. Expiry. Exit if at or below minimum DTE threshold (if MIN_EXIT_DTE < 0, only trigger if already expired)
+    if dte is not None:
+        if MIN_EXIT_DTE < 0:
+            if dte < 0:
+                return ExitDecision(
+                    should_close=True,
+                    reason="EXPIRY",
+                    urgency=URGENCY_IMMEDIATE,
+                    detail=f"DTE {dte} < 0 (expired)",
+                )
+        elif dte <= MIN_EXIT_DTE:
+            return ExitDecision(
+                should_close=True,
+                reason="EXPIRY",
+                urgency=URGENCY_IMMEDIATE,
+                detail=f"DTE {dte} <= {MIN_EXIT_DTE}",
+            )
 
-    # 3. Stop loss.
+    # 3. Stop loss
     if pnl_pct <= STOP_LOSS_PCT:
         return ExitDecision(
             should_close=True,
@@ -164,9 +208,7 @@ def evaluate_exit(
             detail=f"P&L {pnl_pct:+.1%} <= {STOP_LOSS_PCT:+.0%}",
         )
 
-    # 4. Trailing stop, checked BEFORE the fixed target. Arms only once the
-    #    position has actually worked, so a trade that never ran is handled by
-    #    the stop rather than the trail.
+    # 4. Trailing stop (arms once position reaches +18%)
     peak = update_peak(peak_pnl_pct, pnl_pct)
     if peak >= TRAIL_ARM_PCT:
         floor = peak * (1.0 - TRAIL_GIVEBACK_PCT)
@@ -178,24 +220,33 @@ def evaluate_exit(
                 detail=f"faded to {pnl_pct:+.1%} from peak {peak:+.1%} (floor {floor:+.1%})",
             )
 
-    # 5. Fixed take profit. Deliberately far out; the trail usually gets there first.
-    if pnl_pct >= TAKE_PROFIT_PCT:
-        return ExitDecision(
-            should_close=True,
-            reason="TAKE_PROFIT",
-            urgency=URGENCY_NORMAL,
-            detail=f"P&L {pnl_pct:+.1%} >= {TAKE_PROFIT_PCT:+.0%}",
-        )
+    # 5. Take profit
+    if is_credit:
+        if pnl_pct >= CREDIT_SPREAD_TAKE_PROFIT_PCT:
+            return ExitDecision(
+                should_close=True,
+                reason="TAKE_PROFIT_CREDIT",
+                urgency=URGENCY_NORMAL,
+                detail=f"Credit capture {pnl_pct:+.1%} >= {CREDIT_SPREAD_TAKE_PROFIT_PCT:+.0%}",
+            )
+    else:
+        target_pct = DEBIT_SPREAD_TAKE_PROFIT_PCT if is_spread else LONG_TAKE_PROFIT_PCT
+        if pnl_pct >= target_pct:
+            return ExitDecision(
+                should_close=True,
+                reason="TAKE_PROFIT",
+                urgency=URGENCY_NORMAL,
+                detail=f"P&L {pnl_pct:+.1%} >= {target_pct:+.0%}",
+            )
 
-    # 6. Time stop. Theta on short-dated premium is unforgiving; if the thesis
-    #    has not paid within the planned hold, the trade is over.
-    held = days_held(opened_at, now)
-    if held >= MAX_HOLD_DAYS:
+    # 6. Time stop (40 minutes max hold for fast intraday velocity)
+    mins = minutes_held(opened_at, now)
+    if mins >= MAX_HOLD_MINUTES:
         return ExitDecision(
             should_close=True,
             reason="TIME_STOP",
             urgency=URGENCY_NORMAL,
-            detail=f"held {held:.1f}d >= {MAX_HOLD_DAYS}d",
+            detail=f"held {mins:.0f}m >= {MAX_HOLD_MINUTES:.0f}m",
         )
 
     return HOLD
@@ -205,22 +256,24 @@ def realisable_pnl_pct(
     entry_price: float,
     bid: float,
     fallback_pnl_pct: Optional[float] = None,
+    is_credit: bool = False,
 ) -> Optional[float]:
-    """P&L measured against the bid.
+    """Calculate realisable P&L percentage based on executable prices.
 
-    Alpaca's `unrealized_plpc` marks to the midpoint, but a long option is exited
-    by hitting the bid. Using the mid systematically overstates every position,
-    and on a wide market it is the difference between a winner and a scratch.
-    Returns None when neither the bid nor a fallback is usable, so the caller can
-    treat it as missing data instead of a zero.
+    - For Long/Debit: (current_bid - entry_ask) / entry_ask
+    - For Credit Spreads: (entry_credit - current_cost_to_close) / entry_credit
     """
-    if bid > 0 and entry_price > 0:
-        return (bid - entry_price) / entry_price
+    if entry_price > 0:
+        if is_credit:
+            # bid here represents current cost to buy back / close
+            return (entry_price - bid) / entry_price
+        if bid > 0:
+            return (bid - entry_price) / entry_price
     return fallback_pnl_pct
 
 
 def dte_from_occ_symbol(option_symbol: str, now: Optional[datetime] = None) -> Optional[int]:
-    """Days to expiry parsed from the OCC symbol - no extra API call needed."""
+    """Days to expiry parsed from the OCC symbol."""
     from strategy.option_selector import parse_occ_symbol
 
     try:
@@ -231,7 +284,7 @@ def dte_from_occ_symbol(option_symbol: str, now: Optional[datetime] = None) -> O
 
 
 def sort_closes_immediate_first(decisions: list[tuple[str, ExitDecision]]) -> list[tuple[str, ExitDecision]]:
-    """Order closes so urgent ones are submitted first if the loop is interrupted."""
+    """Order closes so urgent ones are submitted first."""
     return sorted(decisions, key=lambda item: (0 if item[1].is_immediate else 1, item[0]))
 
 
@@ -241,11 +294,14 @@ __all__ = [
     "URGENCY_IMMEDIATE",
     "URGENCY_NORMAL",
     "days_held",
+    "minutes_held",
     "dte_from_occ_symbol",
     "evaluate_exit",
+    "in_daily_flatten_window",
     "in_flatten_window",
     "market_now",
     "realisable_pnl_pct",
     "sort_closes_immediate_first",
     "update_peak",
 ]
+

@@ -11,17 +11,18 @@ def build_trade_candidates(
     stock_rank_by_symbol,
     option_rank_by_symbol,
 ) -> list[TradeCandidate]:
-    """Turn globally-ranked OptionCandidate objects into portfolio-ready trades."""
     result: list[TradeCandidate] = []
     for option in ranked_options:
-        matches = [
-            symbol
-            for symbol in stocks_by_symbol
-            if option.symbol.startswith(symbol.upper())
-        ]
-        if not matches:
-            continue
-        stock_symbol = max(matches, key=len)
+        stock_symbol = getattr(option, "underlying_symbol", None)
+        if not stock_symbol or stock_symbol not in stocks_by_symbol:
+            matches = [
+                symbol
+                for symbol in stocks_by_symbol
+                if option.symbol.upper().startswith(symbol.upper()) or f"{symbol.upper()}_" in option.symbol.upper()
+            ]
+            if not matches:
+                continue
+            stock_symbol = max(matches, key=len)
         stock = stocks_by_symbol[stock_symbol]
         direction = directions_by_symbol[stock_symbol]
         result.append(

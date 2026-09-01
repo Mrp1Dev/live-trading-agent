@@ -33,6 +33,12 @@ class PositionState:
     peak_pnl_pct: float = 0.0
     trade_score: float = 0.0
     thesis: str = ""
+    is_spread: bool = False
+    is_credit: bool = False
+    spread_type: str = "single_leg"
+    long_symbol: str = ""
+    short_symbol: str = ""
+    strike_width: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -50,9 +56,16 @@ class PositionState:
                 peak_pnl_pct=float(raw.get("peak_pnl_pct", 0.0) or 0.0),
                 trade_score=float(raw.get("trade_score", 0.0) or 0.0),
                 thesis=str(raw.get("thesis", "")),
+                is_spread=bool(raw.get("is_spread", False)),
+                is_credit=bool(raw.get("is_credit", False)),
+                spread_type=str(raw.get("spread_type", "single_leg")),
+                long_symbol=str(raw.get("long_symbol", "")),
+                short_symbol=str(raw.get("short_symbol", "")),
+                strike_width=float(raw.get("strike_width", 0.0) or 0.0),
             )
         except (KeyError, TypeError, ValueError):
             return None
+
 
 
 def _state_path() -> str:
@@ -125,6 +138,12 @@ def record_entry(
     trade_score: float = 0.0,
     thesis: str = "",
     now: datetime | None = None,
+    is_spread: bool = False,
+    is_credit: bool = False,
+    spread_type: str = "single_leg",
+    long_symbol: str = "",
+    short_symbol: str = "",
+    strike_width: float = 0.0,
 ) -> PositionState:
     """Register a newly opened position."""
     entry = PositionState(
@@ -137,6 +156,12 @@ def record_entry(
         peak_pnl_pct=0.0,
         trade_score=float(trade_score),
         thesis=thesis,
+        is_spread=is_spread,
+        is_credit=is_credit,
+        spread_type=spread_type,
+        long_symbol=long_symbol,
+        short_symbol=short_symbol,
+        strike_width=strike_width,
     )
     state[option_symbol] = entry
     return entry
@@ -163,10 +188,28 @@ def reconcile(state: dict[str, PositionState], open_symbols: Iterable[str]) -> l
     not exist. Returns the symbols removed.
     """
     live = {str(symbol) for symbol in open_symbols}
-    stale = [symbol for symbol in state if symbol not in live]
-    for symbol in stale:
-        state.pop(symbol, None)
+    stale = []
+    for symbol, entry in list(state.items()):
+        if entry.is_spread:
+            # Multi-leg spread remains active as long as either constituent leg is open on the broker
+            long_open = bool(entry.long_symbol and entry.long_symbol in live)
+            short_open = bool(entry.short_symbol and entry.short_symbol in live)
+            if not long_open and not short_open:
+                state.pop(symbol, None)
+                stale.append(symbol)
+        else:
+            if symbol not in live:
+                state.pop(symbol, None)
+                stale.append(symbol)
     return stale
+
+
+def find_spread_for_leg(state: Mapping[str, PositionState], occ_symbol: str) -> PositionState | None:
+    """Find a tracked spread in state that owns the given OCC leg symbol."""
+    for entry in state.values():
+        if entry.is_spread and (entry.long_symbol == occ_symbol or entry.short_symbol == occ_symbol):
+            return entry
+    return None
 
 
 def adopt_untracked(
@@ -199,6 +242,7 @@ def adopt_untracked(
 __all__ = [
     "PositionState",
     "adopt_untracked",
+    "find_spread_for_leg",
     "forget",
     "load_state",
     "reconcile",

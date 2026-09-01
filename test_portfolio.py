@@ -178,18 +178,19 @@ class TestPortfolioRankingAlignment(unittest.TestCase):
             for i in range(1, 11)
         ]
 
-        # On $100,000 account:
-        # MAX_SINGLE_TRADE_RISK_PCT = 2.5% ($2,500) -> All positions pass single trade cap ($2,400 <= $2,500)
-        # MAX_TOTAL_RISK_PCT = 20% ($20,000)
+        from unittest.mock import patch
+
+        # Sized so total risk is capped at $20,000 with 2.5% single-trade cap:
         # Positions 1..8 take 8 * $2,400 = $19,200.
         # Position 9 gets trimmed to remaining $800 (3 contracts @ $240 = $720).
         # Position 10 (rank #10) has $0 remaining and must be rejected.
-        report = assess_portfolio(
-            positions=positions,
-            account_equity=100000.0,
-            current_equity=100000.0,
-            peak_equity=100000.0,
-        )
+        with patch("risk.risk.MAX_TOTAL_RISK_PCT", 0.20), patch("risk.risk.MAX_SINGLE_TRADE_RISK_PCT", 0.025):
+            report = assess_portfolio(
+                positions=positions,
+                account_equity=100000.0,
+                current_equity=100000.0,
+                peak_equity=100000.0,
+            )
 
         self.assertEqual(len(report.approved_positions), 9)
         self.assertEqual([p.trade.stock_symbol for p in report.approved_positions[:8]], [f"SYM{i}" for i in range(1, 9)])
