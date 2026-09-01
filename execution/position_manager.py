@@ -77,6 +77,133 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _format_strike_str(strike: float) -> str:
+    """Format strike nicely: 505.0 -> '505', 217.5 -> '217.5'."""
+    return f"{strike:g}"
+
+
+def _detect_and_pair_untracked_spreads(
+    pos_by_symbol: dict[str, Any],
+    accounted_legs: set[str],
+    state: dict[str, Any],
+    reference: datetime,
+) -> tuple[list[str], list[str]]:
+    """Scan unaccounted broker positions for matching long+short pairs on the same underlying/expiration.
+
+    Pairs them into structured multi-leg spread PositionState entries, updates state,
+    and removes any stale single-leg entries for those legs.
+    Returns (paired_spread_symbols, newly_accounted_legs).
+    """
+    from strategy.option_selector import parse_occ_symbol
+
+    unaccounted_syms = [s for s in pos_by_symbol if s not in accounted_legs]
+    if len(unaccounted_syms) < 2:
+        return [], []
+
+    # Parse and group by (underlying, expiration, option_type)
+    groups: dict[tuple[str, Any, str], list[tuple[str, Any, float, int, float]]] = {}
+    for sym in unaccounted_syms:
+        raw_pos = pos_by_symbol[sym]
+        qty = int(_safe_float(getattr(raw_pos, "qty", 0)))
+        if qty == 0:
+            continue
+        entry_price = _safe_float(getattr(raw_pos, "avg_entry_price", 0.0))
+        try:
+            exp, opt_type, strike = parse_occ_symbol(sym)
+            underlying = _underlying_of(sym)
+            key = (underlying, exp, opt_type)
+            groups.setdefault(key, []).append((sym, raw_pos, strike, qty, entry_price))
+        except ValueError:
+            continue
+
+    paired_spreads: list[str] = []
+    new_accounted: list[str] = []
+
+    for (underlying, exp, opt_type), items in groups.items():
+        longs = [item for item in items if item[3] > 0]
+        shorts = [item for item in items if item[3] < 0]
+
+        if not longs or not shorts:
+            continue
+
+        # Sort longs and shorts by strike
+        longs.sort(key=lambda x: x[2])
+        shorts.sort(key=lambda x: x[2])
+
+        for l_sym, _, l_strike, l_qty, l_entry in longs:
+            if l_sym in new_accounted:
+                continue
+            for s_sym, _, s_strike, s_qty, s_entry in shorts:
+                if s_sym in new_accounted:
+                    continue
+
+                contracts = min(abs(l_qty), abs(s_qty))
+                exp_str = exp.strftime("%y%m%d")
+
+                if opt_type == "call":
+                    if l_strike < s_strike:
+                        # Bull Call Debit Spread
+                        code = "BCD"
+                        spread_type = "debit_bull_call"
+                        direction = "BULLISH"
+                        is_credit = False
+                        net_entry = max(0.01, round(l_entry - s_entry, 2))
+                        comp_sym = f"{underlying}_{exp_str}_{code}_C{_format_strike_str(l_strike)}/C{_format_strike_str(s_strike)}"
+                    else:
+                        # Bear Call Credit Spread
+                        code = "BCC"
+                        spread_type = "credit_bear_call"
+                        direction = "BEARISH"
+                        is_credit = True
+                        net_entry = max(0.01, round(s_entry - l_entry, 2))
+                        comp_sym = f"{underlying}_{exp_str}_{code}_C{_format_strike_str(s_strike)}/C{_format_strike_str(l_strike)}"
+                else:  # put
+                    if l_strike > s_strike:
+                        # Bear Put Debit Spread
+                        code = "BPD"
+                        spread_type = "debit_bear_put"
+                        direction = "BEARISH"
+                        is_credit = False
+                        net_entry = max(0.01, round(l_entry - s_entry, 2))
+                        comp_sym = f"{underlying}_{exp_str}_{code}_P{_format_strike_str(l_strike)}/P{_format_strike_str(s_strike)}"
+                    else:
+                        # Bull Put Credit Spread
+                        code = "BPC"
+                        spread_type = "credit_bull_put"
+                        direction = "BULLISH"
+                        is_credit = True
+                        net_entry = max(0.01, round(s_entry - l_entry, 2))
+                        comp_sym = f"{underlying}_{exp_str}_{code}_P{_format_strike_str(s_strike)}/P{_format_strike_str(l_strike)}"
+
+                # Remove stale single leg entries from state if present
+                position_state.forget(state, l_sym)
+                position_state.forget(state, s_sym)
+
+                # Record spread entry in state
+                position_state.record_entry(
+                    state,
+                    option_symbol=comp_sym,
+                    stock_symbol=underlying,
+                    direction=direction,
+                    entry_price=net_entry,
+                    contracts=contracts,
+                    now=reference,
+                    is_spread=True,
+                    is_credit=is_credit,
+                    spread_type=spread_type,
+                    long_symbol=l_sym,
+                    short_symbol=s_sym,
+                    strike_width=abs(l_strike - s_strike),
+                    thesis="adopted: auto-paired spread legs from broker",
+                )
+
+                new_accounted.extend([l_sym, s_sym])
+                paired_spreads.append(comp_sym)
+                break
+
+    return paired_spreads, new_accounted
+
+
 def manage_open_positions(
     broker: Any,
     *,
@@ -108,7 +235,7 @@ def manage_open_positions(
     adopted: list[str] = []
     accounted_legs: set[str] = set()
 
-    # 1. Process tracked multi-leg spreads
+    # 1. Identify legs of already-tracked multi-leg spreads
     for comp_sym, st in list(state.items()):
         if not st.is_spread:
             continue
@@ -120,6 +247,23 @@ def manage_open_positions(
         accounted_legs.add(st.long_symbol)
         if st.short_symbol:
             accounted_legs.add(st.short_symbol)
+
+    # 1.5 Auto-detect and pair untracked spreads from broker positions
+    paired_spreads, newly_accounted = _detect_and_pair_untracked_spreads(
+        pos_by_symbol, accounted_legs, state, reference
+    )
+    if paired_spreads:
+        adopted.extend(paired_spreads)
+        accounted_legs.update(newly_accounted)
+
+    # 2. Process all tracked multi-leg spreads (including newly auto-paired ones)
+    for comp_sym, st in list(state.items()):
+        if not st.is_spread:
+            continue
+        long_p = pos_by_symbol.get(st.long_symbol)
+        short_p = pos_by_symbol.get(st.short_symbol)
+        if not long_p and not short_p:
+            continue
 
         contracts = st.contracts
         if long_p:
@@ -155,7 +299,7 @@ def manage_open_positions(
         if pnl_pct is not None:
             peak = position_state.update_peak(state, comp_sym, pnl_pct)
 
-        dte = dte_from_occ_symbol(st.long_symbol, reference)
+        dte = dte_from_occ_symbol(st.long_symbol or comp_sym, reference)
         decision = evaluate_exit(
             pnl_pct=pnl_pct if pnl_pct is not None else 0.0,
             peak_pnl_pct=peak,
@@ -169,7 +313,7 @@ def manage_open_positions(
         managed.append(
             ManagedPosition(
                 option_symbol=comp_sym,
-                stock_symbol=st.stock_symbol or _underlying_of(st.long_symbol),
+                stock_symbol=st.stock_symbol or _underlying_of(st.long_symbol or comp_sym),
                 contracts=contracts,
                 entry_price=entry_price,
                 bid=bid,
@@ -181,7 +325,7 @@ def manage_open_positions(
             )
         )
 
-    # 2. Process single-leg positions (tracked or untracked)
+    # 3. Process remaining single-leg positions (tracked or untracked)
     for position in option_positions:
         symbol = str(getattr(position, "symbol", ""))
         if not symbol or symbol in accounted_legs:
@@ -272,20 +416,21 @@ def manage_open_positions(
             both_legs_open = bool(st and st.is_spread and st.short_symbol and (st.long_symbol in pos_by_symbol) and (st.short_symbol in pos_by_symbol))
             if both_legs_open and hasattr(broker, "place_mleg_order"):
                 # Multi-leg closing order
+                tol = EXIT_LIMIT_TOLERANCE if decision.is_immediate else 0.0
                 if st.is_credit:
                     # Closing credit spread: buy back short, sell long (net debit paid -> positive limit price)
                     close_legs = [
                         {"symbol": st.short_symbol, "side": "buy", "ratio_qty": 1, "position_intent": "buy_to_close"},
                         {"symbol": st.long_symbol, "side": "sell", "ratio_qty": 1, "position_intent": "sell_to_close"},
                     ]
-                    limit_price = max(0.01, round(position.ask * (1.0 + EXIT_LIMIT_TOLERANCE), 2))
+                    limit_price = max(0.01, round(position.ask * (1.0 + tol), 2))
                 else:
                     # Closing debit spread: sell long, buy back short (net credit received -> negative limit price)
                     close_legs = [
                         {"symbol": st.long_symbol, "side": "sell", "ratio_qty": 1, "position_intent": "sell_to_close"},
                         {"symbol": st.short_symbol, "side": "buy", "ratio_qty": 1, "position_intent": "buy_to_close"},
                     ]
-                    credit_to_receive = max(0.01, round(position.bid * (1.0 - EXIT_LIMIT_TOLERANCE), 2))
+                    credit_to_receive = max(0.01, round(position.bid * (1.0 - tol), 2))
                     limit_price = -credit_to_receive
 
                 broker.place_mleg_order(
@@ -305,9 +450,10 @@ def manage_open_positions(
 
                 raw_pos = pos_by_symbol.get(target_sym)
                 is_short = raw_pos is not None and int(_safe_float(getattr(raw_pos, "qty", 0))) < 0
+                tol = EXIT_LIMIT_TOLERANCE if decision.is_immediate else 0.0
                 if is_short:
                     # Short single leg: buy to close
-                    limit_price = max(0.01, round(position.ask * (1.0 + EXIT_LIMIT_TOLERANCE), 2)) if position.ask > 0 else None
+                    limit_price = max(0.01, round(position.ask * (1.0 + tol), 2)) if position.ask > 0 else None
                     broker.place_option_order(
                         symbol=target_sym,
                         qty=position.contracts,
@@ -318,22 +464,35 @@ def manage_open_positions(
                         limit_price=limit_price,
                         client_order_id=_exit_client_order_id(target_sym, reference),
                     )
-                elif position.bid > 0:
-                    # Marketable limit placed slightly through the bid.
-                    limit_price = max(0.01, round(position.bid * (1.0 - EXIT_LIMIT_TOLERANCE), 2))
-                    broker.place_option_order(
-                        symbol=target_sym,
-                        qty=position.contracts,
-                        side="sell",
-                        position_intent="sell_to_close",
-                        order_type="limit",
-                        time_in_force="day",
-                        limit_price=limit_price,
-                        client_order_id=_exit_client_order_id(target_sym, reference),
-                    )
                 else:
-                    # No usable bid; fall back to the broker's own close endpoint
-                    broker.close_position(target_sym, qty=position.contracts)
+                    # Safety check: ensure closing this long leg alone does not leave an uncovered short option on the broker
+                    underlying = _underlying_of(target_sym)
+                    has_opposing_short = any(
+                        sym != target_sym and _underlying_of(sym) == underlying and int(_safe_float(getattr(p, "qty", 0))) < 0
+                        for sym, p in pos_by_symbol.items()
+                    )
+                    if has_opposing_short:
+                        raise BrokerError(
+                            f"Cannot close long leg {target_sym} alone: account holds short option positions in {underlying}. "
+                            "Must close short leg first or close as multi-leg spread."
+                        )
+
+                    if position.bid > 0:
+                        # Marketable limit placed at or slightly through the bid based on urgency.
+                        limit_price = max(0.01, round(position.bid * (1.0 - tol), 2))
+                        broker.place_option_order(
+                            symbol=target_sym,
+                            qty=position.contracts,
+                            side="sell",
+                            position_intent="sell_to_close",
+                            order_type="limit",
+                            time_in_force="day",
+                            limit_price=limit_price,
+                            client_order_id=_exit_client_order_id(target_sym, reference),
+                        )
+                    else:
+                        # No usable bid; fall back to the broker's own close endpoint
+                        broker.close_position(target_sym, qty=position.contracts)
 
             position_state.forget(state, symbol)
             closed.append((symbol, decision.reason))
@@ -565,7 +724,8 @@ def verify_fills(
 
 
 def _exit_client_order_id(symbol: str, now: datetime) -> str:
-    return f"exit-{symbol}-{now.strftime('%Y%m%dT%H%M%S')}"
+    clean_sym = symbol.replace("/", "-").replace(" ", "").replace("_", "-")
+    return f"exit-{clean_sym}-{now.strftime('%Y%m%dT%H%M%S')}"
 
 
 def _print_position_report(positions: list[ManagedPosition], now: datetime) -> None:

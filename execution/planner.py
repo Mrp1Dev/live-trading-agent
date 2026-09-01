@@ -58,31 +58,54 @@ def build_execution_intents(positions, *, strategy_run_id: str | None = None, cr
                 long_symbol=long_symbol,
                 short_symbol=short_symbol,
                 net_limit_price=net_limit_price,
+                strike_width=float(getattr(trade, "strike_width", 0.0)),
                 legs=legs,
             )
         )
     return intents
 
 
-def build_order_instruction(intent: ExecutionIntent, *, live_ask: float, policy: ExecutionPolicy) -> OrderInstruction:
+def build_order_instruction(
+    intent: ExecutionIntent,
+    *,
+    live_ask: float | None = None,
+    live_quote: LiveOptionQuote | None = None,
+    policy: ExecutionPolicy,
+) -> OrderInstruction:
+    bid = float(getattr(live_quote, "bid", 0.0) or 0.0) if live_quote else 0.0
+    ask = float(getattr(live_quote, "ask", 0.0) or 0.0) if live_quote else float(live_ask or 0.0)
+    if ask <= 0 and live_ask is not None:
+        ask = float(live_ask)
+
     if intent.is_mleg:
         if intent.is_credit:
-            # For credit spreads, live_ask or reference_entry_price represents net credit.
-            # Buffer accepts slightly less credit to cross the spread and ensure marketable fill.
-            ref_credit = live_ask if live_ask > 0 else intent.reference_entry_price
-            credit_target = max(0.01, round(ref_credit * (1.0 - policy.limit_price_buffer_pct), 2))
-            # In Alpaca MLEG API, net credit limit_price is NEGATIVE
+            # For credit spreads: bid is net credit to receive at market; ask is cost to buy back
+            # Near-mid credit: price slightly inside the spread to capture price improvement
+            if bid > 0 and ask > 0 and ask >= bid:
+                mid = (bid + ask) / 2.0
+                credit_target = max(0.01, round(mid - 0.15 * (mid - bid), 2))
+            else:
+                ref_credit = bid if bid > 0 else (ask if ask > 0 else intent.reference_entry_price)
+                credit_target = max(0.01, round(ref_credit * (1.0 - policy.limit_price_buffer_pct), 2))
             limit_price = -credit_target
         else:
-            ref_debit = live_ask if live_ask > 0 else intent.reference_entry_price
-            # In Alpaca MLEG API, net debit limit_price is POSITIVE
-            limit_price = max(0.01, round(ref_debit * (1.0 + policy.limit_price_buffer_pct), 2))
+            # For debit spreads: ask is net debit to pay at market; bid is sell value
+            if bid > 0 and ask > 0 and ask >= bid:
+                mid = (bid + ask) / 2.0
+                limit_price = max(0.01, round(mid + 0.15 * (ask - mid), 2))
+            else:
+                ref_debit = ask if ask > 0 else intent.reference_entry_price
+                limit_price = max(0.01, round(ref_debit * (1.0 + policy.limit_price_buffer_pct), 2))
     elif intent.is_credit:
-        ref_price = live_ask if live_ask > 0 else intent.reference_entry_price
+        ref_price = bid if bid > 0 else (ask if ask > 0 else intent.reference_entry_price)
         limit_price = max(0.01, round(ref_price * (1.0 - policy.limit_price_buffer_pct), 2))
     else:
-        ref_price = live_ask if live_ask > 0 else intent.reference_entry_price
-        limit_price = max(0.01, round(ref_price * (1.0 + policy.limit_price_buffer_pct), 2))
+        if bid > 0 and ask > 0 and ask >= bid:
+            mid = (bid + ask) / 2.0
+            limit_price = max(0.01, round(mid + 0.15 * (ask - mid), 2))
+        else:
+            ref_price = ask if ask > 0 else intent.reference_entry_price
+            limit_price = max(0.01, round(ref_price * (1.0 + policy.limit_price_buffer_pct), 2))
 
     client_order_id = f"oa-{intent.strategy_run_id}-{intent.intent_id}"[:48]
     order_class = "mleg" if intent.is_mleg else "simple"

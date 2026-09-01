@@ -95,12 +95,21 @@ def get_latest_underlying_prices(
 
     Raises if no usable price exists.
     """
+    metrics = get_latest_market_metrics(symbols=symbols, feed=feed)
+    return {sym: m["price"] for sym, m in metrics.items()}
+
+
+def get_latest_market_metrics(
+    symbols: Union[str, List[str]],
+    feed: DataFeed = DataFeed.IEX,
+) -> Dict[str, Dict[str, float]]:
+    """Return fresh price, today's open, and intraday return metrics for each symbol."""
     snapshots = get_stock_snapshots(
         symbols=symbols,
         feed=feed,
     )
     symbol_list = [symbols] if isinstance(symbols, str) else list(symbols)
-    prices: Dict[str, float] = {}
+    metrics: Dict[str, Dict[str, float]] = {}
 
     for symbol in symbol_list:
         snapshot = snapshots.get(symbol)
@@ -108,7 +117,6 @@ def get_latest_underlying_prices(
             continue
 
         price: Optional[float] = None
-
         if snapshot.latest_trade is not None:
             trade_price = float(snapshot.latest_trade.price or 0)
             if trade_price > 0:
@@ -125,10 +133,24 @@ def get_latest_underlying_prices(
             if daily_close > 0:
                 price = daily_close
 
-        if price is not None:
-            prices[symbol] = price
+        if price is None or price <= 0:
+            continue
 
-    return prices
+        today_open = float(getattr(snapshot.daily_bar, "open", 0.0) or 0.0) if snapshot.daily_bar else 0.0
+        prev_close = float(getattr(snapshot.prev_daily_bar, "close", 0.0) or 0.0) if snapshot.prev_daily_bar else 0.0
+
+        intraday_return = (price - today_open) / today_open if today_open > 0 else 0.0
+        change_pct = (price - prev_close) / prev_close if prev_close > 0 else intraday_return
+
+        metrics[symbol] = {
+            "price": price,
+            "today_open": today_open,
+            "prev_close": prev_close,
+            "intraday_return": intraday_return,
+            "change_pct": change_pct,
+        }
+
+    return metrics
 
 
 def get_latest_stock_bars(

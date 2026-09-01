@@ -188,7 +188,12 @@ def execute_intents(
                 validation.live_quote.bid if (intent.is_credit and validation.live_quote.bid > 0)
                 else (validation.live_quote.ask if validation.live_quote.ask > 0 else intent.reference_entry_price)
             )
-            instruction = build_order_instruction(intent, live_ask=live_ref_price, policy=policy)
+            instruction = build_order_instruction(
+                intent,
+                live_ask=live_ref_price,
+                live_quote=validation.live_quote,
+                policy=policy,
+            )
 
             if intent.is_mleg and hasattr(broker, "place_mleg_order"):
                 raw_order = broker.place_mleg_order(

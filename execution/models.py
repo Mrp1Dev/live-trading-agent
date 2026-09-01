@@ -157,6 +157,7 @@ class ExecutionIntent:
     long_symbol: str = ""
     short_symbol: str | None = None
     net_limit_price: float = 0.0
+    strike_width: float = 0.0
     legs: list[dict] = field(default_factory=list)
 
 

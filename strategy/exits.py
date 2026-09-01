@@ -26,6 +26,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Optional
 
 from config import (
+    CREDIT_SPREAD_STOP_LOSS_PCT,
     CREDIT_SPREAD_TAKE_PROFIT_PCT,
     DAILY_FLATTEN_HOUR_ET,
     DAILY_FLATTEN_MINUTE_ET,
@@ -200,15 +201,24 @@ def evaluate_exit(
             )
 
     # 3. Stop loss
-    if pnl_pct <= STOP_LOSS_PCT:
-        return ExitDecision(
-            should_close=True,
-            reason="STOP_LOSS",
-            urgency=URGENCY_IMMEDIATE,
-            detail=f"P&L {pnl_pct:+.1%} <= {STOP_LOSS_PCT:+.0%}",
-        )
+    if is_credit:
+        if pnl_pct <= CREDIT_SPREAD_STOP_LOSS_PCT:
+            return ExitDecision(
+                should_close=True,
+                reason="STOP_LOSS_CREDIT",
+                urgency=URGENCY_IMMEDIATE,
+                detail=f"Credit spread loss {pnl_pct:+.1%} <= {CREDIT_SPREAD_STOP_LOSS_PCT:+.0%}",
+            )
+    else:
+        if pnl_pct <= STOP_LOSS_PCT:
+            return ExitDecision(
+                should_close=True,
+                reason="STOP_LOSS",
+                urgency=URGENCY_IMMEDIATE,
+                detail=f"P&L {pnl_pct:+.1%} <= {STOP_LOSS_PCT:+.0%}",
+            )
 
-    # 4. Trailing stop (arms once position reaches +18%)
+    # 4. Trailing stop (arms once position reaches +25%)
     peak = update_peak(peak_pnl_pct, pnl_pct)
     if peak >= TRAIL_ARM_PCT:
         floor = peak * (1.0 - TRAIL_GIVEBACK_PCT)

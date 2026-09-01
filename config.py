@@ -29,36 +29,37 @@ MAX_ABS_PORTFOLIO_VEGA = 4000.0
 EMERGENCY_DRAWDOWN_PCT = 0.15
 
 # ============================================================
-# OPTIONS & SPREADS (0 - 2 DTE)
+# OPTIONS & SPREADS (1 - 4 DTE)
 # ============================================================
 
-MIN_DTE = 0                           # 0-DTE allowed (SPY, QQQ, IWM)
-MAX_DTE = 2                           # 0-2 DTE for high gamma / rapid theta
-MAX_OPTION_SPREAD_PCT = 0.035         # 3.5% max spread on legs (ultra-liquid only)
-MIN_OPTION_ABS_DELTA = 0.10
-MAX_OPTION_ABS_DELTA = 0.90
+MIN_DTE = 1                           # 1-DTE minimum to avoid 0-DTE exponential theta cliff
+MAX_DTE = 4                           # 1-4 DTE for high gamma with manageable theta
+MAX_OPTION_SPREAD_PCT = 0.040         # 4.0% max spread on legs
+MIN_OPTION_ABS_DELTA = 0.15
+MAX_OPTION_ABS_DELTA = 0.85
 MIN_OPTION_PREMIUM = 0.15
 
 # Latest date forbidden for multi-day holds (final hackathon snapshot)
 LATEST_FORBIDDEN_EXPIRATION = date(2026, 9, 4)
 
 # ============================================================
-# INTRADAY EXITS (15 - 45 MIN TURNOVER)
+# INTRADAY & SWING EXITS
 # ============================================================
 
 CREDIT_SPREAD_TAKE_PROFIT_PCT = 0.50  # +50% of credit captured
-DEBIT_SPREAD_TAKE_PROFIT_PCT = 0.35   # +35% on debit spread
-LONG_TAKE_PROFIT_PCT = 0.40           # +40% on single-leg long
+CREDIT_SPREAD_STOP_LOSS_PCT = -0.75   # Stop if cost to close exceeds 1.75x entry credit
+DEBIT_SPREAD_TAKE_PROFIT_PCT = 0.40   # +40% on debit spread
+LONG_TAKE_PROFIT_PCT = 0.50           # +50% on single-leg long
 TAKE_PROFIT_PCT = LONG_TAKE_PROFIT_PCT
-STOP_LOSS_PCT = -0.20                 # -20% hard cut
-TRAIL_ARM_PCT = 0.18                  # arms when position reaches +18%
-TRAIL_GIVEBACK_PCT = 0.20             # give back at most 20% from peak
+STOP_LOSS_PCT = -0.40                 # -40% hard cut on debit/longs (allows breathing room)
+TRAIL_ARM_PCT = 0.25                  # arms when position reaches +25%
+TRAIL_GIVEBACK_PCT = 0.25             # give back at most 25% from peak
 
-MAX_HOLD_MINUTES = 40.0               # time stop in minutes (kills stagnant trades)
-MAX_HOLD_DAYS = MAX_HOLD_MINUTES / (6.5 * 60.0) # fractional trading day equivalent (~0.1d)
-MIN_EXIT_DTE = -1                     # 0-DTE allowed; daily EOD at 15:50 ET flattens before close
+MAX_HOLD_MINUTES = 150.0              # 2.5 hour hold window (allows momentum move to develop)
+MAX_HOLD_DAYS = MAX_HOLD_MINUTES / (6.5 * 60.0) # fractional trading day equivalent (~0.38d)
+MIN_EXIT_DTE = -1                     # daily EOD at 15:50 ET flattens before close
 
-# Daily EOD hard flatten (close all 0-DTE / intraday positions before market close)
+# Daily EOD hard flatten (close all intraday positions before market close)
 DAILY_FLATTEN_HOUR_ET = 15
 DAILY_FLATTEN_MINUTE_ET = 50
 
@@ -78,7 +79,7 @@ NO_TRADE_MINUTES_BEFORE_CLOSE = 12
 
 ENTRY_ORDER_TIMEOUT_SECONDS = 60
 
-# Fast loop cadence for high-turnover trading
-EXIT_INTERVAL_SECONDS = 20            # 20 seconds (checks marks & evaluates fast exits)
-ENTRY_INTERVAL_MINUTES = 3            # 3 minutes (scans for new setups when slots open)
+# Balanced loop cadence to eliminate churn
+EXIT_INTERVAL_SECONDS = 20            # 20 seconds (checks marks & evaluates exits)
+ENTRY_INTERVAL_MINUTES = 10           # 10 minutes (prevents over-trading churn)
 

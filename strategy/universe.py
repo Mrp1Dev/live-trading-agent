@@ -1,19 +1,30 @@
 BENCHMARK_SYMBOL = "SPY"
 
-# Fast, ultra-liquid universe for 0-2 DTE trading with tight $0.01-$0.02 spreads
+# Extended fast, ultra-liquid universe for 0-2 DTE trading
+# High volume, daily/near-daily expirations, tight $0.01-$0.02 ATM spreads
 FAST_UNIVERSE = [
-    "SPY",
-    "QQQ",
-    "IWM",
-    "NVDA",
-    "TSLA",
-    "AMD",
-    "AAPL",
-    "AMZN",
-    "META",
-    "MSFT",
-    "COIN",
-    "MSTR",
+    # --- Broad Index & Sector ETFs ---
+    "SPY",    # S&P 500 ETF
+    "QQQ",    # Nasdaq-100 ETF
+    "IWM",    # Russell 2000 ETF
+    "TLT",    # 20+ Year Treasury Bond ETF
+    "GLD",    # SPDR Gold Shares ETF
+    
+    # --- Mega-Cap Tech & Semiconductors ---
+    "NVDA",   # Nvidia
+    "AAPL",   # Apple
+    "AMZN",   # Amazon
+    "META",   # Meta Platforms
+    "MSFT",   # Microsoft
+    "GOOGL",  # Alphabet Class A
+    "AMD",    # Advanced Micro Devices
+    "TSLA",   # Tesla
+    "SMCI",   # Super Micro Computer
+
+    # --- High-Beta & Crypto-Linked Equities ---
+    "COIN",   # Coinbase Global
+    "MSTR",   # MicroStrategy
+    "PLTR",   # Palantir Technologies
 ]
 
 # Default active universe on branch 'short' is the ultra-liquid subset

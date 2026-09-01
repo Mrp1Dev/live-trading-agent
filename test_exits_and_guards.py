@@ -108,7 +108,7 @@ def test_unarmed_position_rides_to_the_stop():
 
 
 def test_time_stop():
-    old = (NOW - timedelta(minutes=50)).isoformat()
+    old = (NOW - timedelta(minutes=160)).isoformat()
     check("time stop fires past MAX_HOLD_MINUTES", _exit(0.05, opened=old).reason == "TIME_STOP")
     fresh = (NOW - timedelta(minutes=5)).isoformat()
     check("time stop does not fire early", _exit(0.05, opened=fresh).reason == "HOLD")
@@ -439,9 +439,9 @@ def test_position_manager_closes_the_right_positions():
         check("exits are sell_to_close limit orders",
               all(o["side"] == "sell" and o["position_intent"] == "sell_to_close"
                   and o["order_type"] == "limit" for o in broker.orders))
-        check("exit limit is placed slightly through the bid",
-              abs(sells[winner]["limit_price"] - 4.90) < 0.01,
-              str(sells[winner]["limit_price"]))
+        check("immediate exit limit is placed slightly through the bid for urgent exits",
+              abs(sells[loser]["limit_price"] - 0.78) < 0.01,
+              str(sells[loser]["limit_price"]))
         check("closed positions are dropped from state",
               set(position_state.load_state(path)) == {holder},
               str(list(position_state.load_state(path))))
@@ -485,6 +485,138 @@ def test_dry_run_places_no_orders():
               report.closed and report.closed[0][1].startswith("DRY_RUN"), str(report.closed))
 
 
+def test_auto_pair_untracked_spreads():
+    """Verify that when a broker holds complementary long and short options,
+    the position manager automatically pairs them into a structured spread."""
+    from execution.position_manager import manage_open_positions
+    from execution.models import LiveOptionQuote
+
+    long_sym = "MSFT260902C00505000"
+    short_sym = "MSFT260902C00510000"
+
+    class _SpreadBroker(_FakeBroker):
+        def __init__(self, positions, quotes):
+            super().__init__(positions, quotes)
+            self.mleg_orders = []
+
+        def get_spread_quote(self, long_symbol, short_symbol, is_credit=False):
+            return LiveOptionQuote(
+                symbol=f"{long_symbol}/{short_symbol}",
+                bid=0.90,
+                ask=1.00,
+                source="test",
+            )
+
+        def place_mleg_order(self, **kwargs):
+            self.mleg_orders.append(kwargs)
+            return {"id": "fake-mleg-123"}
+
+    broker = _SpreadBroker(
+        positions=[
+            _FakePosition(long_sym, 7, 2.61),    # Long 505 Call
+            _FakePosition(short_sym, -7, 0.95),  # Short 510 Call
+        ],
+        quotes={
+            long_sym: _FakeQuote(1.89, 1.95),
+            short_sym: _FakeQuote(0.67, 0.70),
+        },
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "positions.json")
+        report = manage_open_positions(broker, now=NOW, dry_run=False,
+                                       state_path=path, verbose=False)
+
+        # Should be auto-paired into MSFT_260902_BCD_C505/C510
+        expected_spread_sym = "MSFT_260902_BCD_C505/C510"
+        check("untracked complementary legs auto-pair into spread",
+              expected_spread_sym in report.adopted, str(report.adopted))
+
+        # Net bid is 0.90 vs entry 1.66 -> pnl = -45.8% <= -40% -> triggers STOP_LOSS exit
+        closed_syms = [s for s, _ in report.closed]
+        check("spread is closed on stop loss", expected_spread_sym in closed_syms, str(report.closed))
+
+        check("spread exit submitted as MLEG order",
+              len(broker.mleg_orders) == 1, str(broker.mleg_orders))
+
+        if broker.mleg_orders:
+            mleg = broker.mleg_orders[0]
+            check("MLEG qty matches contracts", mleg["qty"] == 7)
+            check("MLEG has 2 closing legs", len(mleg["legs"]) == 2)
+            check("MLEG debit close limit price is negative credit to receive", mleg["limit_price"] < 0)
+
+        # Test holding spread keeps active state
+        broker_holding = _SpreadBroker(
+            positions=[
+                _FakePosition(long_sym, 7, 2.61),
+                _FakePosition(short_sym, -7, 0.95),
+            ],
+            quotes={
+                long_sym: _FakeQuote(1.89, 1.95),
+                short_sym: _FakeQuote(0.67, 0.70),
+            },
+        )
+        broker_holding.get_spread_quote = lambda l, s, is_credit=False: LiveOptionQuote(
+            symbol=f"{l}/{s}", bid=1.65, ask=1.70, source="test"
+        )
+        report_holding = manage_open_positions(broker_holding, now=NOW, dry_run=False,
+                                               state_path=path, verbose=False)
+        saved_state = position_state.load_state(path)
+        check("holding spread is registered in position state",
+              expected_spread_sym in saved_state, str(list(saved_state.keys())))
+        if expected_spread_sym in saved_state:
+            spread_state = saved_state[expected_spread_sym]
+            check("spread state has is_spread=True", spread_state.is_spread)
+            check("spread state has long_symbol", spread_state.long_symbol == long_sym)
+            check("spread state has short_symbol", spread_state.short_symbol == short_sym)
+            check("spread state has contracts=7", spread_state.contracts == 7)
+            check("spread state has net entry price = 1.66", abs(spread_state.entry_price - 1.66) < 0.01)
+
+
+def test_uncovered_short_option_safety_guard():
+    """Verify that the position manager refuses to place a lone sell_to_close order
+    if doing so would leave an opposing short option on the broker uncovered."""
+    from execution.position_manager import manage_open_positions
+    from strategy.state import PositionState
+
+    long_sym = "MSFT260902C00505000"
+    short_sym = "MSFT260902C00510000"
+
+    broker = _FakeBroker(
+        positions=[
+            _FakePosition(long_sym, 7, 2.61),    # Long Call
+            _FakePosition(short_sym, -7, 0.95),  # Short Call
+        ],
+        quotes={
+            long_sym: _FakeQuote(1.89, 1.95),
+            short_sym: _FakeQuote(0.67, 0.70),
+        },
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "positions.json")
+        # Pre-seed state with an isolated single-leg entry for the long call
+        seeded_state = {
+            long_sym: PositionState(
+                option_symbol=long_sym,
+                stock_symbol="MSFT",
+                direction="BULLISH",
+                opened_at=NOW.isoformat(),
+                entry_price=2.61,
+                contracts=7,
+                is_spread=False,
+            )
+        }
+        position_state.save_state(seeded_state, path)
+
+        report = manage_open_positions(broker, now=NOW, dry_run=False,
+                                       state_path=path, verbose=False)
+
+        # It should auto-pair or refuse to submit a naked sell order
+        check("no standalone sell order submitted for long leg while short is open",
+              all(o.get("symbol") != long_sym for o in broker.orders))
+
+
 # ---------------------------------------------------------------------------
 
 def main() -> int:
@@ -511,6 +643,8 @@ def main() -> int:
         test_position_manager_closes_the_right_positions,
         test_position_manager_survives_a_quote_failure,
         test_dry_run_places_no_orders,
+        test_auto_pair_untracked_spreads,
+        test_uncovered_short_option_safety_guard,
     ]
     for test in tests:
         try:
@@ -533,3 +667,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

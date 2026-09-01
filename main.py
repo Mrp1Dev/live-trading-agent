@@ -5,6 +5,7 @@ from alpaca_client.options import get_option_chain
 from alpaca_client.stocks import (
     print_top_scanned_stocks,
     get_latest_underlying_prices,
+    get_latest_market_metrics,
 )
 from strategy.option_selector import select_directional_options
 from strategy.direction import TradeDirection, determine_direction
@@ -86,6 +87,7 @@ def _record_submitted_entries(execution_report) -> None:
             spread_type=getattr(intent, "spread_type", "single_leg"),
             long_symbol=getattr(intent, "long_symbol", ""),
             short_symbol=getattr(intent, "short_symbol", "") or "",
+            strike_width=float(getattr(intent, "strike_width", 0.0)),
         )
     position_state.save_state(state)
 
@@ -169,19 +171,33 @@ def run_entry_cycle(
             f"ScannerScore={stock.score:.1f}"
         )
 
-    latest_prices = get_latest_underlying_prices([stock.symbol for stock in selected_stocks])
+    target_symbols = list({stock.symbol for stock in selected_stocks} | {"SPY"})
+    market_metrics = get_latest_market_metrics(target_symbols)
+    spy_metric = market_metrics.get("SPY", {})
+    spy_intraday_return = spy_metric.get("intraday_return")
+
     all_options = []
     stocks_by_symbol = {}
     directions_by_symbol = {}
 
     for stock in selected_stocks:
-        underlying_price = latest_prices.get(stock.symbol)
+        stock_metric = market_metrics.get(stock.symbol, {})
+        underlying_price = stock_metric.get("price")
         if underlying_price is None or underlying_price <= 0:
             print(f"Skipping {stock.symbol}: no valid live price.")
             continue
-        direction = determine_direction(stock)
+
+        intraday_ret = stock_metric.get("intraday_return")
+        change_pct = stock_metric.get("change_pct")
+
+        direction = determine_direction(
+            stock,
+            intraday_return=intraday_ret,
+            change_pct=change_pct,
+            spy_intraday_return=spy_intraday_return,
+        )
         if direction == TradeDirection.NEUTRAL:
-            print(f"Skipping {stock.symbol}: direction is neutral.")
+            print(f"Skipping {stock.symbol}: direction is neutral (or contradicted by intraday price action).")
             continue
         chain = get_option_chain(stock.symbol)
         options = select_directional_options(
