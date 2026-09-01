@@ -136,8 +136,11 @@ def get_latest_market_metrics(
         if price is None or price <= 0:
             continue
 
-        today_open = float(getattr(snapshot.daily_bar, "open", 0.0) or 0.0) if snapshot.daily_bar else 0.0
-        prev_close = float(getattr(snapshot.prev_daily_bar, "close", 0.0) or 0.0) if snapshot.prev_daily_bar else 0.0
+        daily_bar = getattr(snapshot, "daily_bar", None)
+        today_open = float(getattr(daily_bar, "open", 0.0) or 0.0) if daily_bar else 0.0
+
+        prev_bar = getattr(snapshot, "previous_daily_bar", None) or getattr(snapshot, "prev_daily_bar", None)
+        prev_close = float(getattr(prev_bar, "close", 0.0) or 0.0) if prev_bar else 0.0
 
         intraday_return = (price - today_open) / today_open if today_open > 0 else 0.0
         change_pct = (price - prev_close) / prev_close if prev_close > 0 else intraday_return
