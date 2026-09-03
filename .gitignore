@@ -10,3 +10,4 @@ state/
 # build scratch
 _header.txt
 _pipeline_body.txt
+.env.account2
