@@ -26,6 +26,8 @@ from datetime import date, datetime, time, timedelta
 from typing import Optional
 
 from config import (
+    BREAKEVEN_ARM_PCT,
+    BREAKEVEN_BUFFER_PCT,
     CREDIT_SPREAD_STOP_LOSS_PCT,
     CREDIT_SPREAD_TAKE_PROFIT_PCT,
     DAILY_FLATTEN_HOUR_ET,
@@ -38,6 +40,10 @@ from config import (
     MAX_HOLD_MINUTES,
     MIN_EXIT_DTE,
     STOP_LOSS_PCT,
+    TIME_DECAY_STAGE1_MINUTES,
+    TIME_DECAY_STAGE1_TARGET_PCT,
+    TIME_DECAY_STAGE2_MINUTES,
+    TIME_DECAY_STAGE2_TARGET_PCT,
     TRAIL_ARM_PCT,
     TRAIL_GIVEBACK_PCT,
 )
@@ -218,10 +224,18 @@ def evaluate_exit(
                 detail=f"P&L {pnl_pct:+.1%} <= {STOP_LOSS_PCT:+.0%}",
             )
 
-    # 4. Trailing stop (arms once position reaches +25%)
+    # 4. Trailing stop (arms once position reaches TRAIL_ARM_PCT)
     peak = update_peak(peak_pnl_pct, pnl_pct)
     if peak >= TRAIL_ARM_PCT:
-        floor = peak * (1.0 - TRAIL_GIVEBACK_PCT)
+        # Dynamic ratcheted floor: tighter giveback at higher peaks
+        if peak >= 0.35:
+            floor = peak * 0.85
+        elif peak >= 0.25:
+            floor = peak * (1.0 - TRAIL_GIVEBACK_PCT)
+        else:
+            # Between TRAIL_ARM_PCT (e.g. 0.18) and 0.25: give back at most 6% absolute
+            floor = max(BREAKEVEN_BUFFER_PCT, peak - 0.06)
+
         if pnl_pct <= floor:
             return ExitDecision(
                 should_close=True,
@@ -230,7 +244,18 @@ def evaluate_exit(
                 detail=f"faded to {pnl_pct:+.1%} from peak {peak:+.1%} (floor {floor:+.1%})",
             )
 
-    # 5. Take profit
+    # 5. Breakeven Shield (protects gains of +12% or more from turning into losses)
+    if peak >= BREAKEVEN_ARM_PCT:
+        if pnl_pct <= BREAKEVEN_BUFFER_PCT:
+            return ExitDecision(
+                should_close=True,
+                reason="BREAKEVEN_STOP",
+                urgency=URGENCY_NORMAL,
+                detail=f"protected gain: faded to {pnl_pct:+.1%} after peak {peak:+.1%} (floor {BREAKEVEN_BUFFER_PCT:+.1%})",
+            )
+
+    # 6. Take profit & Dynamic Time-Decayed Targets
+    mins = minutes_held(opened_at, now)
     if is_credit:
         if pnl_pct >= CREDIT_SPREAD_TAKE_PROFIT_PCT:
             return ExitDecision(
@@ -249,8 +274,23 @@ def evaluate_exit(
                 detail=f"P&L {pnl_pct:+.1%} >= {target_pct:+.0%}",
             )
 
-    # 6. Time stop (40 minutes max hold for fast intraday velocity)
-    mins = minutes_held(opened_at, now)
+        # Dynamic time-decayed targets: take profits early before theta accelerates
+        if mins >= TIME_DECAY_STAGE2_MINUTES and pnl_pct >= TIME_DECAY_STAGE2_TARGET_PCT:
+            return ExitDecision(
+                should_close=True,
+                reason="TIME_DECAY_PROFIT",
+                urgency=URGENCY_NORMAL,
+                detail=f"banked {pnl_pct:+.1%} >= {TIME_DECAY_STAGE2_TARGET_PCT:+.0%} target after {mins:.0f}m hold",
+            )
+        if mins >= TIME_DECAY_STAGE1_MINUTES and pnl_pct >= TIME_DECAY_STAGE1_TARGET_PCT:
+            return ExitDecision(
+                should_close=True,
+                reason="TIME_DECAY_PROFIT",
+                urgency=URGENCY_NORMAL,
+                detail=f"banked {pnl_pct:+.1%} >= {TIME_DECAY_STAGE1_TARGET_PCT:+.0%} target after {mins:.0f}m hold",
+            )
+
+    # 7. Time stop (max hold window to eliminate theta burn)
     if mins >= MAX_HOLD_MINUTES:
         return ExitDecision(
             should_close=True,

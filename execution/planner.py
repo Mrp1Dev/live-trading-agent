@@ -80,32 +80,21 @@ def build_order_instruction(
     if intent.is_mleg:
         if intent.is_credit:
             # For credit spreads: bid is net credit to receive at market; ask is cost to buy back
-            # Near-mid credit: price slightly inside the spread to capture price improvement
-            if bid > 0 and ask > 0 and ask >= bid:
-                mid = (bid + ask) / 2.0
-                credit_target = max(0.01, round(mid - 0.15 * (mid - bid), 2))
-            else:
-                ref_credit = bid if bid > 0 else (ask if ask > 0 else intent.reference_entry_price)
-                credit_target = max(0.01, round(ref_credit * (1.0 - policy.limit_price_buffer_pct), 2))
+            # Marketable credit limit: match market bid (or slightly buffered) to ensure fill
+            ref_credit = bid if bid > 0 else (intent.reference_entry_price if intent.reference_entry_price > 0 else ask)
+            credit_target = max(0.01, round(ref_credit * (1.0 - policy.limit_price_buffer_pct), 2))
             limit_price = -credit_target
         else:
             # For debit spreads: ask is net debit to pay at market; bid is sell value
-            if bid > 0 and ask > 0 and ask >= bid:
-                mid = (bid + ask) / 2.0
-                limit_price = max(0.01, round(mid + 0.15 * (ask - mid), 2))
-            else:
-                ref_debit = ask if ask > 0 else intent.reference_entry_price
-                limit_price = max(0.01, round(ref_debit * (1.0 + policy.limit_price_buffer_pct), 2))
+            # Marketable debit limit: match market ask (or slightly buffered) to ensure immediate fill
+            ref_debit = ask if ask > 0 else intent.reference_entry_price
+            limit_price = max(0.01, round(ref_debit * (1.0 + policy.limit_price_buffer_pct), 2))
     elif intent.is_credit:
         ref_price = bid if bid > 0 else (ask if ask > 0 else intent.reference_entry_price)
         limit_price = max(0.01, round(ref_price * (1.0 - policy.limit_price_buffer_pct), 2))
     else:
-        if bid > 0 and ask > 0 and ask >= bid:
-            mid = (bid + ask) / 2.0
-            limit_price = max(0.01, round(mid + 0.15 * (ask - mid), 2))
-        else:
-            ref_price = ask if ask > 0 else intent.reference_entry_price
-            limit_price = max(0.01, round(ref_price * (1.0 + policy.limit_price_buffer_pct), 2))
+        ref_price = ask if ask > 0 else intent.reference_entry_price
+        limit_price = max(0.01, round(ref_price * (1.0 + policy.limit_price_buffer_pct), 2))
 
     client_order_id = f"oa-{intent.strategy_run_id}-{intent.intent_id}"[:48]
     order_class = "mleg" if intent.is_mleg else "simple"

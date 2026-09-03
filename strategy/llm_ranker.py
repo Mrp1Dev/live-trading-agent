@@ -81,9 +81,10 @@ def _pct(value: float) -> str:
 def _format_scanner_row(stock: ScannedStock) -> str:
     """Format the complete scanner information compactly for the LLM."""
     rank = stock.rank if stock.rank is not None else "-"
+    intraday_str = f"Intraday: {_pct(stock.intraday_return)} | " if getattr(stock, "intraday_return", None) is not None else ""
     return (
         f"Rank #{rank} | Symbol: {stock.symbol} | Price: ${stock.price:.2f} | "
-        f"1D: {_pct(stock.return_1d)} | 5D: {_pct(stock.return_5d)} | "
+        f"1D: {_pct(stock.return_1d)} | {intraday_str}5D: {_pct(stock.return_5d)} | "
         f"20D: {_pct(stock.return_20d)} | Vol/Avg: {stock.volume_ratio:.2f}x | "
         f"SMA20 dist: {_pct(stock.distance_sma20)} | "
         f"SMA50 dist: {_pct(stock.distance_sma50)} | "

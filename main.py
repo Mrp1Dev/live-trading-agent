@@ -190,6 +190,13 @@ def run_entry_cycle(
         intraday_ret = stock_metric.get("intraday_return")
         change_pct = stock_metric.get("change_pct")
 
+        # Synchronize stock with the absolute latest live market price & return
+        stock.price = underlying_price
+        if change_pct is not None:
+            stock.return_1d = change_pct
+        if intraday_ret is not None:
+            stock.intraday_return = intraday_ret
+
         direction = determine_direction(
             stock,
             intraday_return=intraday_ret,

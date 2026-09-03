@@ -164,8 +164,8 @@ class TestImprovements(unittest.TestCase):
         self.assertEqual(d_stop.should_close, True)
         self.assertEqual(d_stop.reason, "STOP_LOSS_CREDIT")
 
-    def test_near_midpoint_price_improvement(self):
-        """Verify limit orders price inside the spread near midpoint instead of crossing full ask."""
+    def test_marketable_entry_limit_pricing(self):
+        """Verify limit orders price at the executable ask to guarantee instant fills on broker."""
         intent = ExecutionIntent(
             intent_id="test1",
             strategy_run_id="run1",
@@ -196,9 +196,8 @@ class TestImprovements(unittest.TestCase):
         policy = ExecutionPolicy()
 
         instr = build_order_instruction(intent, live_quote=quote, policy=policy)
-        # Mid is 1.70. With 0.15 * (1.90 - 1.70) = 0.03, limit price should be 1.73, NOT 1.90!
-        self.assertAlmostEqual(instr.limit_price, 1.73, places=2)
-        self.assertLess(instr.limit_price, quote.ask)
+        # Marketable limit price matches ask (1.90) to guarantee execution
+        self.assertAlmostEqual(instr.limit_price, 1.90, places=2)
 
 
 if __name__ == "__main__":

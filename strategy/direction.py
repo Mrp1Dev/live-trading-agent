@@ -15,22 +15,24 @@ def determine_direction(
     spy_intraday_return: float | None = None,
 ) -> TradeDirection:
     """
-    Determine directional bias with both multi-day trend and real-time intraday momentum confirmation.
+    Determine directional bias with both multi-day trend and real-time intraday momentum.
 
-    Requires a majority of the three multi-day directional signals to agree,
-    AND confirms that real-time intraday price action does not contradict the trade.
+    Prioritizes real-time live market data:
+    1. Strong multi-day agreement establishes base direction, confirmed by live price action.
+    2. Mixed multi-day stocks can be directionally resolved by strong live intraday momentum.
+    3. Real-time intraday price action or market-wide dumps veto contradictory trades.
     """
 
     bullish_signals = sum([
-        stock.return_5d > 0,
-        stock.return_20d > 0,
-        stock.relative_strength_spy > 0,
+        getattr(stock, "return_5d", 0.0) > 0,
+        getattr(stock, "return_20d", 0.0) > 0,
+        getattr(stock, "relative_strength_spy", 0.0) > 0,
     ])
 
     bearish_signals = sum([
-        stock.return_5d < 0,
-        stock.return_20d < 0,
-        stock.relative_strength_spy < 0,
+        getattr(stock, "return_5d", 0.0) < 0,
+        getattr(stock, "return_20d", 0.0) < 0,
+        getattr(stock, "relative_strength_spy", 0.0) < 0,
     ])
 
     base_direction = TradeDirection.NEUTRAL
@@ -38,6 +40,14 @@ def determine_direction(
         base_direction = TradeDirection.BULLISH
     elif bearish_signals >= 2:
         base_direction = TradeDirection.BEARISH
+    else:
+        # Live market tie-breaker for mixed historical setups:
+        # If the stock is strongly moving today, live momentum establishes direction
+        if change_pct is not None and intraday_return is not None:
+            if change_pct >= 0.008 and intraday_return >= 0.004:
+                base_direction = TradeDirection.BULLISH
+            elif change_pct <= -0.008 and intraday_return <= -0.004:
+                base_direction = TradeDirection.BEARISH
 
     if base_direction == TradeDirection.NEUTRAL:
         return TradeDirection.NEUTRAL

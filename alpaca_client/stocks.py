@@ -138,6 +138,7 @@ def get_latest_market_metrics(
 
         daily_bar = getattr(snapshot, "daily_bar", None)
         today_open = float(getattr(daily_bar, "open", 0.0) or 0.0) if daily_bar else 0.0
+        today_volume = float(getattr(daily_bar, "volume", 0.0) or 0.0) if daily_bar else 0.0
 
         prev_bar = getattr(snapshot, "previous_daily_bar", None) or getattr(snapshot, "prev_daily_bar", None)
         prev_close = float(getattr(prev_bar, "close", 0.0) or 0.0) if prev_bar else 0.0
@@ -151,6 +152,7 @@ def get_latest_market_metrics(
             "prev_close": prev_close,
             "intraday_return": intraday_return,
             "change_pct": change_pct,
+            "volume": today_volume,
         }
 
     return metrics
@@ -176,26 +178,37 @@ def scan_stocks(
     universe: Optional[List[str]] = None,
     top_n: int = STOCK_SCANNER_TOP_N,
     benchmark_symbol: str = BENCHMARK_SYMBOL,
+    use_live_data: bool = True,
 ) -> List[ScannedStock]:
-    """Fetch historical daily bars from Alpaca and scan the universe for top candidates."""
+    """Fetch historical daily bars and live market metrics from Alpaca to scan the universe."""
     target_universe = list(universe) if universe else list(UNIVERSE)
     all_symbols = list(set(target_universe + [benchmark_symbol]))
 
     df = get_historical_daily_bars(symbols=all_symbols, days=90)
+    live_metrics = None
+    if use_live_data:
+        try:
+            live_metrics = get_latest_market_metrics(symbols=all_symbols)
+        except Exception as exc:
+            print(f"Warning: could not fetch live market metrics for scanner: {exc}")
+            live_metrics = None
+
     return scan_stock_bars(
         bars_df=df,
         universe=target_universe,
         benchmark_symbol=benchmark_symbol,
         top_n=top_n,
+        live_metrics=live_metrics,
     )
 
 
 def print_top_scanned_stocks(
     universe: Optional[List[str]] = None,
     top_n: int = STOCK_SCANNER_TOP_N,
+    use_live_data: bool = True,
 ) -> List[ScannedStock]:
     """Scan the universe and print the formatted top picks table."""
-    stocks = scan_stocks(universe=universe, top_n=top_n)
+    stocks = scan_stocks(universe=universe, top_n=top_n, use_live_data=use_live_data)
     print_scan_results(stocks, title=f"Top Stock Scanner Picks (Top {len(stocks)})")
     return stocks
 

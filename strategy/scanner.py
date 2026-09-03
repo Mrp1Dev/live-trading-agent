@@ -87,6 +87,7 @@ class ScannedStock:
     trend_score: float
     score: float
     rank: Optional[int] = None
+    intraday_return: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -172,9 +173,11 @@ def extract_stock_metrics(
     stock_df: pd.DataFrame,
     spy_return_20d: float,
     as_of: Optional[datetime] = None,
+    live_metric: Optional[Dict[str, float]] = None,
 ) -> Optional[Dict]:
-    """Calculate raw technical metrics for a single stock from its daily bars.
+    """Calculate raw technical metrics for a single stock from its daily bars
 
+    and optional live market metrics.
     Returns None when the bars cannot support a trustworthy metric set, so the
     symbol is dropped rather than scored on defaults.
     """
@@ -187,37 +190,76 @@ def extract_stock_metrics(
         return None
 
     closes, volumes = cleaned
-    current_price = float(closes[-1])
 
-    # 1. Returns: 1-day, 5-day, 20-day
-    ret_1d = float((closes[-1] - closes[-2]) / closes[-2])
-    ret_5d = float((closes[-1] - closes[-6]) / closes[-6])
-    ret_20d = float((closes[-1] - closes[-21]) / closes[-21])
+    live_price = float(live_metric.get("price", 0.0) or 0.0) if live_metric else 0.0
+    if live_price > 0:
+        # Live market data takes precedence over yesterday's close
+        current_price = live_price
 
-    # 2. Volume / Average Volume (20-day historical average excluding current bar)
-    current_volume = float(volumes[-1])
-    avg_volume_20d = float(np.mean(volumes[-21:-1]))
+        # 1. Live Returns
+        if live_metric.get("change_pct") is not None:
+            ret_1d = float(live_metric["change_pct"])
+        else:
+            ret_1d = float((current_price - closes[-1]) / closes[-1])
 
-    if avg_volume_20d <= 0:
-        # No traded history to compare against; the ratio would be meaningless.
-        return None
+        ret_5d = float((current_price - closes[-5]) / closes[-5]) if len(closes) >= 5 else ret_1d
+        ret_20d = float((current_price - closes[-20]) / closes[-20]) if len(closes) >= 20 else ret_5d
 
-    volume_ratio = current_volume / avg_volume_20d
+        # 2. Volume: today's live accumulated volume vs 20-day historical average
+        avg_volume_20d = float(np.mean(volumes[-20:]))
+        live_vol = float(live_metric.get("volume", 0.0) or 0.0)
+        current_volume = live_vol if live_vol > 0 else float(volumes[-1])
+        volume_ratio = current_volume / avg_volume_20d if avg_volume_20d > 0 else 1.0
 
-    # 3. Distance from Moving Averages (20d & 50d)
-    sma_20 = float(np.mean(closes[-20:]))
-    dist_sma20 = (current_price - sma_20) / sma_20 if sma_20 > 0 else 0.0
+        # 3. Moving Averages updated with live price
+        sma_20 = float(np.mean(np.append(closes[-19:], current_price)))
+        dist_sma20 = (current_price - sma_20) / sma_20 if sma_20 > 0 else 0.0
 
-    if len(closes) >= 50:
-        sma_50 = float(np.mean(closes[-50:]))
-        dist_sma50 = (current_price - sma_50) / sma_50 if sma_50 > 0 else dist_sma20
+        if len(closes) >= 49:
+            sma_50 = float(np.mean(np.append(closes[-49:], current_price)))
+            dist_sma50 = (current_price - sma_50) / sma_50 if sma_50 > 0 else dist_sma20
+        else:
+            sma_50 = sma_20
+            dist_sma50 = dist_sma20
+
+        # 4. Realized Volatility updated with live move
+        log_ret_live = np.log(current_price / closes[-1]) if current_price > 0 and closes[-1] > 0 else 0.0
+        log_returns = np.append(np.diff(np.log(closes[-20:])), log_ret_live)
+        realized_vol = float(np.std(log_returns, ddof=1) * np.sqrt(252)) if log_returns.size > 1 else 0.0
+        intraday_return = float(live_metric.get("intraday_return", 0.0) or 0.0)
     else:
-        sma_50 = sma_20
-        dist_sma50 = dist_sma20
+        # Fallback to historical daily bars
+        current_price = float(closes[-1])
 
-    # 4. Realized Volatility (Annualized 20-day log return standard deviation)
-    log_returns = np.diff(np.log(closes[-21:]))
-    realized_vol = float(np.std(log_returns, ddof=1) * np.sqrt(252)) if log_returns.size > 1 else 0.0
+        # 1. Returns: 1-day, 5-day, 20-day
+        ret_1d = float((closes[-1] - closes[-2]) / closes[-2])
+        ret_5d = float((closes[-1] - closes[-6]) / closes[-6])
+        ret_20d = float((closes[-1] - closes[-21]) / closes[-21])
+
+        # 2. Volume / Average Volume (20-day historical average excluding current bar)
+        current_volume = float(volumes[-1])
+        avg_volume_20d = float(np.mean(volumes[-21:-1]))
+
+        if avg_volume_20d <= 0:
+            return None
+
+        volume_ratio = current_volume / avg_volume_20d
+
+        # 3. Distance from Moving Averages (20d & 50d)
+        sma_20 = float(np.mean(closes[-20:]))
+        dist_sma20 = (current_price - sma_20) / sma_20 if sma_20 > 0 else 0.0
+
+        if len(closes) >= 50:
+            sma_50 = float(np.mean(closes[-50:]))
+            dist_sma50 = (current_price - sma_50) / sma_50 if sma_50 > 0 else dist_sma20
+        else:
+            sma_50 = sma_20
+            dist_sma50 = dist_sma20
+
+        # 4. Realized Volatility (Annualized 20-day log return standard deviation)
+        log_returns = np.diff(np.log(closes[-21:]))
+        realized_vol = float(np.std(log_returns, ddof=1) * np.sqrt(252)) if log_returns.size > 1 else 0.0
+        intraday_return = None
 
     # 5. Relative Strength vs SPY (20-day excess return over benchmark)
     rs_spy = float(ret_20d - spy_return_20d)
@@ -249,6 +291,7 @@ def extract_stock_metrics(
         "raw_volatility": raw_volatility,
         "raw_relative_strength": raw_relative_strength,
         "raw_trend": raw_trend,
+        "intraday_return": intraday_return,
     }
 
 
@@ -373,6 +416,7 @@ def score_and_rank_stocks(metrics_list: List[Dict]) -> List[ScannedStock]:
                 relative_strength_score=rs_score,
                 trend_score=tr_score,
                 score=composite_score,
+                intraday_return=m.get("intraday_return"),
             )
         )
 
@@ -407,6 +451,7 @@ def _benchmark_return_20d(
     bars_df: pd.DataFrame,
     benchmark_symbol: str,
     as_of: Optional[datetime] = None,
+    live_spy_price: Optional[float] = None,
 ) -> float:
     """20-day benchmark return, or 0.0 when the benchmark is unavailable.
 
@@ -426,6 +471,12 @@ def _benchmark_return_20d(
     spy_closes = spy_closes[np.isfinite(spy_closes)]
     spy_closes = spy_closes[spy_closes > 0]
 
+    if live_spy_price is not None and live_spy_price > 0:
+        if spy_closes.size >= 20:
+            return float((live_spy_price - spy_closes[-20]) / spy_closes[-20])
+        if spy_closes.size > 0:
+            return float((live_spy_price - spy_closes[0]) / spy_closes[0])
+
     if spy_closes.size >= MIN_BARS_REQUIRED:
         return float((spy_closes[-1] - spy_closes[-21]) / spy_closes[-21])
     if spy_closes.size > 1:
@@ -439,18 +490,28 @@ def scan_stock_bars(
     benchmark_symbol: str = BENCHMARK_SYMBOL,
     top_n: int = 15,
     as_of: Optional[datetime] = None,
+    live_metrics: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> List[ScannedStock]:
     """Pure strategy scanner logic that processes a DataFrame of daily bars
 
-    and returns the top N ranked candidates. Makes no API calls.
+    and returns the top N ranked candidates. Incorporates live_metrics when supplied.
     """
     target_universe = list(universe) if universe else list(UNIVERSE)
 
     if bars_df is None or len(bars_df) == 0:
         return []
 
-    # 1. Benchmark return for the relative-strength factor
-    spy_return_20d = _benchmark_return_20d(bars_df, benchmark_symbol, as_of=as_of)
+    # 1. Benchmark return for the relative-strength factor (with live price if available)
+    live_spy_price = None
+    if live_metrics and benchmark_symbol in live_metrics:
+        live_spy_price = live_metrics[benchmark_symbol].get("price")
+
+    spy_return_20d = _benchmark_return_20d(
+        bars_df,
+        benchmark_symbol,
+        as_of=as_of,
+        live_spy_price=live_spy_price,
+    )
 
     # 2. Extract metrics for all available stocks in universe
     metrics_list = []
@@ -460,7 +521,14 @@ def scan_stock_bars(
         if symbol not in available_symbols:
             continue
         sdf = bars_df.xs(symbol, level=0)
-        metrics = extract_stock_metrics(symbol, sdf, spy_return_20d, as_of=as_of)
+        live_metric = live_metrics.get(symbol) if live_metrics else None
+        metrics = extract_stock_metrics(
+            symbol,
+            sdf,
+            spy_return_20d,
+            as_of=as_of,
+            live_metric=live_metric,
+        )
         if metrics is not None:
             metrics_list.append(metrics)
 

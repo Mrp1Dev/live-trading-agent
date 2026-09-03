@@ -108,10 +108,63 @@ def test_unarmed_position_rides_to_the_stop():
 
 
 def test_time_stop():
-    old = (NOW - timedelta(minutes=160)).isoformat()
+    old = (NOW - timedelta(minutes=95)).isoformat()
     check("time stop fires past MAX_HOLD_MINUTES", _exit(0.05, opened=old).reason == "TIME_STOP")
     fresh = (NOW - timedelta(minutes=5)).isoformat()
     check("time stop does not fire early", _exit(0.05, opened=fresh).reason == "HOLD")
+
+
+def test_breakeven_shield_protects_profit():
+    # Peak reached +15% (>= BREAKEVEN_ARM_PCT 12%), now faded to +1% (<= BREAKEVEN_BUFFER_PCT 2%)
+    d = _exit(0.01, peak=0.15)
+    check("breakeven shield fires when faded to +1% after +15% peak", d.reason == "BREAKEVEN_STOP", d.reason)
+
+    # Peak reached only +10% (< 12%), faded to +1% -> should HOLD (unarmed for breakeven)
+    d = _exit(0.01, peak=0.10)
+    check("breakeven shield unarmed when peak was under 12%", d.reason == "HOLD", d.reason)
+
+    # Peak reached +15%, but current PnL is +5% (> 2%) -> should HOLD
+    d = _exit(0.05, peak=0.15)
+    check("breakeven shield does not fire while above +2% buffer", d.reason == "HOLD", d.reason)
+
+
+def test_ratcheted_trailing_stop():
+    # Armed at +18%: peak +20%, floor is 0.20 - 0.06 = +14%
+    d = _exit(0.13, peak=0.20)
+    check("trailing stop fires at +13% when peak is +20% (floor 14%)", d.reason == "TRAILING_STOP", d.reason)
+
+    # Peak +30%: floor is 0.30 * 0.80 = +24%
+    d = _exit(0.23, peak=0.30)
+    check("trailing stop fires at +23% when peak is +30% (floor 24%)", d.reason == "TRAILING_STOP", d.reason)
+
+    # Peak +40%: floor is 0.40 * 0.85 = +34%
+    d = _exit(0.33, peak=0.40)
+    check("trailing stop fires at +33% when peak is +40% (floor 34%)", d.reason == "TRAILING_STOP", d.reason)
+
+
+def test_dynamic_time_decay_profit():
+    # Held for 50 minutes (>= 45m), current PnL +19% (>= +18% stage 1 target)
+    at_50m = (NOW - timedelta(minutes=50)).isoformat()
+    d = _exit(0.19, peak=0.19, opened=at_50m)
+    check("time-decay profit fires at 50m with +19% gain", d.reason == "TIME_DECAY_PROFIT", d.reason)
+
+    # Held for 50 minutes, current PnL +14% (< +18%) -> HOLD
+    d = _exit(0.14, peak=0.14, opened=at_50m)
+    check("time-decay profit does not fire at 50m when below +18%", d.reason == "HOLD", d.reason)
+
+    # Held for 80 minutes (>= 75m), current PnL +11% (>= +10% stage 2 target)
+    at_80m = (NOW - timedelta(minutes=80)).isoformat()
+    d = _exit(0.11, peak=0.11, opened=at_80m)
+    check("time-decay profit fires at 80m with +11% gain", d.reason == "TIME_DECAY_PROFIT", d.reason)
+
+
+def test_debit_spread_calibrated_take_profit():
+    # Debit spread target is +28%
+    d = evaluate_exit(pnl_pct=0.29, peak_pnl_pct=0.29, dte=2, opened_at=NOW.isoformat(), now=NOW, is_spread=True)
+    check("calibrated debit spread take profit fires at +29%", d.reason == "TAKE_PROFIT", d.reason)
+
+    d = evaluate_exit(pnl_pct=0.25, peak_pnl_pct=0.25, dte=2, opened_at=NOW.isoformat(), now=NOW, is_spread=True)
+    check("debit spread holds below +28% target", d.reason == "HOLD", d.reason)
 
 
 def test_days_held_degrades_safely():
@@ -624,6 +677,10 @@ def main() -> int:
         test_rule_precedence,
         test_trailing_stop_behaviour,
         test_unarmed_position_rides_to_the_stop,
+        test_breakeven_shield_protects_profit,
+        test_ratcheted_trailing_stop,
+        test_dynamic_time_decay_profit,
+        test_debit_spread_calibrated_take_profit,
         test_time_stop,
         test_days_held_degrades_safely,
         test_flatten_window,

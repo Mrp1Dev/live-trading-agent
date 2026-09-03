@@ -48,15 +48,27 @@ LATEST_FORBIDDEN_EXPIRATION = date(2026, 9, 4)
 
 CREDIT_SPREAD_TAKE_PROFIT_PCT = 0.50  # +50% of credit captured
 CREDIT_SPREAD_STOP_LOSS_PCT = -0.75   # Stop if cost to close exceeds 1.75x entry credit
-DEBIT_SPREAD_TAKE_PROFIT_PCT = 0.40   # +40% on debit spread
-LONG_TAKE_PROFIT_PCT = 0.50           # +50% on single-leg long
+DEBIT_SPREAD_TAKE_PROFIT_PCT = 0.28   # +28% on debit spread (calibrated for bid-ask slippage)
+LONG_TAKE_PROFIT_PCT = 0.40           # +40% on single-leg long
 TAKE_PROFIT_PCT = LONG_TAKE_PROFIT_PCT
-STOP_LOSS_PCT = -0.40                 # -40% hard cut on debit/longs (allows breathing room)
-TRAIL_ARM_PCT = 0.25                  # arms when position reaches +25%
-TRAIL_GIVEBACK_PCT = 0.25             # give back at most 25% from peak
+STOP_LOSS_PCT = -0.30                 # -30% hard cut on debit/longs (protects against severe drawdowns)
 
-MAX_HOLD_MINUTES = 150.0              # 2.5 hour hold window (allows momentum move to develop)
-MAX_HOLD_DAYS = MAX_HOLD_MINUTES / (6.5 * 60.0) # fractional trading day equivalent (~0.38d)
+# Breakeven Shield (locks in entry + buffer once trade gains traction)
+BREAKEVEN_ARM_PCT = 0.12              # Arms when position reaches +12% peak profit
+BREAKEVEN_BUFFER_PCT = 0.02           # Floor at +2% to guarantee net profit against slippage
+
+# Calibrated Trailing Stop
+TRAIL_ARM_PCT = 0.18                  # Arms earlier when position reaches +18%
+TRAIL_GIVEBACK_PCT = 0.20             # Give back at most 20% from peak
+
+# Dynamic Time-Decayed Targets & Hold Limits
+TIME_DECAY_STAGE1_MINUTES = 45.0      # At 45m hold, lower target to +18%
+TIME_DECAY_STAGE1_TARGET_PCT = 0.18
+TIME_DECAY_STAGE2_MINUTES = 75.0      # At 75m hold, lower target to +10%
+TIME_DECAY_STAGE2_TARGET_PCT = 0.10
+
+MAX_HOLD_MINUTES = 90.0               # 1.5 hour hold window (protects against theta burn)
+MAX_HOLD_DAYS = MAX_HOLD_MINUTES / (6.5 * 60.0) # fractional trading day equivalent (~0.23d)
 MIN_EXIT_DTE = -1                     # daily EOD at 15:50 ET flattens before close
 
 # Daily EOD hard flatten (close all intraday positions before market close)
