@@ -56,7 +56,7 @@ class PositionState:
 
 
 def _state_path() -> str:
-    return STATE_FILE
+    return os.getenv("ALPACA_STATE_FILE") or STATE_FILE
 
 
 def load_state(path: str | None = None) -> dict[str, PositionState]:

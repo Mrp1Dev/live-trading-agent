@@ -48,12 +48,12 @@ DIVIDEND_YIELD = 0.0
 # deployed, which is larger than the gross edge of any realistic directional
 # signal. It remains the parameter default so callers keep working; MAX_SPREAD_PCT
 # is the binding constraint.
-MAX_SPREAD_PCT = 0.08
-ABS_SPREAD_TOLERANCE = 0.02      # one-tick escape hatch for cheap contracts
-MAX_DAILY_THETA_PCT = 0.12       # abs(theta_per_day) / ask
-MAX_BREAKEVEN_RATIO = 1.15       # breakeven move / expected move over the hold
-MAX_IV_RV_RATIO = 1.60           # do not buy richly-priced premium
-MIN_EXPECTED_RETURN = -0.10      # net of the round trip
+MAX_SPREAD_PCT = 0.15           # Relaxed from 0.08 to match config.MAX_OPTION_SPREAD_PCT
+ABS_SPREAD_TOLERANCE = 0.05     # Relaxed from 0.02 ($0.05 absolute spread tolerance for cheap/mid contracts)
+MAX_DAILY_THETA_PCT = 0.20      # Relaxed from 0.12 (allow contracts with daily theta up to 20%)
+MAX_BREAKEVEN_RATIO = 1.60      # Relaxed from 1.15 (allow breakeven moves up to 1.6x expected move)
+MAX_IV_RV_RATIO = 2.20          # Relaxed from 1.60 (accommodate earnings/catalyst momentum IV)
+MIN_EXPECTED_RETURN = -0.25     # Relaxed from -0.10 (allow modelled return down to -25%)
 
 # Expected-return model.
 PLANNED_HOLD_DAYS = 2.0
@@ -705,44 +705,32 @@ def _score_candidate(
 # ---------------------------------------------------------------------------
 
 
-def _gate(candidate: OptionCandidate, *, max_spread_pct: float) -> Optional[str]:
-    """Return a rejection reason, or None if the candidate passes every gate.
-
-    Gate ORDER is load-bearing, because the first failure is the reason that gets
-    written to the decision log. They are ordered cause before symptom:
-
-        spread          a cost that exists before any model runs
-        IV/RV           the contract is priced richly
-        theta burn      the contract decays too fast
-        breakeven       the strike is too far for the expected move
-        expected return the aggregate verdict
-
-    IV/RV precedes the breakeven check on purpose. Rich implied vol inflates the
-    premium, which inflates the breakeven - so a rich contract fails both, and
-    "you are paying 3.0x realized vol" is the useful reason to record, while
-    "breakeven is 2.6x the expected move" is only its consequence.
-    """
-
-    # Spread. A one-tick market on a cheap contract is a tick-size floor, not
-    # evidence of illiquidity, so an absolute-cents escape hatch applies.
-    # The epsilon matters: option quotes are in whole cents, so an exactly
-    # two-cent market is the common case for the escape hatch, and binary
-    # floating point makes `0.02 > 0.02` intermittently true.
+def _gate(
+    candidate: OptionCandidate,
+    *,
+    max_spread_pct: float,
+    max_iv_rv_ratio: float = MAX_IV_RV_RATIO,
+    max_daily_theta_pct: float = MAX_DAILY_THETA_PCT,
+    max_breakeven_ratio: float = MAX_BREAKEVEN_RATIO,
+    min_expected_return: float = MIN_EXPECTED_RETURN,
+    abs_spread_tolerance: float = ABS_SPREAD_TOLERANCE,
+) -> Optional[str]:
+    """Return a rejection reason, or None if the candidate passes every gate."""
     absolute_spread = candidate.ask - candidate.bid
-    if candidate.spread_pct > max_spread_pct and absolute_spread > ABS_SPREAD_TOLERANCE + 1e-9:
+    if candidate.spread_pct > max_spread_pct and absolute_spread > abs_spread_tolerance + 1e-9:
         return f"spread {candidate.spread_pct:.1%} > {max_spread_pct:.1%}"
 
-    if candidate.iv_rv_ratio is not None and candidate.iv_rv_ratio > MAX_IV_RV_RATIO:
-        return f"IV/RV {candidate.iv_rv_ratio:.2f} > {MAX_IV_RV_RATIO:.2f}"
+    if candidate.iv_rv_ratio is not None and candidate.iv_rv_ratio > max_iv_rv_ratio:
+        return f"IV/RV {candidate.iv_rv_ratio:.2f} > {max_iv_rv_ratio:.2f}"
 
-    if candidate.theta_burn_pct is not None and candidate.theta_burn_pct > MAX_DAILY_THETA_PCT:
-        return f"theta burn {candidate.theta_burn_pct:.1%}/day > {MAX_DAILY_THETA_PCT:.0%}"
+    if candidate.theta_burn_pct is not None and candidate.theta_burn_pct > max_daily_theta_pct:
+        return f"theta burn {candidate.theta_burn_pct:.1%}/day > {max_daily_theta_pct:.0%}"
 
-    if candidate.breakeven_ratio is not None and candidate.breakeven_ratio > MAX_BREAKEVEN_RATIO:
-        return f"breakeven/expected move {candidate.breakeven_ratio:.2f} > {MAX_BREAKEVEN_RATIO:.2f}"
+    if candidate.breakeven_ratio is not None and candidate.breakeven_ratio > max_breakeven_ratio:
+        return f"breakeven/expected move {candidate.breakeven_ratio:.2f} > {max_breakeven_ratio:.2f}"
 
-    if candidate.expected_return is not None and candidate.expected_return < MIN_EXPECTED_RETURN:
-        return f"expected return {candidate.expected_return:+.1%} < {MIN_EXPECTED_RETURN:+.0%}"
+    if candidate.expected_return is not None and candidate.expected_return < min_expected_return:
+        return f"expected return {candidate.expected_return:+.1%} < {min_expected_return:+.0%}"
 
     return None
 
@@ -761,30 +749,40 @@ def select_directional_options(
     realized_vol: Optional[float] = None,
     as_of: Optional[datetime] = None,
     collect_rejections: Optional[list[OptionCandidate]] = None,
+    relaxed: bool = False,
 ) -> list[OptionCandidate]:
     """
     Select tradeable directional option candidates, ranked by modelled quality.
-
-    `realized_vol` is optional so existing callers keep working, but without it
-    the variance-risk-premium gate and score component stay dark and the
-    expected-return model falls back to pricing the forecast at implied vol.
-    Pass ScannedStock.realized_volatility whenever it is available.
-
-    `as_of` drives the market clock, so the same function can be replayed at a
-    historical decision timestamp.
-
-    Pass a list as `collect_rejections` to receive every candidate that failed a
-    gate, each carrying `reject_reason`. Nothing is filtered silently.
     """
-
     direction = direction.lower()
 
     if direction not in {"bullish", "bearish"}:
         raise ValueError("direction must be 'bullish' or 'bearish'")
 
-    if max_spread_pct > MAX_SPREAD_PCT:
-        # config's ceiling is looser than the friction budget allows.
-        max_spread_pct = MAX_SPREAD_PCT
+    if relaxed:
+        eff_max_spread = 0.25
+        eff_abs_spread_tol = 0.10
+        eff_max_iv_rv = 3.20
+        eff_max_theta = 0.35
+        eff_max_breakeven = 2.40
+        eff_min_exp_ret = -0.40
+        eff_min_delta = min_abs_delta * 0.6
+        eff_max_delta = min(0.95, max_abs_delta * 1.1)
+        eff_min_premium = min_premium * 0.5
+        eff_min_dte = 1
+        eff_max_dte = max(max_dte, 21)
+    else:
+        eff_max_spread = max_spread_pct if max_spread_pct <= MAX_SPREAD_PCT else MAX_SPREAD_PCT
+        eff_abs_spread_tol = ABS_SPREAD_TOLERANCE
+        eff_max_iv_rv = MAX_IV_RV_RATIO
+        eff_max_theta = MAX_DAILY_THETA_PCT
+        eff_max_breakeven = MAX_BREAKEVEN_RATIO
+        eff_min_exp_ret = MIN_EXPECTED_RETURN
+        eff_min_delta = min_abs_delta
+        eff_max_delta = max_abs_delta
+        eff_min_premium = min_premium
+        eff_min_dte = min_dte
+        eff_max_dte = max_dte
 
     candidates: list[OptionCandidate] = []
 
@@ -813,8 +811,8 @@ def select_directional_options(
         if direction == "bearish" and candidate.option_type != "put":
             continue
 
-        if candidate.dte < min_dte or candidate.dte > max_dte:
-            _reject(f"dte {candidate.dte} outside [{min_dte}, {max_dte}]")
+        if candidate.dte < eff_min_dte or candidate.dte > eff_max_dte:
+            _reject(f"dte {candidate.dte} outside [{eff_min_dte}, {eff_max_dte}]")
             continue
 
         # Do not initiate positions that can reach expiration
@@ -826,8 +824,8 @@ def select_directional_options(
         # -----------------------------------------------------
         # Premium
         # -----------------------------------------------------
-        if candidate.mid < min_premium:
-            _reject(f"premium {candidate.mid:.2f} < {min_premium:.2f}")
+        if candidate.mid < eff_min_premium:
+            _reject(f"premium {candidate.mid:.2f} < {eff_min_premium:.2f}")
             continue
 
         # -----------------------------------------------------
@@ -839,18 +837,26 @@ def select_directional_options(
 
         abs_delta = abs(candidate.delta)
 
-        if abs_delta < min_abs_delta:
-            _reject(f"|delta| {abs_delta:.2f} < {min_abs_delta:.2f}")
+        if abs_delta < eff_min_delta:
+            _reject(f"|delta| {abs_delta:.2f} < {eff_min_delta:.2f}")
             continue
 
-        if abs_delta > max_abs_delta:
-            _reject(f"|delta| {abs_delta:.2f} > {max_abs_delta:.2f}")
+        if abs_delta > eff_max_delta:
+            _reject(f"|delta| {abs_delta:.2f} > {eff_max_delta:.2f}")
             continue
 
         # -----------------------------------------------------
         # Cost, decay and pricing gates
         # -----------------------------------------------------
-        reason = _gate(candidate, max_spread_pct=max_spread_pct)
+        reason = _gate(
+            candidate,
+            max_spread_pct=eff_max_spread,
+            max_iv_rv_ratio=eff_max_iv_rv,
+            max_daily_theta_pct=eff_max_theta,
+            max_breakeven_ratio=eff_max_breakeven,
+            min_expected_return=eff_min_exp_ret,
+            abs_spread_tolerance=eff_abs_spread_tol,
+        )
         if reason is not None:
             _reject(reason)
             continue

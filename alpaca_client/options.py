@@ -10,14 +10,24 @@ from strategy.option_selector import (
 )
 
 
+import time
+
+
 def get_option_chain(symbol: str) -> Dict[str, OptionsSnapshot]:
     client = get_option_data_client()
-
     request = OptionChainRequest(
         underlying_symbol=symbol,
     )
 
-    return client.get_option_chain(request)
+    for attempt in range(3):
+        try:
+            return client.get_option_chain(request)
+        except Exception as exc:
+            if attempt < 2:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            print(f"  [options] Option chain fetch failed for {symbol} ({exc})")
+            return {}
 
 
 def print_chain(symbol: str, limit: int = 10) -> None:

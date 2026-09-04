@@ -163,12 +163,14 @@ def run_entry_cycle(
             f"ScannerScore={stock.score:.1f}"
         )
 
-    latest_prices = get_latest_underlying_prices([stock.symbol for stock in selected_stocks])
+    # Fetch latest prices for all ranked candidates in case top stocks are filtered out
+    latest_prices = get_latest_underlying_prices([stock.symbol for stock in ranked_candidates])
     all_options = []
     stocks_by_symbol = {}
     directions_by_symbol = {}
 
-    for stock in selected_stocks:
+    # Pass 1: Standard deterministic gates across ranked candidates
+    for stock in ranked_candidates:
         underlying_price = latest_prices.get(stock.symbol)
         if underlying_price is None or underlying_price <= 0:
             print(f"Skipping {stock.symbol}: no valid live price.")
@@ -177,7 +179,11 @@ def run_entry_cycle(
         if direction == TradeDirection.NEUTRAL:
             print(f"Skipping {stock.symbol}: direction is neutral.")
             continue
-        chain = get_option_chain(stock.symbol)
+        try:
+            chain = get_option_chain(stock.symbol)
+        except Exception as exc:
+            print(f"Skipping {stock.symbol}: option chain retrieval failed ({exc}).")
+            continue
         options = select_directional_options(
             chain=chain,
             underlying_price=underlying_price,
@@ -192,8 +198,42 @@ def run_entry_cycle(
         directions_by_symbol[stock.symbol] = direction.value
         all_options.extend(options)
 
+        # Stop early once we have built a sufficiently diversified candidate pool
+        if len(stocks_by_symbol) >= LLM_STOCK_TOP_K and len(all_options) >= OPTION_LLM_TOP_K:
+            break
+
+    # Pass 2: If all candidates exhausted standard gates, retry with relaxed deterministic gates
     if not all_options:
-        print("No option candidates survived deterministic filtering.")
+        print("\nAll candidate stocks exhausted standard deterministic gates. Retrying candidate pool with relaxed filtering...")
+        for stock in ranked_candidates:
+            underlying_price = latest_prices.get(stock.symbol)
+            if underlying_price is None or underlying_price <= 0:
+                continue
+            direction = determine_direction(stock)
+            if direction == TradeDirection.NEUTRAL:
+                continue
+            try:
+                chain = get_option_chain(stock.symbol)
+            except Exception as exc:
+                continue
+            options = select_directional_options(
+                chain=chain,
+                underlying_price=underlying_price,
+                direction=direction.value.lower(),
+                realized_vol=stock.realized_volatility,
+                max_candidates=MAX_OPTIONS_PER_STOCK,
+                relaxed=True,
+            )
+            if options:
+                print(f"  [relaxed gate] Found {len(options)} option candidate(s) for {stock.symbol}.")
+                stocks_by_symbol[stock.symbol] = stock
+                directions_by_symbol[stock.symbol] = direction.value
+                all_options.extend(options)
+                if len(all_options) >= 8:
+                    break
+
+    if not all_options:
+        print("No option candidates survived deterministic filtering even after relaxed retry.")
         return
 
     ranked_option_symbols = rank_option_pool(

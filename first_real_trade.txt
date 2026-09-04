@@ -1,3 +1,4 @@
+# COMPLETELY OUTDATED FILE
 (.venv) PS D:\Dev\Hackathons\Alpaca\APIPlayground\alpaca-agent> python main.py --confirm-paper-trades
 === Connected to Alpaca (Paper Trading) ===
 Account ID:     d48d209b-666d-4938-97e6-7237959a96e4

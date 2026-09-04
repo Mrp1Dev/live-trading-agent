@@ -8,6 +8,7 @@ from typing import Mapping, Sequence
 
 from dotenv import load_dotenv
 import requests
+import time
 
 from strategy.scanner import ScannedStock
 
@@ -252,39 +253,46 @@ def rank_stocks(
         print(prompt)
         print("=" * 120)
 
-    try:
-        response = requests.post(
-            f"{FEATHERLESS_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {_get_api_key()}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "alpaca-agent",
-                "X-Title": "Alpaca Options Trading Agent",
-            },
-            json={
-                "model": selected_model,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "chat_template_kwargs": {
-                    "thinking": False,
+    payload = None
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                f"{FEATHERLESS_BASE_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {_get_api_key()}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "alpaca-agent",
+                    "X-Title": "Alpaca Options Trading Agent",
                 },
-            },
-            timeout=60,
-        )
-        response.raise_for_status()
-        payload = response.json()
-    except requests.RequestException as exc:
-        raise LLMRankerError(
-            f"Featherless ranking request failed: {exc}"
-        ) from exc
-    except ValueError as exc:
-        raise LLMRankerError(
-            "Featherless returned a non-JSON response."
-        ) from exc
+                json={
+                    "model": selected_model,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "chat_template_kwargs": {
+                        "thinking": False,
+                    },
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            break
+        except (requests.RequestException, ConnectionError) as exc:
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            print(f"Featherless ranking request failed ({exc}); falling back to quantitative scanner score ranking.")
+            return [s.symbol for s in sorted(stocks, key=lambda x: x.score, reverse=True)]
+        except ValueError as exc:
+            if attempt < 2:
+                time.sleep(1.0)
+                continue
+            print(f"Featherless returned non-JSON response ({exc}); falling back to quantitative scanner score ranking.")
+            return [s.symbol for s in sorted(stocks, key=lambda x: x.score, reverse=True)]
 
     try:
         choices = payload["choices"]

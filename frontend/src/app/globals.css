@@ -1,0 +1,979 @@
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500;600&display=swap');
+
+:root {
+  /* ==========================================================================
+     Material Design 3 (Material You) - Light Theme (Default)
+     ========================================================================== */
+  --md-sys-color-background: #f7f9fd;
+  --md-sys-color-surface: #ffffff;
+  --md-sys-color-surface-dim: #dadee6;
+  --md-sys-color-surface-bright: #f7f9fd;
+  
+  --md-sys-color-surface-container-lowest: #ffffff;
+  --md-sys-color-surface-container-low: #f1f4f9;
+  --md-sys-color-surface-container: #eaeff6;
+  --md-sys-color-surface-container-high: #e3e8f0;
+  --md-sys-color-surface-container-highest: #dbe1eb;
+
+  --md-sys-color-on-surface: #181c20;
+  --md-sys-color-on-surface-variant: #43474e;
+  --md-sys-color-outline: #73777f;
+  --md-sys-color-outline-variant: #c3c7d0;
+
+  --md-sys-color-primary: #0b57d0;
+  --md-sys-color-on-primary: #ffffff;
+  --md-sys-color-primary-container: #d3e3fd;
+  --md-sys-color-on-primary-container: #041e49;
+
+  --md-sys-color-secondary: #4a5f78;
+  --md-sys-color-on-secondary: #ffffff;
+  --md-sys-color-secondary-container: #d7e3f8;
+  --md-sys-color-on-secondary-container: #041c33;
+
+  --md-sys-color-tertiary: #6c567b;
+  --md-sys-color-on-tertiary: #ffffff;
+  --md-sys-color-tertiary-container: #f4daff;
+  --md-sys-color-on-tertiary-container: #261435;
+
+  --md-sys-color-success: #137333;
+  --md-sys-color-on-success: #ffffff;
+  --md-sys-color-success-container: #ceead6;
+  --md-sys-color-on-success-container: #0d5224;
+
+  --md-sys-color-error: #ba1a1a;
+  --md-sys-color-on-error: #ffffff;
+  --md-sys-color-error-container: #ffdad6;
+  --md-sys-color-on-error-container: #410002;
+
+  --md-sys-color-warning: #9a5700;
+  --md-sys-color-warning-container: #ffe0b3;
+  --md-sys-color-on-warning-container: #331a00;
+
+  /* Typography */
+  --md-sys-font-sans: 'Roboto', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --md-sys-font-mono: 'Roboto Mono', SFMono-Regular, Consolas, monospace;
+
+  /* Shapes & Elevations */
+  --md-shape-xs: 4px;
+  --md-shape-sm: 8px;
+  --md-shape-md: 12px;
+  --md-shape-lg: 16px;
+  --md-shape-xl: 24px;
+  --md-shape-full: 9999px;
+
+  --md-elevation-1: 0 1px 3px rgba(0, 0, 0, 0.05), 0 1px 2px rgba(0, 0, 0, 0.03);
+  --md-elevation-2: 0 2px 6px rgba(0, 0, 0, 0.06), 0 1px 4px rgba(0, 0, 0, 0.04);
+  --md-elevation-3: 0 4px 12px rgba(0, 0, 0, 0.08), 0 2px 6px rgba(0, 0, 0, 0.04);
+
+  --term-bg: #141820;
+  --term-surface: #1b202c;
+  --term-fg: #dce1eb;
+  --term-border: #283042;
+}
+
+[data-theme="dark"] {
+  /* ==========================================================================
+     Material Design 3 (Material You) - Dark Theme
+     ========================================================================== */
+  --md-sys-color-background: #0f131a;
+  --md-sys-color-surface: #131720;
+  --md-sys-color-surface-dim: #0c0f15;
+  --md-sys-color-surface-bright: #373b45;
+
+  --md-sys-color-surface-container-lowest: #0a0d13;
+  --md-sys-color-surface-container-low: #181d27;
+  --md-sys-color-surface-container: #1e2430;
+  --md-sys-color-surface-container-high: #262c3b;
+  --md-sys-color-surface-container-highest: #303747;
+
+  --md-sys-color-on-surface: #e2e6ee;
+  --md-sys-color-on-surface-variant: #c3c7d0;
+  --md-sys-color-outline: #8d919a;
+  --md-sys-color-outline-variant: #43474e;
+
+  --md-sys-color-primary: #a8c7fa;
+  --md-sys-color-on-primary: #062e6f;
+  --md-sys-color-primary-container: #0842a0;
+  --md-sys-color-on-primary-container: #d3e3fd;
+
+  --md-sys-color-secondary: #b1c7e6;
+  --md-sys-color-on-secondary: #1a314b;
+  --md-sys-color-secondary-container: #324761;
+  --md-sys-color-on-secondary-container: #d7e3f8;
+
+  --md-sys-color-tertiary: #d7bfe6;
+  --md-sys-color-on-tertiary: #3b2849;
+  --md-sys-color-tertiary-container: #533e61;
+  --md-sys-color-on-tertiary-container: #f4daff;
+
+  --md-sys-color-success: #81c995;
+  --md-sys-color-on-success: #003915;
+  --md-sys-color-success-container: #0d5224;
+  --md-sys-color-on-success-container: #ceead6;
+
+  --md-sys-color-error: #ffb4ab;
+  --md-sys-color-on-error: #690005;
+  --md-sys-color-error-container: #93000a;
+  --md-sys-color-on-error-container: #ffdad6;
+
+  --md-sys-color-warning: #ffb961;
+  --md-sys-color-warning-container: #5b3300;
+  --md-sys-color-on-warning-container: #ffe0b3;
+
+  --md-elevation-1: 0 1px 3px rgba(0, 0, 0, 0.35);
+  --md-elevation-2: 0 2px 8px rgba(0, 0, 0, 0.45);
+  --md-elevation-3: 0 4px 16px rgba(0, 0, 0, 0.55);
+
+  --term-bg: #0d1117;
+  --term-surface: #151a23;
+  --term-fg: #e2e6ee;
+  --term-border: #232a38;
+}
+
+/* ==========================================================================
+   Base Styles & Reset
+   ========================================================================== */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  overflow-x: hidden;
+  width: 100%;
+  max-width: 100vw;
+  box-sizing: border-box;
+}
+
+body {
+  background-color: var(--md-sys-color-background);
+  color: var(--md-sys-color-on-surface);
+  font-family: var(--md-sys-font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  font-feature-settings: 'tnum' 1, 'cv05' 1;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Tabular numbers for financial metrics */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Monospace restricted to raw terminal logs only */
+.code-mono {
+  font-family: var(--md-sys-font-mono);
+}
+
+/* Layout */
+.app-layout {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background-color: var(--md-sys-color-background);
+  color: var(--md-sys-color-on-background);
+  width: 100%;
+  max-width: 100vw;
+  overflow-x: hidden;
+  box-sizing: border-box;
+}
+
+/* ==========================================================================
+   Header (Material You Top App Bar)
+   ========================================================================== */
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 28px;
+  height: 64px;
+  background-color: var(--md-sys-color-surface);
+  border-bottom: 1px solid var(--md-sys-color-outline-variant);
+  box-shadow: var(--md-elevation-1);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.brand-section {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.brand-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--md-shape-md);
+  background: linear-gradient(135deg, var(--md-sys-color-primary) 0%, #1a73e8 100%);
+  color: #ffffff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 18px;
+  box-shadow: var(--md-elevation-1);
+}
+
+.brand-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--md-sys-color-on-surface);
+  letter-spacing: -0.2px;
+}
+
+.brand-subtitle {
+  font-size: 11px;
+  color: var(--md-sys-color-on-surface-variant);
+  font-weight: 400;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* Header Live Status */
+.market-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  background-color: var(--md-sys-color-surface-container-high);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: var(--md-shape-full);
+  font-size: 12px;
+}
+
+.pulse-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: var(--md-sys-color-success);
+  display: inline-block;
+  box-shadow: 0 0 0 2px rgba(19, 115, 51, 0.2);
+  animation: pulse-ring 2s infinite ease-out;
+}
+
+@keyframes pulse-ring {
+  0% { transform: scale(0.95); opacity: 0.9; }
+  50% { transform: scale(1.3); opacity: 0.4; }
+  100% { transform: scale(0.95); opacity: 0.9; }
+}
+
+@keyframes m3-block-arrive {
+  0% {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.m3-arrive {
+  animation: m3-block-arrive 0.32s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.m3-arrive-delay-1 {
+  animation: m3-block-arrive 0.32s cubic-bezier(0.16, 1, 0.3, 1) 0.08s forwards;
+  opacity: 0;
+}
+
+.m3-arrive-delay-2 {
+  animation: m3-block-arrive 0.32s cubic-bezier(0.16, 1, 0.3, 1) 0.16s forwards;
+  opacity: 0;
+}
+
+.m3-arrive-delay-3 {
+  animation: m3-block-arrive 0.32s cubic-bezier(0.16, 1, 0.3, 1) 0.24s forwards;
+  opacity: 0;
+}
+
+.m3-arrive-delay-4 {
+  animation: m3-block-arrive 0.32s cubic-bezier(0.16, 1, 0.3, 1) 0.32s forwards;
+  opacity: 0;
+}
+
+/* ==========================================================================
+   Main Grid
+   ========================================================================== */
+.main-content {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  gap: 24px;
+  padding: 24px 28px;
+  max-width: 1760px;
+  margin: 0 auto;
+  width: 100%;
+  flex: 1;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+@media (max-width: 1120px) {
+  .main-content {
+    grid-template-columns: 1fr;
+    padding: 16px;
+  }
+}
+
+/* ==========================================================================
+   M3 Cards & Containers
+   ========================================================================== */
+.m3-card {
+  background-color: var(--md-sys-color-surface);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: var(--md-shape-xl);
+  padding: 22px;
+  margin-bottom: 20px;
+  box-shadow: var(--md-elevation-1);
+  transition: box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+.m3-card:hover {
+  border-color: var(--md-sys-color-outline);
+}
+
+.m3-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.m3-card-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--md-sys-color-on-surface);
+  letter-spacing: -0.1px;
+}
+
+/* ==========================================================================
+   Material 3 Text Fields & Inputs
+   ========================================================================== */
+.m3-text-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.m3-text-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--md-sys-color-on-surface-variant);
+  letter-spacing: 0.1px;
+}
+
+.m3-text-input {
+  width: 100%;
+  height: 42px;
+  padding: 0 14px;
+  background-color: var(--md-sys-color-surface-container);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: var(--md-shape-md);
+  color: var(--md-sys-color-on-surface);
+  font-family: var(--md-sys-font-mono);
+  font-size: 13px;
+  outline: none;
+  box-sizing: border-box;
+  transition: border-color 0.2s cubic-bezier(0.2, 0, 0, 1), box-shadow 0.2s cubic-bezier(0.2, 0, 0, 1), background-color 0.2s ease;
+}
+
+.m3-text-input:hover {
+  border-color: var(--md-sys-color-outline);
+  background-color: var(--md-sys-color-surface-container-high);
+}
+
+.m3-text-input:focus {
+  border-color: var(--md-sys-color-primary);
+  background-color: var(--md-sys-color-surface);
+  box-shadow: 0 0 0 3px rgba(103, 80, 164, 0.18);
+}
+
+.m3-text-input::placeholder {
+  color: var(--md-sys-color-on-surface-variant);
+  opacity: 0.55;
+  font-family: var(--md-sys-font-sans);
+}
+
+/* ==========================================================================
+   Material You Buttons
+   ========================================================================== */
+.btn-m3-filled {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: auto;
+  height: 44px;
+  padding: 0 20px;
+  background-color: var(--md-sys-color-primary);
+  color: var(--md-sys-color-on-primary);
+  border: none;
+  border-radius: var(--md-shape-full);
+  font-family: var(--md-sys-font-sans);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.1px;
+  cursor: pointer;
+  box-shadow: var(--md-elevation-1);
+  transition: all 0.2s cubic-bezier(0.2, 0, 0, 1);
+}
+
+.btn-m3-block {
+  width: 100%;
+}
+
+.btn-m3-filled:hover {
+  box-shadow: var(--md-elevation-2);
+  filter: brightness(1.05);
+}
+
+.btn-m3-filled:active {
+  transform: scale(0.98);
+}
+
+.btn-m3-filled.danger {
+  background-color: var(--md-sys-color-error);
+  color: var(--md-sys-color-on-error);
+}
+
+.btn-m3-tonal {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 38px;
+  padding: 0 16px;
+  background-color: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface);
+  border: none;
+  border-radius: var(--md-shape-full);
+  font-family: var(--md-sys-font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-m3-tonal:hover {
+  background-color: var(--md-sys-color-surface-container-highest);
+}
+
+.btn-m3-outlined {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 38px;
+  padding: 0 16px;
+  background-color: transparent;
+  color: var(--md-sys-color-primary);
+  border: 1px solid var(--md-sys-color-outline);
+  border-radius: var(--md-shape-full);
+  font-family: var(--md-sys-font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-m3-outlined:hover {
+  background-color: var(--md-sys-color-surface-container-low);
+  border-color: var(--md-sys-color-primary);
+}
+
+.btn-m3-icon {
+  width: 38px;
+  height: 38px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background-color: var(--md-sys-color-surface-container-low);
+  color: var(--md-sys-color-on-surface);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: var(--md-shape-full);
+  font-size: 15px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-m3-icon:hover {
+  background-color: var(--md-sys-color-surface-container-high);
+}
+
+/* ==========================================================================
+   Segmented Buttons (Material You)
+   ========================================================================== */
+.segmented-button-group {
+  display: flex;
+  background-color: var(--md-sys-color-surface-container-low);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: var(--md-shape-full);
+  padding: 3px;
+  gap: 2px;
+}
+
+.segmented-button {
+  flex: 1;
+  padding: 7px 12px;
+  border-radius: var(--md-shape-full);
+  border: none;
+  background: transparent;
+  color: var(--md-sys-color-on-surface-variant);
+  font-family: var(--md-sys-font-sans);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-align: center;
+}
+
+.segmented-button.active {
+  background-color: var(--md-sys-color-surface);
+  color: var(--md-sys-color-primary);
+  font-weight: 600;
+  box-shadow: var(--md-elevation-1);
+}
+
+/* ==========================================================================
+   Inputs (Material Design 3 Outlined Style)
+   ========================================================================== */
+.m3-input-field {
+  margin-bottom: 14px;
+}
+
+.m3-input-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--md-sys-color-on-surface-variant);
+  margin-bottom: 6px;
+}
+
+.m3-text-input {
+  width: 100%;
+  height: 44px;
+  padding: 0 14px;
+  background-color: var(--md-sys-color-surface);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: var(--md-shape-md);
+  color: var(--md-sys-color-on-surface);
+  font-family: var(--md-sys-font-sans);
+  font-size: 14px;
+  outline: none;
+  transition: all 0.15s ease;
+}
+
+.m3-text-input:focus {
+  border-color: var(--md-sys-color-primary);
+  box-shadow: 0 0 0 2px var(--md-sys-color-primary-container);
+}
+
+/* ==========================================================================
+   Metrics Rows
+   ========================================================================== */
+.m3-metric-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.m3-metric-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--md-sys-color-outline-variant);
+}
+
+.m3-metric-item:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.m3-metric-name {
+  font-size: 13px;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.m3-metric-val {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--md-sys-color-on-surface);
+}
+
+.m3-metric-val.positive {
+  color: var(--md-sys-color-success);
+}
+
+.m3-metric-val.negative {
+  color: var(--md-sys-color-error);
+}
+
+/* ==========================================================================
+   Badges & Chips
+   ========================================================================== */
+.m3-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: var(--md-shape-full);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.1px;
+}
+
+.m3-badge.success {
+  background-color: var(--md-sys-color-success-container);
+  color: var(--md-sys-color-on-success-container);
+}
+
+.m3-badge.neutral {
+  background-color: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.m3-badge.warning {
+  background-color: var(--md-sys-color-warning-container);
+  color: var(--md-sys-color-on-warning-container);
+}
+
+.m3-badge.error {
+  background-color: var(--md-sys-color-error-container);
+  color: var(--md-sys-color-on-error-container);
+}
+
+/* ==========================================================================
+   Pipeline Stepper (Material You Horizontal Progress)
+   ========================================================================== */
+.stepper-container {
+  background-color: var(--md-sys-color-surface);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: var(--md-shape-xl);
+  padding: 16px 20px;
+  margin-bottom: 20px;
+  box-shadow: var(--md-elevation-1);
+  max-width: 100%;
+  min-width: 0;
+}
+
+.stepper-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.stepper-legend {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: var(--md-shape-full);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.1px;
+}
+
+.legend-item.deterministic {
+  background-color: var(--md-sys-color-surface-container);
+  color: var(--md-sys-color-on-surface-variant);
+  border: 1px solid var(--md-sys-color-outline-variant);
+}
+
+.legend-item.llm {
+  background-color: var(--md-sys-color-tertiary-container);
+  color: var(--md-sys-color-on-tertiary-container);
+  border: 1px solid rgba(127, 103, 190, 0.25);
+  font-weight: 600;
+}
+
+.legend-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.legend-dot.deterministic {
+  background-color: var(--md-sys-color-outline);
+}
+
+.legend-dot.llm {
+  background-color: var(--md-sys-color-tertiary);
+}
+
+.stepper-track {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 6px;
+  scrollbar-width: thin;
+  max-width: 100%;
+}
+
+.step-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 38px;
+  padding: 0 14px;
+  border-radius: var(--md-shape-full);
+  font-family: var(--md-sys-font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: all 0.15s cubic-bezier(0.2, 0, 0, 1);
+}
+
+.step-pill:hover {
+  filter: brightness(1.04);
+  box-shadow: var(--md-elevation-1);
+}
+
+/* Authentic M3 Secondary / Surface Tone for Deterministic stages */
+.step-pill.m3-secondary-step {
+  background-color: var(--md-sys-color-surface-container);
+  color: var(--md-sys-color-on-surface);
+  border: 1px solid var(--md-sys-color-outline-variant);
+}
+
+.step-pill.m3-secondary-step .step-badge {
+  background-color: var(--md-sys-color-surface-container-highest);
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+/* Authentic M3 Tertiary Tone for Featherless.ai / LLM stages */
+.step-pill.m3-tertiary-step {
+  background-color: var(--md-sys-color-tertiary-container);
+  color: var(--md-sys-color-on-tertiary-container);
+  border: 1px solid rgba(127, 103, 190, 0.22);
+}
+
+.step-pill.m3-tertiary-step .step-badge {
+  background-color: rgba(127, 103, 190, 0.18);
+  color: var(--md-sys-color-on-tertiary-container);
+}
+
+/* Active Highlight Focus */
+.step-pill.active {
+  background-color: var(--md-sys-color-primary-container) !important;
+  color: var(--md-sys-color-on-primary-container) !important;
+  border-color: var(--md-sys-color-primary) !important;
+  font-weight: 700;
+  box-shadow: var(--md-elevation-1);
+}
+
+.step-pill.active .step-badge {
+  background-color: var(--md-sys-color-primary) !important;
+  color: var(--md-sys-color-on-primary) !important;
+}
+
+.step-pill.completed .step-badge {
+  background-color: var(--md-sys-color-success) !important;
+  color: #ffffff !important;
+}
+
+.step-badge {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+/* ==========================================================================
+   Dynamic Stage Workspace
+   ========================================================================== */
+.workspace-card {
+  background-color: var(--md-sys-color-surface);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: var(--md-shape-xl);
+  padding: 26px 28px;
+  margin-bottom: 20px;
+  box-shadow: var(--md-elevation-1);
+  min-height: 440px;
+}
+
+.workspace-title-section {
+  margin-bottom: 20px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--md-sys-color-outline-variant);
+}
+
+.workspace-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--md-sys-color-on-surface);
+  letter-spacing: -0.2px;
+  margin-bottom: 4px;
+}
+
+.workspace-description {
+  font-size: 13px;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+/* ==========================================================================
+   Material You Tables
+   ========================================================================== */
+.m3-table-wrapper {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: var(--md-shape-lg);
+  background-color: var(--md-sys-color-surface);
+}
+
+.m3-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 13px;
+}
+
+.m3-table th {
+  background-color: var(--md-sys-color-surface-container-low);
+  color: var(--md-sys-color-on-surface-variant);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--md-sys-color-outline-variant);
+  white-space: nowrap;
+}
+
+.m3-table td {
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--md-sys-color-outline-variant);
+  color: var(--md-sys-color-on-surface);
+  white-space: nowrap;
+}
+
+.m3-table tr:last-child td {
+  border-bottom: none;
+}
+
+.m3-table tr:hover td {
+  background-color: var(--md-sys-color-surface-container-low);
+}
+
+/* ==========================================================================
+   Execution Console Box (Material Developer Console)
+   ========================================================================== */
+.terminal-box {
+  background-color: var(--term-bg);
+  border: 1px solid var(--term-border);
+  border-radius: var(--md-shape-xl);
+  padding: 16px 20px;
+  color: var(--term-fg);
+  font-family: var(--md-sys-font-mono);
+  font-size: 12px;
+  box-shadow: var(--md-elevation-2);
+}
+
+.terminal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--term-border);
+  font-family: var(--md-sys-font-sans);
+}
+
+.terminal-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #f1f5f9;
+}
+
+.terminal-stream {
+  max-height: 280px;
+  overflow-y: auto;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-all;
+  padding-right: 6px;
+}
+
+.terminal-stream::-webkit-scrollbar {
+  width: 6px;
+}
+
+.terminal-stream::-webkit-scrollbar-thumb {
+  background: var(--term-border);
+  border-radius: 4px;
+}
+
+.terminal-line {
+  padding: 1px 0;
+}
+
+.term-cmd { color: #4ade80; font-weight: 600; }
+.term-meta { color: #38bdf8; }
+.term-header { color: #c084fc; font-weight: 600; }
+.term-success { color: #4ade80; }
+.term-warn { color: #fbbf24; }
+.term-err { color: #f87171; }
+
+/* ==========================================================================
+   Research Dossier Card
+   ========================================================================== */
+.dossier-card {
+  background-color: var(--md-sys-color-surface-container-low);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: var(--md-shape-lg);
+  padding: 20px;
+  margin-bottom: 16px;
+}
+
+.dossier-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.dossier-symbol {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--md-sys-color-primary);
+}
+
+.dossier-field {
+  margin-bottom: 10px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.dossier-label {
+  font-weight: 600;
+  color: var(--md-sys-color-on-surface-variant);
+  margin-right: 8px;
+}

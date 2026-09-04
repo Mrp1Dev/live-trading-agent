@@ -434,26 +434,27 @@ def fetch_stock_news(
             "include_content": "false",
             "exclude_contentless": "true",
         }
-        response = requests.get(
-            ALPACA_NEWS_URL,
-            headers={
-                "APCA-API-KEY-ID": api_key,
-                "APCA-API-SECRET-KEY": secret_key,
-            },
-            params=params,
-            timeout=timeout,
-        )
-        try:
-            response.raise_for_status()
-            payload = response.json()
-        except requests.RequestException as exc:
-            raise ResearchAgentError(
-                f"Alpaca news request failed for {symbol}: {exc}"
-            ) from exc
-        except ValueError as exc:
-            raise ResearchAgentError(
-                f"Alpaca returned invalid news JSON for {symbol}."
-            ) from exc
+        payload = {}
+        for attempt in range(2):
+            try:
+                response = requests.get(
+                    ALPACA_NEWS_URL,
+                    headers={
+                        "APCA-API-KEY-ID": api_key,
+                        "APCA-API-SECRET-KEY": secret_key,
+                    },
+                    params=params,
+                    timeout=min(timeout, 15),
+                )
+                response.raise_for_status()
+                payload = response.json()
+                break
+            except Exception as exc:
+                if attempt == 1:
+                    print(f"Alpaca news query timed out for {symbol} ({type(exc).__name__}). Continuing with quantitative profile.")
+                    return []
+                import time
+                time.sleep(1)
 
         raw_articles = payload.get("news", [])
         if not isinstance(raw_articles, list):

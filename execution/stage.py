@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 
 from .alpaca_broker import AlpacaBroker
@@ -16,7 +17,7 @@ def run_execution_stage(
     *,
     confirmed: bool,
     strategy_run_id: str | None = None,
-    journal_path: str = "logs/execution.jsonl",
+    journal_path: str | None = None,
     expected_account_id: str | None = None,
 ):
     """Run the one-shot execution stage.
@@ -30,7 +31,8 @@ def run_execution_stage(
         created_at=datetime.now(timezone.utc),
     )
     print_confirmation_block(intents)
-    journal = ExecutionJournal(journal_path)
+    actual_journal_path = journal_path or os.getenv("ALPACA_JOURNAL_PATH", "logs/execution.jsonl")
+    journal = ExecutionJournal(actual_journal_path)
     policy = execution_policy_from_env()
 
     if not confirmed:
